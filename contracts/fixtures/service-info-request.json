@@ -1,0 +1,5 @@
+{
+  "fixtureType": "service-info-request",
+  "tool": "prism_v1_get_service_info",
+  "arguments": {}
+}

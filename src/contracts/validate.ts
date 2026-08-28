@@ -16,10 +16,18 @@ const addFormats = require("ajv-formats") as FormatsPlugin;
 
 export const FIXTURE_DEFINITIONS = {
   "error-response.json": "ErrorResponseFixture",
+  "permit-request.json": "PermitRequestFixture",
   "permit-response.json": "PermitResponseFixture",
+  "pipeline-run-summary-request.json": "PipelineRunSummaryRequestFixture",
+  "pipeline-run-summary-response.json": "PipelineRunSummaryResponseFixture",
+  "property-request.json": "PropertyRequestFixture",
   "property-response.json": "PropertyResponseFixture",
+  "query-schema-request.json": "QuerySchemaRequestFixture",
+  "query-schema-response.json": "QuerySchemaResponseFixture",
   "search-request.json": "SearchRequestFixture",
   "search-response.json": "SearchResponseFixture",
+  "service-info-request.json": "ServiceInfoRequestFixture",
+  "service-info-response.json": "ServiceInfoResponseFixture",
 } as const;
 
 export type FixtureName = keyof typeof FIXTURE_DEFINITIONS;

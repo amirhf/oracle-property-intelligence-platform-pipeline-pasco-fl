@@ -1,0 +1,41 @@
+{
+  "fixtureType": "service-info-response",
+  "tool": "prism_v1_get_service_info",
+  "result": {
+    "ok": true,
+    "data": {
+      "serviceVersion": "fixture-service-1.1.0",
+      "contractVersion": "1.1.0",
+      "activeContractHash": "1ef6f43072bc93ee8557aa9fcd0ce55eab26560fe4d061fac7c9388b2d0301c5",
+      "county": "pasco",
+      "dataset": {
+        "version": "fixture-dataset-2026-08-28",
+        "freshness": {
+          "observedAt": "2026-08-28T00:00:00Z",
+          "retrievedAt": "2026-08-28T00:00:00Z",
+          "loadedAt": "2026-08-28T00:00:00Z",
+          "publishedAt": null,
+          "computedAt": "2026-08-28T00:00:00Z",
+          "sourceCadence": "weekly fixture cadence",
+          "cadenceStatus": "within_source_cadence"
+        }
+      },
+      "supportedTools": [
+        "prism_v1_get_service_info",
+        "prism_v1_get_pipeline_run_summary",
+        "prism_v1_search_roofing_opportunities",
+        "prism_v1_get_property",
+        "prism_v1_get_permit",
+        "prism_v1_get_query_schema"
+      ]
+    },
+    "meta": {
+      "contractVersion": "1.1.0",
+      "schemaHash": "1ef6f43072bc93ee8557aa9fcd0ce55eab26560fe4d061fac7c9388b2d0301c5",
+      "county": "pasco",
+      "asOf": "2026-08-28T00:00:00Z",
+      "artifactCids": [],
+      "nextCursor": null
+    }
+  }
+}

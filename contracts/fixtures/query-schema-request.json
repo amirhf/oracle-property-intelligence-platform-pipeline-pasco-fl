@@ -1,0 +1,5 @@
+{
+  "fixtureType": "query-schema-request",
+  "tool": "prism_v1_get_query_schema",
+  "arguments": {}
+}

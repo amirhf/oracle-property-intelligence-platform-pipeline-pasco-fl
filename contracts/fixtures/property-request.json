@@ -1,0 +1,7 @@
+{
+  "fixtureType": "property-request",
+  "tool": "prism_v1_get_property",
+  "arguments": {
+    "propertyId": "prop_e72ba795455c19d71ce4cb11f6177a5e"
+  }
+}

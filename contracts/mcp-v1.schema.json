@@ -1,18 +1,26 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.prismteam.ai/oracle/mcp/v1/schema.json",
-  "title": "Prism Oracle MCP v1 contract fixtures",
-  "description": "Normative schemas for the structured MCP v1 tool inputs, outputs, evidence, pagination and partial-data behavior. The document root validates committed contract fixtures; the $defs are the runtime contract.",
+  "title": "Prism Oracle MCP v1.1 contract fixtures",
+  "description": "Normative schemas for the structured MCP v1.1 tool inputs, outputs, evidence, pagination and partial-data behavior. The document root validates committed contract fixtures; the $defs are the runtime contract.",
   "oneOf": [
+    { "$ref": "#/$defs/ServiceInfoRequestFixture" },
+    { "$ref": "#/$defs/ServiceInfoResponseFixture" },
+    { "$ref": "#/$defs/PipelineRunSummaryRequestFixture" },
+    { "$ref": "#/$defs/PipelineRunSummaryResponseFixture" },
     { "$ref": "#/$defs/SearchRequestFixture" },
     { "$ref": "#/$defs/SearchResponseFixture" },
+    { "$ref": "#/$defs/PropertyRequestFixture" },
     { "$ref": "#/$defs/PropertyResponseFixture" },
+    { "$ref": "#/$defs/PermitRequestFixture" },
     { "$ref": "#/$defs/PermitResponseFixture" },
+    { "$ref": "#/$defs/QuerySchemaRequestFixture" },
+    { "$ref": "#/$defs/QuerySchemaResponseFixture" },
     { "$ref": "#/$defs/ErrorResponseFixture" }
   ],
   "$defs": {
     "ContractVersion": {
-      "const": "1.0.0"
+      "const": "1.1.0"
     },
     "SchemaHash": {
       "type": "string",
@@ -21,6 +29,26 @@
     "Identifier": {
       "type": "string",
       "pattern": "^[a-z]+_[a-f0-9]{32}$"
+    },
+    "ToolName": {
+      "enum": [
+        "prism_v1_get_service_info",
+        "prism_v1_get_pipeline_run_summary",
+        "prism_v1_search_roofing_opportunities",
+        "prism_v1_get_property",
+        "prism_v1_get_permit",
+        "prism_v1_get_query_schema"
+      ]
+    },
+    "SupportedToolNames": {
+      "const": [
+        "prism_v1_get_service_info",
+        "prism_v1_get_pipeline_run_summary",
+        "prism_v1_search_roofing_opportunities",
+        "prism_v1_get_property",
+        "prism_v1_get_permit",
+        "prism_v1_get_query_schema"
+      ]
     },
     "IsoDateTime": {
       "type": "string",
@@ -310,6 +338,554 @@
         "nextCursor": { "type": ["string", "null"] }
       }
     },
+    "EmptyArguments": {
+      "type": "object",
+      "additionalProperties": false
+    },
+    "ServiceInfoArguments": {
+      "$ref": "#/$defs/EmptyArguments"
+    },
+    "PipelineRunSummaryArguments": {
+      "$ref": "#/$defs/EmptyArguments"
+    },
+    "QuerySchemaArguments": {
+      "$ref": "#/$defs/EmptyArguments"
+    },
+    "PropertyIdentifier": {
+      "type": "string",
+      "pattern": "^prop_[a-f0-9]{32}$"
+    },
+    "PermitIdentifier": {
+      "type": "string",
+      "pattern": "^perm_[a-f0-9]{32}$"
+    },
+    "PropertyArguments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["propertyId"],
+      "properties": {
+        "propertyId": { "$ref": "#/$defs/PropertyIdentifier" }
+      }
+    },
+    "PermitArguments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["permitId"],
+      "properties": {
+        "permitId": { "$ref": "#/$defs/PermitIdentifier" }
+      }
+    },
+    "ServiceInfoData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "serviceVersion",
+        "contractVersion",
+        "activeContractHash",
+        "county",
+        "dataset",
+        "supportedTools"
+      ],
+      "properties": {
+        "serviceVersion": { "type": "string", "minLength": 1 },
+        "contractVersion": { "$ref": "#/$defs/ContractVersion" },
+        "activeContractHash": { "$ref": "#/$defs/SchemaHash" },
+        "county": { "const": "pasco" },
+        "dataset": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "freshness"],
+          "properties": {
+            "version": { "type": "string", "minLength": 1 },
+            "freshness": { "$ref": "#/$defs/Freshness" }
+          }
+        },
+        "supportedTools": { "$ref": "#/$defs/SupportedToolNames" }
+      }
+    },
+    "ServiceInfoSuccessResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "data", "meta"],
+      "properties": {
+        "ok": { "const": true },
+        "data": { "$ref": "#/$defs/ServiceInfoData" },
+        "meta": { "$ref": "#/$defs/ResponseMeta" }
+      }
+    },
+    "ServiceInfoRequestFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "arguments"],
+      "properties": {
+        "fixtureType": { "const": "service-info-request" },
+        "tool": { "const": "prism_v1_get_service_info" },
+        "arguments": { "$ref": "#/$defs/ServiceInfoArguments" }
+      }
+    },
+    "ServiceInfoResponseFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "result"],
+      "properties": {
+        "fixtureType": { "const": "service-info-response" },
+        "tool": { "const": "prism_v1_get_service_info" },
+        "result": { "$ref": "#/$defs/ServiceInfoSuccessResult" }
+      }
+    },
+    "SourceCount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceSystem",
+        "sourceRecords",
+        "parsedRecords",
+        "acceptedRecords",
+        "rejectedRecords"
+      ],
+      "properties": {
+        "sourceSystem": { "type": "string", "minLength": 1 },
+        "sourceRecords": { "type": "integer", "minimum": 0 },
+        "parsedRecords": { "type": "integer", "minimum": 0 },
+        "acceptedRecords": { "type": "integer", "minimum": 0 },
+        "rejectedRecords": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "ReconciliationCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "canonicalProperties",
+        "distinctPropertyIds",
+        "newRecords",
+        "changedRecords",
+        "unchangedRecords",
+        "duplicateRecords"
+      ],
+      "properties": {
+        "canonicalProperties": { "type": "integer", "minimum": 0 },
+        "distinctPropertyIds": { "type": "integer", "minimum": 0 },
+        "newRecords": { "type": "integer", "minimum": 0 },
+        "changedRecords": { "type": "integer", "minimum": 0 },
+        "unchangedRecords": { "type": "integer", "minimum": 0 },
+        "duplicateRecords": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "CountCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "unavailable"],
+      "properties": {
+        "available": { "type": "integer", "minimum": 0 },
+        "unavailable": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "RoofSignalCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "unavailable", "direct", "proxy"],
+      "properties": {
+        "available": { "type": "integer", "minimum": 0 },
+        "unavailable": { "type": "integer", "minimum": 0 },
+        "direct": { "type": "integer", "minimum": 0 },
+        "proxy": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "SourceCoverage": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "recordCount",
+            "propertyCount",
+            "unavailableReason"
+          ],
+          "properties": {
+            "status": { "enum": ["available", "partial"] },
+            "recordCount": { "type": "integer", "minimum": 0 },
+            "propertyCount": { "type": "integer", "minimum": 0 },
+            "unavailableReason": { "type": "null" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "recordCount",
+            "propertyCount",
+            "unavailableReason"
+          ],
+          "properties": {
+            "status": { "const": "unavailable" },
+            "recordCount": { "type": "null" },
+            "propertyCount": { "type": "null" },
+            "unavailableReason": {
+              "enum": [
+                "not_provided_by_source",
+                "source_not_collected",
+                "source_unavailable",
+                "not_applicable",
+                "ambiguous_match"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "PublicationArtifactState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "datasetVersion",
+        "artifactCount",
+        "publishedAt",
+        "artifactCids"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "not_generated",
+            "dry_run_validated",
+            "published",
+            "unavailable"
+          ]
+        },
+        "datasetVersion": { "type": ["string", "null"], "minLength": 1 },
+        "artifactCount": { "type": ["integer", "null"], "minimum": 0 },
+        "publishedAt": {
+          "oneOf": [
+            { "$ref": "#/$defs/IsoDateTime" },
+            { "type": "null" }
+          ]
+        },
+        "artifactCids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "UnavailableSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceSystem", "reason", "message"],
+      "properties": {
+        "sourceSystem": { "type": "string", "minLength": 1 },
+        "reason": {
+          "enum": [
+            "not_provided_by_source",
+            "source_not_collected",
+            "source_unavailable",
+            "not_applicable",
+            "ambiguous_match"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    },
+    "PipelineRunSummaryData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "county",
+        "runId",
+        "workflowId",
+        "status",
+        "startedAt",
+        "completedAt",
+        "sourceCounts",
+        "reconciliationCounts",
+        "coverage",
+        "publicationArtifacts",
+        "unavailableSources"
+      ],
+      "properties": {
+        "county": { "const": "pasco" },
+        "runId": { "$ref": "#/$defs/Identifier" },
+        "workflowId": { "type": "string", "minLength": 1 },
+        "status": { "const": "completed" },
+        "startedAt": { "$ref": "#/$defs/IsoDateTime" },
+        "completedAt": { "$ref": "#/$defs/IsoDateTime" },
+        "sourceCounts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SourceCount" },
+          "minItems": 1
+        },
+        "reconciliationCounts": { "$ref": "#/$defs/ReconciliationCounts" },
+        "coverage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "properties",
+            "coordinates",
+            "roofSignals",
+            "permits",
+            "contractors"
+          ],
+          "properties": {
+            "properties": { "$ref": "#/$defs/CountCoverage" },
+            "coordinates": { "$ref": "#/$defs/CountCoverage" },
+            "roofSignals": { "$ref": "#/$defs/RoofSignalCoverage" },
+            "permits": { "$ref": "#/$defs/SourceCoverage" },
+            "contractors": { "$ref": "#/$defs/SourceCoverage" }
+          }
+        },
+        "publicationArtifacts": {
+          "$ref": "#/$defs/PublicationArtifactState"
+        },
+        "unavailableSources": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/UnavailableSource" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "PipelineRunSummarySuccessResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "data", "meta"],
+      "properties": {
+        "ok": { "const": true },
+        "data": { "$ref": "#/$defs/PipelineRunSummaryData" },
+        "meta": { "$ref": "#/$defs/ResponseMeta" }
+      }
+    },
+    "PipelineRunSummaryRequestFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "arguments"],
+      "properties": {
+        "fixtureType": { "const": "pipeline-run-summary-request" },
+        "tool": { "const": "prism_v1_get_pipeline_run_summary" },
+        "arguments": { "$ref": "#/$defs/PipelineRunSummaryArguments" }
+      }
+    },
+    "PipelineRunSummaryResponseFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "result"],
+      "properties": {
+        "fixtureType": { "const": "pipeline-run-summary-response" },
+        "tool": { "const": "prism_v1_get_pipeline_run_summary" },
+        "result": { "$ref": "#/$defs/PipelineRunSummarySuccessResult" }
+      }
+    },
+    "QueryCapabilitiesData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "searchableFields",
+        "filterBounds",
+        "allowedSortKeys",
+        "pagination",
+        "roofAgeSemantics",
+        "coverageSemantics",
+        "queryRestrictions"
+      ],
+      "properties": {
+        "searchableFields": {
+          "const": [
+            "coordinates",
+            "roofAgeSignal.ageYears",
+            "roofAgeSignal.basis",
+            "permit.isOpen",
+            "permit.openDurationDays",
+            "ownershipDurationYears",
+            "ownerArea",
+            "freshness.observedAt",
+            "freshness.publishedAt"
+          ]
+        },
+        "filterBounds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "radius",
+            "roofAgeYears",
+            "permitOpenDays",
+            "ownershipYears"
+          ],
+          "properties": {
+            "radius": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "units",
+                "exclusiveMinimum",
+                "maximumMiles",
+                "maximumKilometers"
+              ],
+              "properties": {
+                "units": { "const": ["mi", "km"] },
+                "exclusiveMinimum": { "const": 0 },
+                "maximumMiles": { "const": 50 },
+                "maximumKilometers": { "const": 80.4672 }
+              }
+            },
+            "roofAgeYears": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["minimum", "maximum", "operators", "bases"],
+              "properties": {
+                "minimum": { "const": 0 },
+                "maximum": { "const": 100 },
+                "operators": { "const": ["gt", "gte"] },
+                "bases": { "const": ["direct_only", "direct_or_proxy"] }
+              }
+            },
+            "permitOpenDays": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["minimum", "maximum"],
+              "properties": {
+                "minimum": { "const": 0 },
+                "maximum": { "const": 36500 }
+              }
+            },
+            "ownershipYears": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["minimum", "maximum", "operators"],
+              "properties": {
+                "minimum": { "const": 0 },
+                "maximum": { "const": 500 },
+                "operators": { "const": ["gt", "gte"] }
+              }
+            }
+          }
+        },
+        "allowedSortKeys": {
+          "const": [
+            "distance_asc",
+            "roof_age_desc",
+            "permit_open_days_desc"
+          ]
+        },
+        "pagination": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["minimumLimit", "maximumLimit", "cursor", "stableOrdering"],
+          "properties": {
+            "minimumLimit": { "const": 1 },
+            "maximumLimit": { "const": 100 },
+            "cursor": { "const": "opaque" },
+            "stableOrdering": { "const": true }
+          }
+        },
+        "roofAgeSemantics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "actualBasis",
+            "proxyBases",
+            "yearBuiltProxyIsActualRoofAge"
+          ],
+          "properties": {
+            "actualBasis": { "const": "roof_installation_date" },
+            "proxyBases": {
+              "const": [
+                "roof_permit_completion",
+                "final_inspection",
+                "roof_permit_issue",
+                "year_built_proxy"
+              ]
+            },
+            "yearBuiltProxyIsActualRoofAge": { "const": false }
+          }
+        },
+        "coverageSemantics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["coordinates", "permits", "contractors"],
+          "properties": {
+            "coordinates": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "missingExcludedFromRadius",
+                "directLookupPreservesUnavailable"
+              ],
+              "properties": {
+                "missingExcludedFromRadius": { "const": true },
+                "directLookupPreservesUnavailable": { "const": true }
+              }
+            },
+            "permits": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "unavailableDistinctFromZeroMatches",
+                "aggregatesNullWhenUnavailable"
+              ],
+              "properties": {
+                "unavailableDistinctFromZeroMatches": { "const": true },
+                "aggregatesNullWhenUnavailable": { "const": true }
+              }
+            },
+            "contractors": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["unavailableDistinctFromNoMatch"],
+              "properties": {
+                "unavailableDistinctFromNoMatch": { "const": true }
+              }
+            }
+          }
+        },
+        "queryRestrictions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "arbitrarySql",
+            "arbitraryFilesystemPaths",
+            "databaseAccess",
+            "publicationMutation",
+            "internalSchemaExposure"
+          ],
+          "properties": {
+            "arbitrarySql": { "const": false },
+            "arbitraryFilesystemPaths": { "const": false },
+            "databaseAccess": { "const": false },
+            "publicationMutation": { "const": false },
+            "internalSchemaExposure": { "const": false }
+          }
+        }
+      }
+    },
+    "QuerySchemaSuccessResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "data", "meta"],
+      "properties": {
+        "ok": { "const": true },
+        "data": { "$ref": "#/$defs/QueryCapabilitiesData" },
+        "meta": { "$ref": "#/$defs/ResponseMeta" }
+      }
+    },
+    "QuerySchemaRequestFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "arguments"],
+      "properties": {
+        "fixtureType": { "const": "query-schema-request" },
+        "tool": { "const": "prism_v1_get_query_schema" },
+        "arguments": { "$ref": "#/$defs/QuerySchemaArguments" }
+      }
+    },
+    "QuerySchemaResponseFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "result"],
+      "properties": {
+        "fixtureType": { "const": "query-schema-response" },
+        "tool": { "const": "prism_v1_get_query_schema" },
+        "result": { "$ref": "#/$defs/QuerySchemaSuccessResult" }
+      }
+    },
     "SearchArguments": {
       "type": "object",
       "additionalProperties": false,
@@ -428,6 +1004,48 @@
         "arguments": { "$ref": "#/$defs/SearchArguments" }
       }
     },
+    "SearchSuccessResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "data", "meta"],
+      "properties": {
+        "ok": { "const": true },
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["resolvedCenter", "opportunities"],
+          "properties": {
+            "resolvedCenter": { "$ref": "#/$defs/Fact" },
+            "opportunities": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["property", "distanceMeters", "matchReasons"],
+                "properties": {
+                  "property": { "$ref": "#/$defs/Property" },
+                  "distanceMeters": { "$ref": "#/$defs/Fact" },
+                  "matchReasons": {
+                    "type": "array",
+                    "items": {
+                      "enum": [
+                        "roof_age",
+                        "open_roofing_permit",
+                        "ownership_duration",
+                        "owner_area"
+                      ]
+                    },
+                    "minItems": 1,
+                    "uniqueItems": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "meta": { "$ref": "#/$defs/ResponseMeta" }
+      }
+    },
     "SearchResponseFixture": {
       "type": "object",
       "additionalProperties": false,
@@ -435,48 +1053,27 @@
       "properties": {
         "fixtureType": { "const": "search-response" },
         "tool": { "const": "prism_v1_search_roofing_opportunities" },
-        "result": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["ok", "data", "meta"],
-          "properties": {
-            "ok": { "const": true },
-            "data": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["resolvedCenter", "opportunities"],
-              "properties": {
-                "resolvedCenter": { "$ref": "#/$defs/Fact" },
-                "opportunities": {
-                  "type": "array",
-                  "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["property", "distanceMeters", "matchReasons"],
-                    "properties": {
-                      "property": { "$ref": "#/$defs/Property" },
-                      "distanceMeters": { "$ref": "#/$defs/Fact" },
-                      "matchReasons": {
-                        "type": "array",
-                        "items": {
-                          "enum": [
-                            "roof_age",
-                            "open_roofing_permit",
-                            "ownership_duration",
-                            "owner_area"
-                          ]
-                        },
-                        "minItems": 1,
-                        "uniqueItems": true
-                      }
-                    }
-                  }
-                }
-              }
-            },
-            "meta": { "$ref": "#/$defs/ResponseMeta" }
-          }
-        }
+        "result": { "$ref": "#/$defs/SearchSuccessResult" }
+      }
+    },
+    "PropertyRequestFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "arguments"],
+      "properties": {
+        "fixtureType": { "const": "property-request" },
+        "tool": { "const": "prism_v1_get_property" },
+        "arguments": { "$ref": "#/$defs/PropertyArguments" }
+      }
+    },
+    "PropertySuccessResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "data", "meta"],
+      "properties": {
+        "ok": { "const": true },
+        "data": { "$ref": "#/$defs/Property" },
+        "meta": { "$ref": "#/$defs/ResponseMeta" }
       }
     },
     "PropertyResponseFixture": {
@@ -486,16 +1083,27 @@
       "properties": {
         "fixtureType": { "const": "property-response" },
         "tool": { "const": "prism_v1_get_property" },
-        "result": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["ok", "data", "meta"],
-          "properties": {
-            "ok": { "const": true },
-            "data": { "$ref": "#/$defs/Property" },
-            "meta": { "$ref": "#/$defs/ResponseMeta" }
-          }
-        }
+        "result": { "$ref": "#/$defs/PropertySuccessResult" }
+      }
+    },
+    "PermitRequestFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "arguments"],
+      "properties": {
+        "fixtureType": { "const": "permit-request" },
+        "tool": { "const": "prism_v1_get_permit" },
+        "arguments": { "$ref": "#/$defs/PermitArguments" }
+      }
+    },
+    "PermitSuccessResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "data", "meta"],
+      "properties": {
+        "ok": { "const": true },
+        "data": { "$ref": "#/$defs/Permit" },
+        "meta": { "$ref": "#/$defs/ResponseMeta" }
       }
     },
     "PermitResponseFixture": {
@@ -505,16 +1113,7 @@
       "properties": {
         "fixtureType": { "const": "permit-response" },
         "tool": { "const": "prism_v1_get_permit" },
-        "result": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["ok", "data", "meta"],
-          "properties": {
-            "ok": { "const": true },
-            "data": { "$ref": "#/$defs/Permit" },
-            "meta": { "$ref": "#/$defs/ResponseMeta" }
-          }
-        }
+        "result": { "$ref": "#/$defs/PermitSuccessResult" }
       }
     },
     "ErrorResponseFixture": {
@@ -523,16 +1122,7 @@
       "required": ["fixtureType", "tool", "result"],
       "properties": {
         "fixtureType": { "const": "error-response" },
-        "tool": {
-          "enum": [
-            "prism_v1_get_service_info",
-            "prism_v1_get_pipeline_run_summary",
-            "prism_v1_search_roofing_opportunities",
-            "prism_v1_get_property",
-            "prism_v1_get_permit",
-            "prism_v1_get_query_schema"
-          ]
-        },
+        "tool": { "$ref": "#/$defs/ToolName" },
         "result": {
           "type": "object",
           "additionalProperties": false,

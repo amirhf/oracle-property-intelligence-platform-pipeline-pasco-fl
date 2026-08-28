@@ -46,8 +46,10 @@ approval after external prerequisites are satisfied.
 Deploy later to the approved prism-pasco-oracle Vercel project label only when
 deployment is explicitly authorized. The project must publicly serve the
 read-only explorer, /health and /mcp without evaluator credentials and without
-local runtime dependencies. Register only the six frozen prism_v1_* tools.
-Clients/models never supply SQL. Enforce mandatory structured-input, body,
+local runtime dependencies. Implement active MCP contract revision 1.1.0 and
+register all six frozen prism_v1_* tools with their strict input and success
+schemas. A consuming agent may whitelist a smaller workflow-specific subset,
+but the server discovery surface remains all six. Clients/models never supply SQL. Enforce mandatory structured-input, body,
 radius, page, response, deadline, DuckDB concurrency and queue bounds. Prefer
 platform-native rate limiting when already available; otherwise implement and
 honestly document an instance-local best-effort limiter without adding Redis or

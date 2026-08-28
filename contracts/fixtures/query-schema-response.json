@@ -1,0 +1,92 @@
+{
+  "fixtureType": "query-schema-response",
+  "tool": "prism_v1_get_query_schema",
+  "result": {
+    "ok": true,
+    "data": {
+      "searchableFields": [
+        "coordinates",
+        "roofAgeSignal.ageYears",
+        "roofAgeSignal.basis",
+        "permit.isOpen",
+        "permit.openDurationDays",
+        "ownershipDurationYears",
+        "ownerArea",
+        "freshness.observedAt",
+        "freshness.publishedAt"
+      ],
+      "filterBounds": {
+        "radius": {
+          "units": ["mi", "km"],
+          "exclusiveMinimum": 0,
+          "maximumMiles": 50,
+          "maximumKilometers": 80.4672
+        },
+        "roofAgeYears": {
+          "minimum": 0,
+          "maximum": 100,
+          "operators": ["gt", "gte"],
+          "bases": ["direct_only", "direct_or_proxy"]
+        },
+        "permitOpenDays": {
+          "minimum": 0,
+          "maximum": 36500
+        },
+        "ownershipYears": {
+          "minimum": 0,
+          "maximum": 500,
+          "operators": ["gt", "gte"]
+        }
+      },
+      "allowedSortKeys": [
+        "distance_asc",
+        "roof_age_desc",
+        "permit_open_days_desc"
+      ],
+      "pagination": {
+        "minimumLimit": 1,
+        "maximumLimit": 100,
+        "cursor": "opaque",
+        "stableOrdering": true
+      },
+      "roofAgeSemantics": {
+        "actualBasis": "roof_installation_date",
+        "proxyBases": [
+          "roof_permit_completion",
+          "final_inspection",
+          "roof_permit_issue",
+          "year_built_proxy"
+        ],
+        "yearBuiltProxyIsActualRoofAge": false
+      },
+      "coverageSemantics": {
+        "coordinates": {
+          "missingExcludedFromRadius": true,
+          "directLookupPreservesUnavailable": true
+        },
+        "permits": {
+          "unavailableDistinctFromZeroMatches": true,
+          "aggregatesNullWhenUnavailable": true
+        },
+        "contractors": {
+          "unavailableDistinctFromNoMatch": true
+        }
+      },
+      "queryRestrictions": {
+        "arbitrarySql": false,
+        "arbitraryFilesystemPaths": false,
+        "databaseAccess": false,
+        "publicationMutation": false,
+        "internalSchemaExposure": false
+      }
+    },
+    "meta": {
+      "contractVersion": "1.1.0",
+      "schemaHash": "1ef6f43072bc93ee8557aa9fcd0ce55eab26560fe4d061fac7c9388b2d0301c5",
+      "county": "pasco",
+      "asOf": "2026-08-28T00:00:00Z",
+      "artifactCids": [],
+      "nextCursor": null
+    }
+  }
+}

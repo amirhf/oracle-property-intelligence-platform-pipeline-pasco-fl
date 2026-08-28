@@ -1,0 +1,94 @@
+{
+  "fixtureType": "pipeline-run-summary-response",
+  "tool": "prism_v1_get_pipeline_run_summary",
+  "result": {
+    "ok": true,
+    "data": {
+      "county": "pasco",
+      "runId": "run_11111111111111111111111111111111",
+      "workflowId": "CountyIngest/pasco/run_11111111111111111111111111111111",
+      "status": "completed",
+      "startedAt": "2026-08-28T00:00:00Z",
+      "completedAt": "2026-08-28T00:05:00Z",
+      "sourceCounts": [
+        {
+          "sourceSystem": "fixture_appraiser",
+          "sourceRecords": 25,
+          "parsedRecords": 25,
+          "acceptedRecords": 25,
+          "rejectedRecords": 0
+        },
+        {
+          "sourceSystem": "fixture_gis",
+          "sourceRecords": 25,
+          "parsedRecords": 25,
+          "acceptedRecords": 24,
+          "rejectedRecords": 1
+        }
+      ],
+      "reconciliationCounts": {
+        "canonicalProperties": 25,
+        "distinctPropertyIds": 25,
+        "newRecords": 25,
+        "changedRecords": 0,
+        "unchangedRecords": 0,
+        "duplicateRecords": 0
+      },
+      "coverage": {
+        "properties": {
+          "available": 25,
+          "unavailable": 0
+        },
+        "coordinates": {
+          "available": 24,
+          "unavailable": 1
+        },
+        "roofSignals": {
+          "available": 25,
+          "unavailable": 0,
+          "direct": 0,
+          "proxy": 25
+        },
+        "permits": {
+          "status": "unavailable",
+          "recordCount": null,
+          "propertyCount": null,
+          "unavailableReason": "source_unavailable"
+        },
+        "contractors": {
+          "status": "unavailable",
+          "recordCount": null,
+          "propertyCount": null,
+          "unavailableReason": "source_not_collected"
+        }
+      },
+      "publicationArtifacts": {
+        "status": "dry_run_validated",
+        "datasetVersion": "fixture-dataset-2026-08-28",
+        "artifactCount": 34,
+        "publishedAt": null,
+        "artifactCids": []
+      },
+      "unavailableSources": [
+        {
+          "sourceSystem": "permits",
+          "reason": "source_unavailable",
+          "message": "The synthetic fixture represents unavailable permit-source coverage."
+        },
+        {
+          "sourceSystem": "contractors",
+          "reason": "source_not_collected",
+          "message": "The synthetic fixture represents unavailable contractor-source coverage."
+        }
+      ]
+    },
+    "meta": {
+      "contractVersion": "1.1.0",
+      "schemaHash": "1ef6f43072bc93ee8557aa9fcd0ce55eab26560fe4d061fac7c9388b2d0301c5",
+      "county": "pasco",
+      "asOf": "2026-08-28T00:05:00Z",
+      "artifactCids": [],
+      "nextCursor": null
+    }
+  }
+}

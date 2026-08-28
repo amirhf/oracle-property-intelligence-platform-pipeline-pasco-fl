@@ -59,6 +59,8 @@ Approved hosting labels:
 
 The hosted project reads only public IPNS/IPFS artifacts. It does not use local PostgreSQL, Restate, `DATA_DIR`, source captures, or sibling repositories.
 
+The active MCP v1-family contract revision is `1.1.0`. It supersedes the committed `1.0.0` schema with SHA-256 `714ee037ffca1362870a5135328a783bfe4a0161e7136e09d4d1590894211de7`; the prior hash and source commits remain recorded in `contracts/contract-lock.json` and Git history.
+
 The MCP registers only:
 
 - `prism_v1_get_service_info`
@@ -67,6 +69,8 @@ The MCP registers only:
 - `prism_v1_get_property`
 - `prism_v1_get_permit`
 - `prism_v1_get_query_schema`
+
+Every advertised tool has a strict structured input and success-output schema. A consuming agent may expose a least-privilege subset of these tools for its workflow, but that does not reduce or alter the six-tool public MCP surface.
 
 Existing Elephant DuckDB machinery may be reused internally, but SQL text is never accepted from a client or model and raw/legacy tools are not registered.
 

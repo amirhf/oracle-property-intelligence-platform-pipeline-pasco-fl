@@ -35,7 +35,7 @@ Reference repositories are strictly read-only. Never change them. The final buil
 
 ## Contract and publication authority
 
-- Contract version is `1.0.0`. The exact MCP schema bytes and hash in `contracts/contract-lock.json` are binding.
+- Active MCP contract revision is `1.1.0`. The exact schema bytes and hash in `contracts/contract-lock.json` are binding; the superseded `1.0.0` hash and source commits remain recorded as historical evidence.
 - Shared contract changes require controller approval and synchronized byte-identical updates in both assignment repositories.
 - The public MCP registers only the six frozen `prism_v1_*` structured tools. Do not expose raw SQL or legacy tools.
 - There are exactly two publication domains, documented in `docs/publication-plan.md`.

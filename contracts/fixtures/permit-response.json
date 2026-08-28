@@ -95,8 +95,8 @@
       }
     },
     "meta": {
-      "contractVersion": "1.0.0",
-      "schemaHash": "714ee037ffca1362870a5135328a783bfe4a0161e7136e09d4d1590894211de7",
+      "contractVersion": "1.1.0",
+      "schemaHash": "1ef6f43072bc93ee8557aa9fcd0ce55eab26560fe4d061fac7c9388b2d0301c5",
       "county": "pasco",
       "asOf": "2026-08-28T00:00:00Z",
       "artifactCids": [],

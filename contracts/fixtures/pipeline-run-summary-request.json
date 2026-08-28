@@ -1,0 +1,5 @@
+{
+  "fixtureType": "pipeline-run-summary-request",
+  "tool": "prism_v1_get_pipeline_run_summary",
+  "arguments": {}
+}

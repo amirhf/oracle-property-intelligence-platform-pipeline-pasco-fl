@@ -1,0 +1,7 @@
+{
+  "fixtureType": "permit-request",
+  "tool": "prism_v1_get_permit",
+  "arguments": {
+    "permitId": "perm_91699de8cc4d322ad6fb183f20ae349e"
+  }
+}
