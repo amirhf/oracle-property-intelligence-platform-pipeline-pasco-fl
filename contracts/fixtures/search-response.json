@@ -1,0 +1,164 @@
+{
+  "fixtureType": "search-response",
+  "tool": "prism_v1_search_roofing_opportunities",
+  "result": {
+    "ok": true,
+    "data": {
+      "resolvedCenter": {
+        "availability": "available",
+        "value": {
+          "latitude": 28.2336,
+          "longitude": -82.1812,
+          "crs": "EPSG:4326"
+        },
+        "class": "derived",
+        "evidenceRefs": ["ev_fixture_appraiser_001"],
+        "derivation": {
+          "rule": "published_place_centroid",
+          "ruleVersion": "1.0.0",
+          "inputs": ["publishedPropertyCoordinates"]
+        }
+      },
+      "opportunities": [
+        {
+          "property": {
+            "propertyId": "prop_e72ba795455c19d71ce4cb11f6177a5e",
+            "county": "pasco",
+            "folio": {
+              "availability": "available",
+              "value": "FIXTURE-FOLIO-001",
+              "class": "raw",
+              "evidenceRefs": ["ev_fixture_appraiser_001"]
+            },
+            "address": {
+              "availability": "available",
+              "value": "100 TEST WAY, FIXTURE ZEPHYRHILLS, FL 33540",
+              "class": "normalized",
+              "evidenceRefs": ["ev_fixture_appraiser_001"]
+            },
+            "coordinates": {
+              "availability": "available",
+              "value": {
+                "latitude": 28.2336,
+                "longitude": -82.1812,
+                "crs": "EPSG:4326"
+              },
+              "class": "normalized",
+              "evidenceRefs": ["ev_fixture_appraiser_001"]
+            },
+            "yearBuilt": {
+              "availability": "available",
+              "value": 2008,
+              "class": "raw",
+              "evidenceRefs": ["ev_fixture_appraiser_001"]
+            },
+            "roofInstallationDate": {
+              "availability": "unavailable",
+              "value": null,
+              "class": "raw",
+              "reason": "not_provided_by_source",
+              "evidenceRefs": ["ev_fixture_appraiser_001"]
+            },
+            "roofAgeSignal": {
+              "availability": "available",
+              "value": {
+                "ageYears": 18,
+                "precision": "year",
+                "basis": "year_built_proxy",
+                "basisQuality": "proxy",
+                "asOf": "2026-08-28T00:00:00Z"
+              },
+              "class": "derived",
+              "evidenceRefs": ["ev_fixture_appraiser_001"],
+              "derivation": {
+                "rule": "year_difference_proxy",
+                "ruleVersion": "1.0.0",
+                "asOf": "2026-08-28T00:00:00Z",
+                "inputs": ["property.yearBuilt"]
+              }
+            },
+            "ownershipDurationYears": {
+              "availability": "unavailable",
+              "value": null,
+              "class": "derived",
+              "reason": "not_provided_by_source",
+              "evidenceRefs": ["ev_fixture_appraiser_001"]
+            },
+            "ownerArea": {
+              "availability": "unavailable",
+              "value": null,
+              "class": "derived",
+              "reason": "not_provided_by_source",
+              "evidenceRefs": ["ev_fixture_appraiser_001"]
+            },
+            "openRoofingPermitCount": {
+              "availability": "available",
+              "value": 0,
+              "class": "derived",
+              "evidenceRefs": ["ev_fixture_appraiser_001"],
+              "derivation": {
+                "rule": "count_open_roofing_permits",
+                "ruleVersion": "1.0.0",
+                "asOf": "2026-08-28T00:00:00Z",
+                "inputs": ["permits"]
+              }
+            },
+            "maximumOpenRoofingPermitDays": {
+              "availability": "unavailable",
+              "value": null,
+              "class": "derived",
+              "reason": "not_applicable",
+              "evidenceRefs": []
+            },
+            "permits": [],
+            "evidence": [
+              {
+                "evidenceId": "ev_fixture_appraiser_001",
+                "sourceSystem": "fixture",
+                "sourceName": "Contract fixture appraisal source",
+                "sourceRecordKey": "FIXTURE-FOLIO-001",
+                "sourceUrl": null,
+                "sourceArtifactUri": "fixture://pasco/appraiser/FIXTURE-FOLIO-001",
+                "sourceRecordHash": "sha256:c8510a5f2e795898cc5cb13a7e04f51ed56403072f62b5ee060971018f5a00c3",
+                "observedAt": "2026-08-28T00:00:00Z",
+                "retrievedAt": "2026-08-28T00:00:00Z",
+                "loadedAt": "2026-08-28T00:00:00Z",
+                "publishedCid": null
+              }
+            ],
+            "freshness": {
+              "observedAt": "2026-08-28T00:00:00Z",
+              "retrievedAt": "2026-08-28T00:00:00Z",
+              "loadedAt": "2026-08-28T00:00:00Z",
+              "publishedAt": null,
+              "computedAt": "2026-08-28T00:00:00Z",
+              "sourceCadence": "weekly fixture cadence",
+              "cadenceStatus": "within_source_cadence"
+            }
+          },
+          "distanceMeters": {
+            "availability": "available",
+            "value": 0,
+            "class": "derived",
+            "evidenceRefs": ["ev_fixture_appraiser_001"],
+            "derivation": {
+              "rule": "haversine_meters",
+              "ruleVersion": "1.0.0",
+              "asOf": "2026-08-28T00:00:00Z",
+              "inputs": ["search.center", "property.coordinates"]
+            }
+          },
+          "matchReasons": ["roof_age"]
+        }
+      ]
+    },
+    "meta": {
+      "contractVersion": "1.0.0",
+      "schemaHash": "714ee037ffca1362870a5135328a783bfe4a0161e7136e09d4d1590894211de7",
+      "county": "pasco",
+      "asOf": "2026-08-28T00:00:00Z",
+      "artifactCids": [],
+      "nextCursor": null
+    }
+  }
+}

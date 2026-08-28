@@ -1,0 +1,33 @@
+{
+  "fixtureType": "search-request",
+  "tool": "prism_v1_search_roofing_opportunities",
+  "arguments": {
+    "county": "pasco",
+    "center": {
+      "kind": "place",
+      "text": "Fixture Zephyrhills, FL"
+    },
+    "radius": {
+      "value": 5,
+      "unit": "mi"
+    },
+    "filters": {
+      "roofAge": {
+        "operator": "gt",
+        "years": 15,
+        "basis": "direct_or_proxy"
+      },
+      "permit": {
+        "roofingOnly": true,
+        "openOnly": true,
+        "minOpenDays": 365
+      },
+      "matchMode": "any"
+    },
+    "sort": "permit_open_days_desc",
+    "page": {
+      "limit": 25
+    },
+    "asOf": "2026-08-28T00:00:00Z"
+  }
+}

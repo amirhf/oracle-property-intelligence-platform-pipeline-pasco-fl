@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "contractVersion": "1.0.0",
+  "hashAlgorithm": {
+    "name": "SHA-256",
+    "input": "Exact committed file bytes, including the final LF byte.",
+    "normalization": "none",
+    "command": "shasum -a 256 contracts/mcp-v1.schema.json"
+  },
+  "mcpSchema": {
+    "path": "contracts/mcp-v1.schema.json",
+    "sha256": "714ee037ffca1362870a5135328a783bfe4a0161e7136e09d4d1590894211de7",
+    "mustBeByteIdenticalAcrossAssignments": true
+  },
+  "canonicalSchema": {
+    "path": "contracts/canonical-v1.schema.json",
+    "sha256": "59c6472c2cd6d18041cf72c779fb970a082b00bef09aea724b99687e84198306"
+  },
+  "sharedFixtures": [
+    {
+      "path": "contracts/fixtures/error-response.json",
+      "sha256": "76b3c42a6424fadfc2bf5bdbe829b9102d86e2d70ba76d7689fc3fabe4f67dd2"
+    },
+    {
+      "path": "contracts/fixtures/permit-response.json",
+      "sha256": "155d2bec9d0c33b633c7014df719a697aa1be3099596208b3cf6dafc870b414f"
+    },
+    {
+      "path": "contracts/fixtures/property-response.json",
+      "sha256": "3b604b16cf16cf23f3b2957138a4fb3755c4c7fdbd63422fdc5cfb8c05201a87"
+    },
+    {
+      "path": "contracts/fixtures/search-request.json",
+      "sha256": "1c39b3b43c35e34e6cf6126166634e5d518a91153123f8554062f200ca095269"
+    },
+    {
+      "path": "contracts/fixtures/search-response.json",
+      "sha256": "eaa43b787460810ddcc8d5cb6f0a71101e2fa3fc96f3c58fc4f4c06c4946935a"
+    }
+  ],
+  "baselineCommit": null,
+  "baselineCommitStatus": "pending until this approved baseline is committed in a later authorized phase"
+}
