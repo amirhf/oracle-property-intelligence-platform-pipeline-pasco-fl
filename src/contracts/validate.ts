@@ -62,6 +62,144 @@ async function readJson<T>(filePath: string): Promise<T> {
   return JSON.parse(await readFile(filePath, "utf8")) as T;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function semanticError(instancePath: string, keyword: string): ErrorObject {
+  return {
+    instancePath,
+    schemaPath: `#/$semantic/${keyword}`,
+    keyword,
+    params: {},
+    message: "violates the MCP ownership publication semantics",
+  };
+}
+
+function normalizeAddress(value: string): string {
+  return value.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function propertyRecords(
+  fixture: FixtureName,
+  value: unknown,
+): Array<{ path: string; property: Record<string, unknown> }> {
+  if (
+    !isRecord(value) ||
+    !isRecord(value.result) ||
+    !isRecord(value.result.data)
+  ) {
+    return [];
+  }
+  if (fixture === "property-response.json") {
+    return [{ path: "/result/data", property: value.result.data }];
+  }
+  if (fixture !== "search-response.json") return [];
+  const opportunities = value.result.data.opportunities;
+  if (!Array.isArray(opportunities)) return [];
+  return opportunities.flatMap((opportunity, index) =>
+    isRecord(opportunity) && isRecord(opportunity.property)
+      ? [
+          {
+            path: `/result/data/opportunities/${index}/property`,
+            property: opportunity.property,
+          },
+        ]
+      : [],
+  );
+}
+
+function ownershipSemanticErrors(
+  fixture: FixtureName,
+  value: unknown,
+): ErrorObject[] {
+  const errors: ErrorObject[] = [];
+  for (const { path, property } of propertyRecords(fixture, value)) {
+    if (!isRecord(property.ownership)) continue;
+    const evidenceIds = new Set(
+      Array.isArray(property.evidence)
+        ? property.evidence.flatMap((evidence) =>
+            isRecord(evidence) && typeof evidence.evidenceId === "string"
+              ? [evidence.evidenceId]
+              : [],
+          )
+        : [],
+    );
+    const visit = (entry: unknown, entryPath: string): void => {
+      if (Array.isArray(entry)) {
+        entry.forEach((child, index) => visit(child, `${entryPath}/${index}`));
+        return;
+      }
+      if (!isRecord(entry)) return;
+      if (Array.isArray(entry.evidenceRefs)) {
+        for (const reference of entry.evidenceRefs) {
+          if (typeof reference === "string" && !evidenceIds.has(reference)) {
+            errors.push(
+              semanticError(`${entryPath}/evidenceRefs`, "evidenceReference"),
+            );
+            break;
+          }
+        }
+      }
+      Object.entries(entry).forEach(([key, child]) =>
+        visit(child, `${entryPath}/${key}`),
+      );
+    };
+    visit(property.ownership, `${path}/ownership`);
+
+    const situs = isRecord(property.address)
+      ? property.address.value
+      : undefined;
+    const mailing = isRecord(property.ownership.publicMailingAddress)
+      ? property.ownership.publicMailingAddress
+      : undefined;
+    if (
+      typeof situs !== "string" ||
+      mailing?.availability !== "available" ||
+      !isRecord(mailing.value)
+    ) {
+      continue;
+    }
+    const mailingValue = mailing.value;
+    const componentValue = (name: string): unknown => {
+      const fact = mailingValue[name];
+      return isRecord(fact) && fact.availability === "available"
+        ? fact.value
+        : undefined;
+    };
+    const addressLines = componentValue("addressLines");
+    const lineText = Array.isArray(addressLines)
+      ? addressLines
+          .filter((line): line is string => typeof line === "string")
+          .join(" ")
+      : "";
+    const fullMailing = [
+      lineText,
+      componentValue("locality"),
+      componentValue("region"),
+      componentValue("postalCode"),
+      componentValue("country"),
+    ]
+      .filter((component): component is string => typeof component === "string")
+      .join(" ");
+    const normalizedSitus = normalizeAddress(situs);
+    if (
+      normalizedSitus.length > 0 &&
+      [lineText, fullMailing].some(
+        (candidate) => normalizeAddress(candidate) === normalizedSitus,
+      )
+    ) {
+      errors.push(
+        semanticError(
+          `${path}/ownership/publicMailingAddress`,
+          "situsMailingDistinct",
+        ),
+      );
+    }
+  }
+  return errors;
+}
+
 export async function sha256File(filePath: string): Promise<string> {
   return createHash("sha256")
     .update(await readFile(filePath))
@@ -115,11 +253,15 @@ export class FrozenContractValidator {
     if (!validate) {
       throw new Error(`No validator compiled for ${fixture}`);
     }
-    if (validate(value)) {
+    const schemaValid = validate(value);
+    const semanticErrors = schemaValid
+      ? ownershipSemanticErrors(fixture, value)
+      : [];
+    if (schemaValid && semanticErrors.length === 0) {
       return undefined;
     }
     return {
-      errors: structuredClone(validate.errors ?? []),
+      errors: [...structuredClone(validate.errors ?? []), ...semanticErrors],
       fixture,
     };
   }

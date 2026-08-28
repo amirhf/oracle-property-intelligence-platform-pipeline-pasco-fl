@@ -73,6 +73,86 @@
         "reason": "not_provided_by_source",
         "evidenceRefs": ["ev_fixture_appraiser_001"]
       },
+      "ownership": {
+        "currentOwners": {
+          "availability": "available",
+          "value": [
+            {
+              "displayName": "EXAMPLE RECORD HOLDER ONE",
+              "evidenceRefs": ["ev_fixture_appraiser_001"]
+            },
+            {
+              "displayName": "EXAMPLE RECORD HOLDER TWO",
+              "evidenceRefs": ["ev_fixture_appraiser_001"]
+            }
+          ],
+          "class": "raw",
+          "evidenceRefs": ["ev_fixture_appraiser_001"]
+        },
+        "classification": {
+          "availability": "unavailable",
+          "value": null,
+          "class": "raw",
+          "reason": "not_provided_by_source",
+          "evidenceRefs": ["ev_fixture_appraiser_001"]
+        },
+        "publicMailingAddress": {
+          "availability": "available",
+          "value": {
+            "addressLines": {
+              "availability": "available",
+              "value": ["900 EXAMPLE RECORD AVENUE"],
+              "class": "raw",
+              "evidenceRefs": ["ev_fixture_appraiser_001"]
+            },
+            "locality": {
+              "availability": "available",
+              "value": "SAMPLEVILLE",
+              "class": "raw",
+              "evidenceRefs": ["ev_fixture_appraiser_001"]
+            },
+            "region": {
+              "availability": "available",
+              "value": "FL",
+              "class": "raw",
+              "evidenceRefs": ["ev_fixture_appraiser_001"]
+            },
+            "postalCode": {
+              "availability": "available",
+              "value": "00000",
+              "class": "raw",
+              "evidenceRefs": ["ev_fixture_appraiser_001"]
+            },
+            "country": {
+              "availability": "available",
+              "value": "US",
+              "class": "raw",
+              "evidenceRefs": ["ev_fixture_appraiser_001"]
+            }
+          },
+          "class": "raw",
+          "evidenceRefs": ["ev_fixture_appraiser_001"]
+        },
+        "phone": {
+          "availability": "unavailable",
+          "value": null,
+          "class": "raw",
+          "reason": "source_not_collected",
+          "evidenceRefs": []
+        },
+        "email": {
+          "availability": "unavailable",
+          "value": null,
+          "class": "raw",
+          "reason": "source_not_collected",
+          "evidenceRefs": []
+        },
+        "privacy": {
+          "recordNature": "official_public_record",
+          "publicationStatus": "approved_for_publication",
+          "accuracyQualification": "source_reported_not_independently_verified"
+        }
+      },
       "openRoofingPermitCount": {
         "availability": "available",
         "value": 1,
@@ -229,8 +309,8 @@
       }
     },
     "meta": {
-      "contractVersion": "1.1.0",
-      "schemaHash": "1ef6f43072bc93ee8557aa9fcd0ce55eab26560fe4d061fac7c9388b2d0301c5",
+      "contractVersion": "1.2.0",
+      "schemaHash": "9fc112ef8a4e2120593c3dc20c90073b0eb96596817c96112f63fd258bb7c131",
       "county": "pasco",
       "asOf": "2026-08-28T00:00:00Z",
       "artifactCids": [],

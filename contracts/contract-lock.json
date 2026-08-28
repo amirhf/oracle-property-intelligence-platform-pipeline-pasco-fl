@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "contractVersion": "1.1.0",
+  "contractVersion": "1.2.0",
   "hashAlgorithm": {
     "name": "SHA-256",
     "input": "Exact committed file bytes, including the final LF byte.",
@@ -14,11 +14,18 @@
       "oracleSourceCommit": "92f002d72d084c96bce7ecc106a39671a3e095bb",
       "crmSourceCommit": "603ef0d5f07a565f00c3261f05102d75d9475175",
       "evidence": "Exact superseded bytes remain available in Git history at the source commits."
+    },
+    {
+      "contractVersion": "1.1.0",
+      "sha256": "1ef6f43072bc93ee8557aa9fcd0ce55eab26560fe4d061fac7c9388b2d0301c5",
+      "oracleSourceCommit": "a9222ee91be2eaa5126b7435f917e0da27daa5f8",
+      "crmSourceCommit": "71c03f8b653850f3e8afcd64b39aff67b5551332",
+      "evidence": "Exact superseded bytes remain available in Git history at the source commits."
     }
   ],
   "mcpSchema": {
     "path": "contracts/mcp-v1.schema.json",
-    "sha256": "1ef6f43072bc93ee8557aa9fcd0ce55eab26560fe4d061fac7c9388b2d0301c5",
+    "sha256": "9fc112ef8a4e2120593c3dc20c90073b0eb96596817c96112f63fd258bb7c131",
     "mustBeByteIdenticalAcrossAssignments": true
   },
   "canonicalSchema": {
@@ -28,7 +35,7 @@
   "sharedFixtures": [
     {
       "path": "contracts/fixtures/error-response.json",
-      "sha256": "c2ecf8783eb98807c2aec59c275b05648eb0927ba25447c8dfa3c77a7a77eab6"
+      "sha256": "bc1de3f33517ae9837e7a8de7a651f7e61ad788562713dcb2dfc451c3403759b"
     },
     {
       "path": "contracts/fixtures/permit-request.json",
@@ -36,7 +43,7 @@
     },
     {
       "path": "contracts/fixtures/permit-response.json",
-      "sha256": "61c7c800957326a97f587bbe431b38510a57e7e19ef37b34572264d6840818e3"
+      "sha256": "3fa65d1721d0a9538c86f1b2456f277aafe6ac29f4b1fe18e8d6cf07a778c193"
     },
     {
       "path": "contracts/fixtures/pipeline-run-summary-request.json",
@@ -44,7 +51,7 @@
     },
     {
       "path": "contracts/fixtures/pipeline-run-summary-response.json",
-      "sha256": "ed60da10f91aa40749dc74cbe1d04a57e7c726e9585e7da95d593c3532a3dd8e"
+      "sha256": "48a5b9f5da9662d88343b62bcef1262a5e107d10d74bc0141c4e707d865b1949"
     },
     {
       "path": "contracts/fixtures/property-request.json",
@@ -52,7 +59,7 @@
     },
     {
       "path": "contracts/fixtures/property-response.json",
-      "sha256": "3cfdf8f2ef24371fc8506645f1d9c36bdbdc521bee10b387e427217503603548"
+      "sha256": "60356df86e8ccbb3b5511808a12385ba992c2734847268537b866426ebb5d11e"
     },
     {
       "path": "contracts/fixtures/query-schema-request.json",
@@ -60,7 +67,7 @@
     },
     {
       "path": "contracts/fixtures/query-schema-response.json",
-      "sha256": "d4c9cfdd5141e42c5e6814cd38157986d2f81b97152648a4a8883fc2a7fc2ee3"
+      "sha256": "1a775c367ba873ab431903535ee386ea0ab804c6d7aee119685579c272882c59"
     },
     {
       "path": "contracts/fixtures/search-request.json",
@@ -68,7 +75,7 @@
     },
     {
       "path": "contracts/fixtures/search-response.json",
-      "sha256": "8c3196eeaf571db21ac80a770de3d3bd1a02fbf41ea4e6180d83bda88b7d86ca"
+      "sha256": "465e401b0c9c1bf449c156244bddc323b9d24ac2174c98002f2dbdd8d2dbcc33"
     },
     {
       "path": "contracts/fixtures/service-info-request.json",
@@ -76,9 +83,9 @@
     },
     {
       "path": "contracts/fixtures/service-info-response.json",
-      "sha256": "814c6f7efde91bfe9ac624e1b659e23fc343619455b24cd782d066bcd5bb4e77"
+      "sha256": "d53b33cfaee38bfa0adba17c870b688a7b7417fbe835dc77952a825d708811df"
     }
   ],
   "baselineCommit": null,
-  "baselineCommitStatus": "pending until this approved baseline is committed in a later authorized phase"
+  "baselineCommitStatus": "pending until this approved v1.2.0 revision is committed in a later authorized phase"
 }

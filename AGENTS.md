@@ -35,9 +35,10 @@ Reference repositories are strictly read-only. Never change them. The final buil
 
 ## Contract and publication authority
 
-- Active MCP contract revision is `1.1.0`. The exact schema bytes and hash in `contracts/contract-lock.json` are binding; the superseded `1.0.0` hash and source commits remain recorded as historical evidence.
+- Active MCP contract revision is `1.2.0`. The exact schema bytes and hash in `contracts/contract-lock.json` are binding; the superseded `1.1.0` and `1.0.0` hashes and source commits remain recorded as historical evidence.
 - Shared contract changes require controller approval and synchronized byte-identical updates in both assignment repositories.
 - The public MCP registers only the six frozen `prism_v1_*` structured tools. Do not expose raw SQL or legacy tools.
+- MCP property ownership/contact fields expose only approved official-public-record facts with field-level provenance and explicit unavailable states; they do not imply independent correctness verification.
 - There are exactly two publication domains, documented in `docs/publication-plan.md`.
 - Credentials alone never authorize publication.
 - No upload or IPNS mutation occurs before validation, dry-run plan review, and Amir's hash-bound `Publish/pasco/approve` action.

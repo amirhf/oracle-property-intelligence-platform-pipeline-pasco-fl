@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.prismteam.ai/oracle/mcp/v1/schema.json",
-  "title": "Prism Oracle MCP v1.1 contract fixtures",
-  "description": "Normative schemas for the structured MCP v1.1 tool inputs, outputs, evidence, pagination and partial-data behavior. The document root validates committed contract fixtures; the $defs are the runtime contract.",
+  "title": "Prism Oracle MCP v1.2 contract fixtures",
+  "description": "Normative schemas for the structured MCP v1.2 tool inputs, outputs, evidence, pagination and partial-data behavior. The document root validates committed contract fixtures; the $defs are the runtime contract.",
   "oneOf": [
     { "$ref": "#/$defs/ServiceInfoRequestFixture" },
     { "$ref": "#/$defs/ServiceInfoResponseFixture" },
@@ -20,7 +20,7 @@
   ],
   "$defs": {
     "ContractVersion": {
-      "const": "1.1.0"
+      "const": "1.2.0"
     },
     "SchemaHash": {
       "type": "string",
@@ -121,6 +121,180 @@
         { "$ref": "#/$defs/AvailableFact" },
         { "$ref": "#/$defs/UnavailableFact" }
       ]
+    },
+    "SourceUnavailableFact": {
+      "allOf": [
+        { "$ref": "#/$defs/UnavailableFact" },
+        {
+          "properties": {
+            "class": { "enum": ["raw", "normalized"] }
+          }
+        }
+      ]
+    },
+    "SourceBackedTextAvailableFact": {
+      "allOf": [
+        { "$ref": "#/$defs/AvailableFact" },
+        {
+          "properties": {
+            "value": { "type": "string", "minLength": 1, "maxLength": 500 },
+            "class": { "enum": ["raw", "normalized"] },
+            "derivation": false
+          }
+        }
+      ]
+    },
+    "SourceBackedTextFact": {
+      "oneOf": [
+        { "$ref": "#/$defs/SourceBackedTextAvailableFact" },
+        { "$ref": "#/$defs/SourceUnavailableFact" }
+      ]
+    },
+    "SourceBackedEmailAvailableFact": {
+      "allOf": [
+        { "$ref": "#/$defs/SourceBackedTextAvailableFact" },
+        {
+          "properties": {
+            "value": {
+              "type": "string",
+              "format": "email",
+              "maxLength": 320
+            }
+          }
+        }
+      ]
+    },
+    "SourceBackedEmailFact": {
+      "oneOf": [
+        { "$ref": "#/$defs/SourceBackedEmailAvailableFact" },
+        { "$ref": "#/$defs/SourceUnavailableFact" }
+      ]
+    },
+    "SourceBackedStringListAvailableFact": {
+      "allOf": [
+        { "$ref": "#/$defs/AvailableFact" },
+        {
+          "properties": {
+            "value": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1, "maxLength": 200 },
+              "minItems": 1,
+              "maxItems": 4,
+              "uniqueItems": true
+            },
+            "class": { "enum": ["raw", "normalized"] },
+            "derivation": false
+          }
+        }
+      ]
+    },
+    "SourceBackedStringListFact": {
+      "oneOf": [
+        { "$ref": "#/$defs/SourceBackedStringListAvailableFact" },
+        { "$ref": "#/$defs/SourceUnavailableFact" }
+      ]
+    },
+    "OwnerDisplayName": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["displayName", "evidenceRefs"],
+      "properties": {
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "evidenceRefs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      }
+    },
+    "CurrentOwnersAvailableFact": {
+      "allOf": [
+        { "$ref": "#/$defs/AvailableFact" },
+        {
+          "properties": {
+            "value": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/OwnerDisplayName" },
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "class": { "enum": ["raw", "normalized"] },
+            "derivation": false
+          }
+        }
+      ]
+    },
+    "CurrentOwnersFact": {
+      "oneOf": [
+        { "$ref": "#/$defs/CurrentOwnersAvailableFact" },
+        { "$ref": "#/$defs/SourceUnavailableFact" }
+      ]
+    },
+    "PublicMailingAddressValue": {
+      "description": "A public-record mailing address. Every component has its own availability and provenance; it is distinct from the property situs address.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["addressLines", "locality", "region", "postalCode", "country"],
+      "properties": {
+        "addressLines": { "$ref": "#/$defs/SourceBackedStringListFact" },
+        "locality": { "$ref": "#/$defs/SourceBackedTextFact" },
+        "region": { "$ref": "#/$defs/SourceBackedTextFact" },
+        "postalCode": { "$ref": "#/$defs/SourceBackedTextFact" },
+        "country": { "$ref": "#/$defs/SourceBackedTextFact" }
+      }
+    },
+    "PublicMailingAddressAvailableFact": {
+      "allOf": [
+        { "$ref": "#/$defs/AvailableFact" },
+        {
+          "properties": {
+            "value": { "$ref": "#/$defs/PublicMailingAddressValue" },
+            "class": { "enum": ["raw", "normalized"] },
+            "derivation": false
+          }
+        }
+      ]
+    },
+    "PublicMailingAddressFact": {
+      "oneOf": [
+        { "$ref": "#/$defs/PublicMailingAddressAvailableFact" },
+        { "$ref": "#/$defs/SourceUnavailableFact" }
+      ]
+    },
+    "OwnerContactPrivacy": {
+      "description": "Publication metadata describes provenance and approval, not independent verification or a correctness guarantee.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recordNature", "publicationStatus", "accuracyQualification"],
+      "properties": {
+        "recordNature": { "const": "official_public_record" },
+        "publicationStatus": { "const": "approved_for_publication" },
+        "accuracyQualification": {
+          "const": "source_reported_not_independently_verified"
+        }
+      }
+    },
+    "PublicOwnership": {
+      "description": "Owner-approved public-record projection. classification is a source field and does not reinterpret ownerArea; no acquisition date is inferred.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "currentOwners",
+        "classification",
+        "publicMailingAddress",
+        "phone",
+        "email",
+        "privacy"
+      ],
+      "properties": {
+        "currentOwners": { "$ref": "#/$defs/CurrentOwnersFact" },
+        "classification": { "$ref": "#/$defs/SourceBackedTextFact" },
+        "publicMailingAddress": { "$ref": "#/$defs/PublicMailingAddressFact" },
+        "phone": { "$ref": "#/$defs/SourceBackedTextFact" },
+        "email": { "$ref": "#/$defs/SourceBackedEmailFact" },
+        "privacy": { "$ref": "#/$defs/OwnerContactPrivacy" }
+      }
     },
     "Evidence": {
       "type": "object",
@@ -282,6 +456,7 @@
         "roofAgeSignal",
         "ownershipDurationYears",
         "ownerArea",
+        "ownership",
         "openRoofingPermitCount",
         "maximumOpenRoofingPermitDays",
         "permits",
@@ -299,6 +474,7 @@
         "roofAgeSignal": { "$ref": "#/$defs/Fact" },
         "ownershipDurationYears": { "$ref": "#/$defs/Fact" },
         "ownerArea": { "$ref": "#/$defs/Fact" },
+        "ownership": { "$ref": "#/$defs/PublicOwnership" },
         "openRoofingPermitCount": { "$ref": "#/$defs/Fact" },
         "maximumOpenRoofingPermitDays": { "$ref": "#/$defs/Fact" },
         "permits": {

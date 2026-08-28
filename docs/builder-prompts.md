@@ -29,7 +29,8 @@ bounded full-county feeder. Keep exact folio identity and reconcile every stage.
 
 Implement the frozen Fact/Evidence semantics and deterministic calculations.
 Keep yearBuilt separate from roof-installation facts. Missing roof, ownership,
-business, contractor and BBB information must remain explicitly unavailable.
+owner-contact, business, contractor and BBB information must remain explicitly
+unavailable.
 Models never calculate distance, age, duration, matching, sorting or eligibility.
 
 Use exactly two publication domains from docs/publication-plan.md. Do not create
@@ -46,7 +47,7 @@ approval after external prerequisites are satisfied.
 Deploy later to the approved prism-pasco-oracle Vercel project label only when
 deployment is explicitly authorized. The project must publicly serve the
 read-only explorer, /health and /mcp without evaluator credentials and without
-local runtime dependencies. Implement active MCP contract revision 1.1.0 and
+local runtime dependencies. Implement active MCP contract revision 1.2.0 and
 register all six frozen prism_v1_* tools with their strict input and success
 schemas. A consuming agent may whitelist a smaller workflow-specific subset,
 but the server discovery surface remains all six. Clients/models never supply SQL. Enforce mandatory structured-input, body,
@@ -58,6 +59,12 @@ another service solely for rate limiting.
 Vendor only clean pinned sources recorded in UPSTREAMS.lock.json, or use a pinned
 Git dependency only after a fresh isolated clone proves build/deploy without a
 sibling path. Production must reject fixtures and never fall back to them.
+
+Project canonical ownership into the strict v1.2 Property ownership fields only
+when the value is an approved official-public-record fact with resolving
+evidence. Keep public mailing separate from situs address; do not reinterpret
+ownerArea or infer classification, acquisition date, phone or email. Preserve
+explicit unavailable phone/email states and the contract privacy qualification.
 
 Run implementation tests and collect raw verification outputs in a separate
 work area for controller review. Do not edit ACCEPTANCE.md outcomes or

@@ -99,6 +99,74 @@ describe("negative fixture mutations", () => {
       },
     },
     {
+      fixture: "property-response.json",
+      name: "rejects an empty available current-owner list",
+      mutate: (fixture) => {
+        fixture.result.data.ownership.currentOwners.value = [];
+      },
+    },
+    {
+      fixture: "property-response.json",
+      name: "rejects an available owner name without value provenance",
+      mutate: (fixture) => {
+        delete fixture.result.data.ownership.currentOwners.value[0]
+          .evidenceRefs;
+      },
+    },
+    {
+      fixture: "property-response.json",
+      name: "rejects inferred ownership classification",
+      mutate: (fixture) => {
+        fixture.result.data.ownership.classification = {
+          availability: "available",
+          value: "individual",
+          class: "inferred",
+          evidenceRefs: ["ev_fixture_appraiser_001"],
+        };
+      },
+    },
+    {
+      fixture: "property-response.json",
+      name: "rejects empty mailing address lines as available",
+      mutate: (fixture) => {
+        fixture.result.data.ownership.publicMailingAddress.value.addressLines.value =
+          [];
+      },
+    },
+    {
+      fixture: "property-response.json",
+      name: "rejects an invented value in an unavailable phone fact",
+      mutate: (fixture) => {
+        fixture.result.data.ownership.phone.value = "+1-555-0100";
+      },
+    },
+    {
+      fixture: "property-response.json",
+      name: "rejects a malformed available email fact",
+      mutate: (fixture) => {
+        fixture.result.data.ownership.email = {
+          availability: "available",
+          value: "not-an-email",
+          class: "raw",
+          evidenceRefs: ["ev_fixture_appraiser_001"],
+        };
+      },
+    },
+    {
+      fixture: "property-response.json",
+      name: "rejects extra ownership fields",
+      mutate: (fixture) => {
+        fixture.result.data.ownership.acquisitionDate = "2020-01-01";
+      },
+    },
+    {
+      fixture: "property-response.json",
+      name: "rejects an unapproved publication status",
+      mutate: (fixture) => {
+        fixture.result.data.ownership.privacy.publicationStatus = "private";
+      },
+    },
+    {
       fixture: "search-request.json",
       name: "rejects a radius above the 50-mile bound",
       mutate: (fixture) => {
@@ -178,6 +246,44 @@ describe("record and coverage distinctions", () => {
     property.permits = [];
     expect(
       validator.validateFixture("search-response.json", fixture),
+    ).toBeUndefined();
+  });
+});
+
+describe("ownership publication semantics", () => {
+  it("requires every available owner/contact evidence reference to resolve", async () => {
+    const fixture: any = await validator.loadFixture("property-response.json");
+    fixture.result.data.ownership.currentOwners.value[0].evidenceRefs = [
+      "ev_missing_owner_source",
+    ];
+    expect(
+      validator.validateFixture("property-response.json", fixture),
+    ).toBeDefined();
+  });
+
+  it("rejects substituting the situs address for public mailing", async () => {
+    const fixture: any = await validator.loadFixture("property-response.json");
+    fixture.result.data.address.value =
+      "900 EXAMPLE RECORD AVENUE, SAMPLEVILLE, FL 00000, US";
+    expect(
+      validator.validateFixture("property-response.json", fixture),
+    ).toBeDefined();
+  });
+
+  it("accepts fictional available ownership with unavailable phone and email", async () => {
+    const fixture: any = await validator.loadFixture("property-response.json");
+    const ownership = fixture.result.data.ownership;
+    expect(ownership.currentOwners.value).toHaveLength(2);
+    expect(ownership.phone).toMatchObject({
+      availability: "unavailable",
+      value: null,
+    });
+    expect(ownership.email).toMatchObject({
+      availability: "unavailable",
+      value: null,
+    });
+    expect(
+      validator.validateFixture("property-response.json", fixture),
     ).toBeUndefined();
   });
 });
