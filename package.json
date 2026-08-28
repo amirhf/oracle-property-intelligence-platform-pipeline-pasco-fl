@@ -13,6 +13,8 @@
     "format": "prettier --write \"services/**/*.ts\" \"src/**/*.ts\" \"scripts/**/*.ts\" \"tests/**/*.ts\" \"docs/**/*.md\" \"config/**/*.json\" docker-compose.yml eslint.config.js package.json tsconfig.json",
     "format:check": "prettier --check \"services/**/*.ts\" \"src/**/*.ts\" \"scripts/**/*.ts\" \"tests/**/*.ts\" \"docs/**/*.md\" \"config/**/*.json\" docker-compose.yml eslint.config.js package.json tsconfig.json",
     "lint": "eslint --max-warnings 0 \"services/**/*.ts\" \"src/**/*.ts\" \"scripts/**/*.ts\" \"tests/**/*.ts\"",
+    "mcp:start": "node --import tsx services/mcp.ts",
+    "mcp:check": "node --import tsx scripts/check-mcp.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run tests/unit && vitest run tests/contracts",
     "test:unit": "vitest run tests/unit",
@@ -31,6 +33,7 @@
   },
   "dependencies": {
     "@duckdb/node-api": "1.5.5-r.4",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "@restatedev/restate-sdk": "1.16.9",
     "ajv": "8.20.0",
     "ajv-formats": "3.0.1",
@@ -38,7 +41,8 @@
     "csv-parse": "7.0.2",
     "dotenv": "17.4.2",
     "postgres": "3.4.9",
-    "unzipper": "0.12.5"
+    "unzipper": "0.12.5",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
