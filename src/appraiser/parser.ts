@@ -136,7 +136,18 @@ async function* csvRows(
 }
 
 function emptyCount(): SourceParseCount {
-  return { accepted: 0, parsed: 0, rejected: 0, source: 0 };
+  return {
+    accepted: 0,
+    parsed: 0,
+    rejectionReasons: {},
+    rejected: 0,
+    source: 0,
+  };
+}
+
+function recordRejection(count: SourceParseCount, reason: string): void {
+  count.rejected += 1;
+  count.rejectionReasons[reason] = (count.rejectionReasons[reason] ?? 0) + 1;
 }
 
 async function parseInto<T>(options: {
@@ -147,7 +158,7 @@ async function parseInto<T>(options: {
   const count = emptyCount();
   for await (const row of csvRows(options.filePath, () => {
     count.source += 1;
-    count.rejected += 1;
+    recordRejection(count, "malformed_csv");
   })) {
     count.source += 1;
     try {
@@ -155,8 +166,12 @@ async function parseInto<T>(options: {
       count.parsed += 1;
       options.onAccepted(value);
       count.accepted += 1;
-    } catch {
-      count.rejected += 1;
+    } catch (error) {
+      const reason =
+        error instanceof Error
+          ? error.message.replace(/:.*/, "").replaceAll(" ", "_")
+          : "unknown_parse_error";
+      recordRejection(count, reason);
     }
   }
   return count;

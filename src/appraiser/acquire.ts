@@ -87,14 +87,10 @@ async function ensureZip(options: {
   targetPath: string;
   url: string;
 }): Promise<{ bytes: number; sha256: string }> {
-  const metadata = await inspectRemote(options.url);
   if (await exists(options.targetPath)) {
     const currentStat = await stat(options.targetPath);
     const currentHash = await fileHash(options.targetPath);
-    if (
-      currentStat.size !== metadata.bytes ||
-      currentHash !== options.expectedSha256
-    ) {
+    if (currentHash !== options.expectedSha256) {
       throw new Error(
         `Existing appraiser capture differs from the pinned pilot object: ${path.basename(options.targetPath)}`,
       );
@@ -102,6 +98,7 @@ async function ensureZip(options: {
     return { bytes: currentStat.size, sha256: currentHash };
   }
 
+  const metadata = await inspectRemote(options.url);
   const response = await fetch(options.url, {
     headers: { "user-agent": "Prism-Pasco-Pilot/1.0" },
     signal: AbortSignal.timeout(300_000),

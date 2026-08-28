@@ -1,8 +1,14 @@
+import { access, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 
-import type { ArtifactCapture, CoordinateResult } from "../domain/types.js";
+import type {
+  ArtifactCapture,
+  CoordinateResult,
+  GisAcquisitionMetrics,
+} from "../domain/types.js";
 import { captureTextArtifact } from "../lib/artifacts.js";
 import { SourceAccessStopError } from "../lib/access-stop.js";
+import { sha256 } from "../lib/hash.js";
 
 export const PASCO_GIS_LAYER_URL =
   "https://pascogis.pascocountyfl.net/giswebmm/rest/services/PascoMapper/Parcels/MapServer/7";
@@ -21,8 +27,16 @@ interface GeoJsonFeature {
 }
 
 interface GeoJsonFeatureCollection {
+  exceededTransferLimit?: boolean;
   features: GeoJsonFeature[];
   type: "FeatureCollection";
+}
+
+interface ReadyMarker {
+  bytes: number;
+  sha256: string;
+  sourceSystem: string;
+  sourceUrl: string;
 }
 
 function ringCentroid(ring: Position[]): {
@@ -107,6 +121,11 @@ export function parsePascoGeoJson(body: string): Map<string, CoordinateResult> {
   if (parsed.type !== "FeatureCollection" || !Array.isArray(parsed.features)) {
     throw new Error("Unexpected Pasco GIS GeoJSON response");
   }
+  if (parsed.exceededTransferLimit) {
+    throw new Error(
+      "Pasco GIS response exceeded the advertised transfer limit",
+    );
+  }
   const results = new Map<string, CoordinateResult>();
   for (const feature of parsed.features) {
     const folio = feature.properties.HPARCEL?.trim();
@@ -129,6 +148,235 @@ export function parsePascoGeoJson(body: string): Map<string, CoordinateResult> {
   return results;
 }
 
+async function existingArtifact(
+  finalPath: string,
+): Promise<{ artifact: ArtifactCapture; body: string } | null> {
+  const readyMarkerPath = `${finalPath}.ready.json`;
+  try {
+    await access(finalPath);
+    await access(readyMarkerPath);
+  } catch {
+    return null;
+  }
+  const [body, markerText, fileStat] = await Promise.all([
+    readFile(finalPath, "utf8"),
+    readFile(readyMarkerPath, "utf8"),
+    stat(finalPath),
+  ]);
+  const marker = JSON.parse(markerText) as ReadyMarker;
+  const currentHash = sha256(body);
+  if (marker.bytes !== fileStat.size || marker.sha256 !== currentHash) {
+    throw new Error(`GIS checkpoint failed hash validation: ${finalPath}`);
+  }
+  return {
+    artifact: {
+      bytes: marker.bytes,
+      localPath: finalPath,
+      readyMarkerPath,
+      sha256: marker.sha256,
+      sourceSystem: marker.sourceSystem,
+      sourceUrl: marker.sourceUrl,
+    },
+    body,
+  };
+}
+
+function incrementStatus(metrics: GisAcquisitionMetrics, status: string): void {
+  metrics.statusCounts[status] = (metrics.statusCounts[status] ?? 0) + 1;
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function fetchCoordinateBatch(options: {
+  batchIndex: number;
+  dataDir: string;
+  exactFolios: readonly string[];
+  fetchImpl: typeof fetch;
+  maxRetries: number;
+  metrics: GisAcquisitionMetrics;
+  scopeKey: string;
+}): Promise<{
+  artifact: ArtifactCapture;
+  coordinates: Map<string, CoordinateResult>;
+}> {
+  const finalPath = path.join(
+    options.dataDir,
+    "pasco",
+    "raw",
+    "gis",
+    "scales",
+    options.scopeKey,
+    `batch-${String(options.batchIndex + 1).padStart(5, "0")}.geojson`,
+  );
+  const cached = await existingArtifact(finalPath);
+  if (cached) {
+    options.metrics.reusedBatchCount += 1;
+    incrementStatus(options.metrics, "checkpoint");
+    return {
+      artifact: cached.artifact,
+      coordinates: parsePascoGeoJson(cached.body),
+    };
+  }
+
+  const queryUrl = `${PASCO_GIS_LAYER_URL}/query`;
+  const escaped = options.exactFolios.map(
+    (folio) => `'${folio.replaceAll("'", "''")}'`,
+  );
+  const body = new URLSearchParams({
+    f: "geojson",
+    outFields: "HPARCEL,LAST_UPDATE",
+    outSR: "4326",
+    returnGeometry: "true",
+    where: `HPARCEL IN (${escaped.join(",")})`,
+  }).toString();
+
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= options.maxRetries; attempt += 1) {
+    if (attempt > 0) {
+      options.metrics.retryCount += 1;
+      await wait(250 * 2 ** (attempt - 1));
+    }
+    options.metrics.requestCount += 1;
+    try {
+      const response = await options.fetchImpl(queryUrl, {
+        body,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          "user-agent": "Prism-Pasco-Scale/1.0",
+        },
+        method: "POST",
+        signal: AbortSignal.timeout(60_000),
+      });
+      incrementStatus(options.metrics, String(response.status));
+      if (
+        response.status === 401 ||
+        response.status === 403 ||
+        response.status === 429
+      ) {
+        throw new SourceAccessStopError(
+          `Pasco GIS access stop: HTTP ${response.status}`,
+        );
+      }
+      if (!response.ok) {
+        const error = new Error(
+          `Pasco GIS query failed: HTTP ${response.status}`,
+        );
+        if (response.status >= 500 && attempt < options.maxRetries) {
+          lastError = error;
+          continue;
+        }
+        throw error;
+      }
+      const responseBody = await response.text();
+      if (
+        /captcha|verify you are human|access denied|challenge/i.test(
+          responseBody,
+        )
+      ) {
+        throw new SourceAccessStopError(
+          "Pasco GIS access stop: challenge detected",
+        );
+      }
+      const coordinates = parsePascoGeoJson(responseBody);
+      const artifact = await captureTextArtifact({
+        body: responseBody,
+        finalPath,
+        sourceSystem: "pasco_gis",
+        sourceUrl: queryUrl,
+      });
+      return { artifact, coordinates };
+    } catch (error) {
+      if (error instanceof SourceAccessStopError) throw error;
+      lastError = error;
+      if (attempt >= options.maxRetries) throw error;
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Pasco GIS query failed without an error");
+}
+
+export async function fetchPascoCoordinateBatches(options: {
+  batchSize?: number;
+  concurrency?: number;
+  dataDir: string;
+  exactFolios: readonly string[];
+  fetchImpl?: typeof fetch;
+  maxRetries?: number;
+  scopeKey: string;
+}): Promise<{
+  artifacts: ArtifactCapture[];
+  coordinates: Map<string, CoordinateResult>;
+  metrics: GisAcquisitionMetrics;
+}> {
+  const batchSize = options.batchSize ?? 500;
+  const concurrency = options.concurrency ?? 2;
+  const maxRetries = options.maxRetries ?? 2;
+  if (options.exactFolios.length === 0) {
+    throw new Error("Pasco GIS query requires at least one folio");
+  }
+  if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 2_000) {
+    throw new Error("Pasco GIS batch size must be between 1 and 2,000");
+  }
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 2) {
+    throw new Error("Pasco GIS concurrency must be one or two");
+  }
+  if (!Number.isInteger(maxRetries) || maxRetries < 0 || maxRetries > 2) {
+    throw new Error("Pasco GIS retries must be between zero and two");
+  }
+
+  const batches: string[][] = [];
+  for (let index = 0; index < options.exactFolios.length; index += batchSize) {
+    batches.push(options.exactFolios.slice(index, index + batchSize));
+  }
+  const metrics: GisAcquisitionMetrics = {
+    batchCount: batches.length,
+    batchSize,
+    concurrency,
+    requestCount: 0,
+    retryCount: 0,
+    reusedBatchCount: 0,
+    statusCounts: {},
+  };
+  const results = new Array<
+    Awaited<ReturnType<typeof fetchCoordinateBatch>> | undefined
+  >(batches.length);
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < batches.length) {
+      const batchIndex = nextIndex;
+      nextIndex += 1;
+      const exactFolios = batches[batchIndex];
+      if (!exactFolios) continue;
+      results[batchIndex] = await fetchCoordinateBatch({
+        batchIndex,
+        dataDir: options.dataDir,
+        exactFolios,
+        fetchImpl: options.fetchImpl ?? fetch,
+        maxRetries,
+        metrics,
+        scopeKey: options.scopeKey,
+      });
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, batches.length) }, worker),
+  );
+
+  const artifacts: ArtifactCapture[] = [];
+  const coordinates = new Map<string, CoordinateResult>();
+  for (const result of results) {
+    if (!result) throw new Error("Pasco GIS batch result is missing");
+    artifacts.push(result.artifact);
+    for (const [folio, coordinate] of result.coordinates) {
+      coordinates.set(folio, coordinate);
+    }
+  }
+  return { artifacts, coordinates, metrics };
+}
+
 export async function fetchPascoCoordinates(options: {
   dataDir: string;
   exactFolios: readonly string[];
@@ -136,52 +384,21 @@ export async function fetchPascoCoordinates(options: {
 }): Promise<{
   artifact: ArtifactCapture;
   coordinates: Map<string, CoordinateResult>;
+  metrics: GisAcquisitionMetrics;
 }> {
   if (options.exactFolios.length === 0 || options.exactFolios.length > 25) {
     throw new Error(
       "Pasco GIS pilot query must contain between 1 and 25 folios",
     );
   }
-  const escaped = options.exactFolios.map(
-    (folio) => `'${folio.replaceAll("'", "''")}'`,
-  );
-  const queryUrl = new URL(`${PASCO_GIS_LAYER_URL}/query`);
-  queryUrl.searchParams.set("f", "geojson");
-  queryUrl.searchParams.set("where", `HPARCEL IN (${escaped.join(",")})`);
-  queryUrl.searchParams.set("outFields", "HPARCEL,LAST_UPDATE");
-  queryUrl.searchParams.set("returnGeometry", "true");
-  queryUrl.searchParams.set("outSR", "4326");
-
-  const response = await fetch(queryUrl, {
-    headers: { "user-agent": "Prism-Pasco-Pilot/1.0" },
-    signal: AbortSignal.timeout(30_000),
+  const result = await fetchPascoCoordinateBatches({
+    batchSize: 25,
+    concurrency: 1,
+    dataDir: options.dataDir,
+    exactFolios: options.exactFolios,
+    scopeKey: options.runId,
   });
-  if (response.status === 403 || response.status === 429) {
-    throw new SourceAccessStopError(
-      `Pasco GIS access stop: HTTP ${response.status}`,
-    );
-  }
-  if (!response.ok) {
-    throw new Error(`Pasco GIS query failed: HTTP ${response.status}`);
-  }
-  const body = await response.text();
-  if (/captcha|verify you are human|access denied/i.test(body)) {
-    throw new SourceAccessStopError(
-      "Pasco GIS access stop: challenge detected",
-    );
-  }
-  const artifact = await captureTextArtifact({
-    body,
-    finalPath: path.join(
-      options.dataDir,
-      "pasco",
-      "raw",
-      "gis",
-      options.runId,
-      "pilot-parcels.geojson",
-    ),
-    sourceSystem: "pasco_gis",
-    sourceUrl: queryUrl.toString(),
-  });
-  return { artifact, coordinates: parsePascoGeoJson(body) };
+  const artifact = result.artifacts[0];
+  if (!artifact) throw new Error("Pasco GIS pilot artifact is missing");
+  return { artifact, coordinates: result.coordinates, metrics: result.metrics };
 }

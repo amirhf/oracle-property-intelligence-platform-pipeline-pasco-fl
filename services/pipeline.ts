@@ -1,4 +1,5 @@
 import * as restate from "@restatedev/restate-sdk";
+import { readFile } from "node:fs/promises";
 
 import type { PilotRunRequest, PreparedPilot } from "../src/domain/types.js";
 import {
@@ -6,13 +7,22 @@ import {
   markRunFailed,
   recordRunStarted,
 } from "../src/db/pilot-repository.js";
+import { loadPreparedScale } from "../src/db/scale-repository.js";
 import { preparePilot } from "../src/pilot/prepare.js";
 import { SourceAccessStopError } from "../src/lib/access-stop.js";
+import {
+  prepareScaleDataset,
+  scalePreparedPath,
+} from "../src/scale/prepare.js";
 
 interface PipelineDependencies {
   dataDir: string;
   databaseUrl: string;
 }
+
+type PreparedInput =
+  | { kind: "inline"; prepared: PreparedPilot }
+  | { kind: "scale-file"; preparedPath: string };
 
 export function createPipelineServices(dependencies: PipelineDependencies) {
   const ingestChunk = restate.workflow({
@@ -21,15 +31,42 @@ export function createPipelineServices(dependencies: PipelineDependencies) {
       run: async (
         ctx: restate.WorkflowContext,
         request: PilotRunRequest,
-      ): Promise<PreparedPilot> =>
-        ctx.run("raw-first-pilot-preparation", () =>
-          preparePilot({
+      ): Promise<PreparedInput> => {
+        const selectionSize = request.selectionSize ?? 25;
+        if (selectionSize === 25) {
+          return ctx.run("raw-first-pilot-preparation", async () => ({
+            kind: "inline" as const,
+            prepared: await preparePilot({
+              asOf: request.asOf,
+              dataDir: dependencies.dataDir,
+              runId: request.runId,
+              sampleSeed: request.sampleSeed,
+            }),
+          }));
+        }
+        if (selectionSize !== 5_000 && selectionSize !== 25_000) {
+          throw new restate.TerminalError(
+            "selectionSize must be 25, 5000, or 25000",
+            { errorCode: 400 },
+          );
+        }
+        return ctx.run("raw-first-scale-preparation", async () => {
+          await prepareScaleDataset({
             asOf: request.asOf,
             dataDir: dependencies.dataDir,
             runId: request.runId,
             sampleSeed: request.sampleSeed,
-          }),
-        ),
+            selectionSize,
+          });
+          return {
+            kind: "scale-file" as const,
+            preparedPath: scalePreparedPath(
+              dependencies.dataDir,
+              request.runId,
+            ),
+          };
+        });
+      },
     },
     options: {
       asTerminalError: (error) =>
@@ -44,15 +81,25 @@ export function createPipelineServices(dependencies: PipelineDependencies) {
     handlers: {
       load: async (
         ctx: restate.ObjectContext,
-        input: { prepared: PreparedPilot; request: PilotRunRequest },
+        input: { prepared: PreparedInput; request: PilotRunRequest },
       ) =>
-        ctx.run("postgres-single-writer-load", () =>
-          loadPreparedPilot(
+        ctx.run("postgres-single-writer-load", async () => {
+          if (input.prepared.kind === "inline") {
+            return loadPreparedPilot(
+              dependencies.databaseUrl,
+              input.request,
+              input.prepared.prepared,
+            );
+          }
+          const prepared = JSON.parse(
+            await readFile(input.prepared.preparedPath, "utf8"),
+          ) as PreparedPilot;
+          return loadPreparedScale(
             dependencies.databaseUrl,
             input.request,
-            input.prepared,
-          ),
-        ),
+            prepared,
+          );
+        }),
     },
   });
 

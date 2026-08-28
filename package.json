@@ -23,9 +23,14 @@
     "sources:acquire": "node --import tsx scripts/acquire-sources.ts",
     "pilot:run": "node --import tsx scripts/run-pilot.ts",
     "pilot:report": "node --import tsx scripts/pilot-report.ts",
-    "pilot:check": "node --import tsx scripts/check-pilot.ts"
+    "pilot:check": "node --import tsx scripts/check-pilot.ts",
+    "scale:run": "node --import tsx scripts/run-scale.ts",
+    "scale:check": "node --import tsx scripts/check-scale.ts",
+    "publication:build": "node --import tsx scripts/build-publication.ts",
+    "publication:determinism": "node --import tsx scripts/check-publication-determinism.ts"
   },
   "dependencies": {
+    "@duckdb/node-api": "1.5.5-r.4",
     "@restatedev/restate-sdk": "1.16.9",
     "ajv": "8.20.0",
     "ajv-formats": "3.0.1",

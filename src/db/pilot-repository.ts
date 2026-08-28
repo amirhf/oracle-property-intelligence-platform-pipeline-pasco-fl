@@ -1,4 +1,5 @@
 import { pathToFileURL } from "node:url";
+import { resourceUsage } from "node:process";
 
 import postgres from "postgres";
 
@@ -20,12 +21,14 @@ import {
   sourceRecordHash,
 } from "../lib/hash.js";
 
-const PIPELINE_LIMITATIONS = [
-  "Pilot only: 25 deterministically selected properties, not countywide coverage.",
-  "Pasco Accela coverage can exclude incorporated-city permit systems.",
-  "Pasco Accela collection stopped after challenge/CAPTCHA content was detected; permit search results and contractor identity are unavailable.",
-  "Sunbiz and BBB are intentionally not collected in this checkpoint.",
-] as const;
+function pipelineLimitations(selectionSize: number): string[] {
+  return [
+    `${selectionSize.toLocaleString("en-US")}-property deterministic appraisal/GIS sample; not complete Pasco coverage.`,
+    "Pasco Accela coverage can exclude incorporated-city permit systems.",
+    "Pasco Accela collection stopped after challenge/CAPTCHA content was detected; permit search results and contractor identity are unavailable.",
+    "Sunbiz and BBB are intentionally not collected in this checkpoint.",
+  ];
+}
 
 function parseUsDate(value: string | null): string | null {
   if (!value) return null;
@@ -43,15 +46,23 @@ export async function recordRunStarted(
 ): Promise<void> {
   const sql = postgres(databaseUrl, { max: 1 });
   try {
+    const selectionSize = request.selectionSize ?? 25;
+    const sampleAlgorithm =
+      request.sampleAlgorithm ?? "pasco-pilot-stratified-v1";
+    const databaseSize = await sql<{ bytes: number }[]>`
+      SELECT pg_database_size(current_database())::bigint AS bytes
+    `;
     await sql`
       INSERT INTO oracle_pipeline_runs (
         run_id, workflow_id, county, sample_algorithm, sample_seed,
-        window_start, window_end, as_of, status, limitations
+        window_start, window_end, as_of, status, limitations,
+        selection_size, database_size_before_bytes
       ) VALUES (
         ${request.runId}, ${request.workflowId}, 'pasco',
-        'pasco-pilot-stratified-v1', ${request.sampleSeed},
+        ${sampleAlgorithm}, ${request.sampleSeed},
         '2026-08-23T00:00:00.000Z', '2026-08-23T23:59:59.999Z',
-        ${request.asOf}, 'running', ${sql.json([...PIPELINE_LIMITATIONS])}
+        ${request.asOf}, 'running', ${sql.json(pipelineLimitations(selectionSize))},
+        ${selectionSize}, ${databaseSize[0]?.bytes ?? 0}
       )
       ON CONFLICT (run_id) DO NOTHING
     `;
@@ -101,8 +112,10 @@ export async function loadPreparedPilot(
   request: PilotRunRequest,
   prepared: PreparedPilot,
 ): Promise<PilotRunSummary> {
-  if (prepared.properties.length !== 25) {
-    throw new Error(`Pilot load requires exactly 25 properties`);
+  if (prepared.properties.length !== prepared.selectionSize) {
+    throw new Error(
+      `Prepared property count does not match its selection size`,
+    );
   }
   const sql = postgres(databaseUrl, { max: 1 });
   try {
@@ -392,15 +405,21 @@ export async function loadPreparedPilot(
       const propertyIds = prepared.properties.map((entry) => entry.propertyId);
       const countRows = await transaction<
         {
+          availability: number;
+          buildings: number;
           coordinates: number;
           ownership: number;
           permits: number;
+          roof_signals: number;
         }[]
       >`
         SELECT
           (SELECT count(DISTINCT property_id)::int FROM oracle_coordinates WHERE property_id = ANY(${propertyIds})) AS coordinates,
           (SELECT count(DISTINCT property_id)::int FROM oracle_ownerships WHERE property_id = ANY(${propertyIds})) AS ownership,
-          (SELECT count(*)::int FROM oracle_permits WHERE property_id = ANY(${propertyIds})) AS permits
+          (SELECT count(*)::int FROM oracle_building_signals WHERE property_id = ANY(${propertyIds})) AS buildings,
+          (SELECT count(*)::int FROM oracle_roof_signals WHERE property_id = ANY(${propertyIds})) AS roof_signals,
+          (SELECT count(*)::int FROM oracle_permits WHERE property_id = ANY(${propertyIds})) AS permits,
+          (SELECT count(*)::int FROM oracle_property_availability WHERE property_id = ANY(${propertyIds})) AS availability
       `;
       const duplicateRows = await transaction<{ duplicate_count: number }[]>`
         SELECT count(*)::int AS duplicate_count
@@ -423,32 +442,83 @@ export async function loadPreparedPilot(
         0,
       );
       const counts = countRows[0] ?? {
+        availability: 0,
+        buildings: 0,
         coordinates: 0,
         ownership: 0,
         permits: 0,
+        roof_signals: 0,
       };
+      const runMetrics = await transaction<
+        {
+          database_size_after_bytes: string;
+          database_size_before_bytes: string;
+          elapsed_ms: string;
+        }[]
+      >`
+        SELECT
+          pg_database_size(current_database())::bigint AS database_size_after_bytes,
+          COALESCE(database_size_before_bytes, 0)::bigint AS database_size_before_bytes,
+          GREATEST(0, EXTRACT(EPOCH FROM (now() - started_at)) * 1000)::bigint AS elapsed_ms
+        FROM oracle_pipeline_runs WHERE run_id = ${request.runId}
+      `;
+      const databaseSizeAfterBytes = Number(
+        runMetrics[0]?.database_size_after_bytes ?? 0,
+      );
+      const databaseSizeBeforeBytes = Number(
+        runMetrics[0]?.database_size_before_bytes ?? 0,
+      );
+      const elapsedMs = Number(runMetrics[0]?.elapsed_ms ?? 0);
       const summary: PilotRunSummary = {
         acceptedProperties: prepared.properties.length,
+        buildings: counts.buildings,
         changedProperties,
         coordinates: counts.coordinates,
+        databaseGrowthBytes: Math.max(
+          0,
+          databaseSizeAfterBytes - databaseSizeBeforeBytes,
+        ),
+        databaseSizeAfterBytes,
+        databaseSizeBeforeBytes,
+        diskAvailableBytes: prepared.resourceMetrics.diskAvailableBytes,
         duplicateProperties: duplicateRows[0]?.duplicate_count ?? 0,
+        elapsedMs,
+        explicitUnavailableFacts: counts.availability,
+        gisMetrics: prepared.gisMetrics,
+        missingCoordinates: prepared.properties.length - counts.coordinates,
         newProperties,
         ownership: counts.ownership,
+        peakRssBytes: Math.max(
+          prepared.resourceMetrics.peakRssBytes,
+          resourceUsage().maxRSS * 1_024,
+        ),
         permitRequestCount: prepared.permitRequestCount,
         permits: counts.permits,
         rejectedRecords,
+        roofSignals: counts.roof_signals,
         roofSignalBasis,
         runId: request.runId,
+        selectionSize: prepared.selectionSize,
         sourceCounts: prepared.sourceCounts,
+        throughputPropertiesPerSecond:
+          elapsedMs > 0
+            ? Number(
+                (prepared.properties.length / (elapsedMs / 1_000)).toFixed(2),
+              )
+            : 0,
         unchangedProperties,
         workflowId: request.workflowId,
       };
 
       const reconciliations = [
-        ["pilot_property_count", prepared.properties.length, 25],
+        [
+          "dataset_property_count",
+          prepared.properties.length,
+          prepared.selectionSize,
+        ],
         ["duplicate_exact_folio", summary.duplicateProperties, 0],
-        ["coordinate_coverage", summary.coordinates, 25],
-        ["ownership_coverage", summary.ownership, 25],
+        ["coordinate_coverage", summary.coordinates, prepared.selectionSize],
+        ["ownership_coverage", summary.ownership, prepared.selectionSize],
       ] as const;
       for (const [checkName, observed, expected] of reconciliations) {
         const status = observed === expected ? "pass" : "warn";
@@ -483,7 +553,7 @@ export async function loadPreparedPilot(
             summary as unknown as postgres.JSONValue,
           )},
           limitations = ${transaction.json([
-            ...PIPELINE_LIMITATIONS,
+            ...pipelineLimitations(prepared.selectionSize),
             ...prepared.sourceLimitations,
           ])}
         WHERE run_id = ${request.runId}

@@ -1,4 +1,5 @@
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { resourceUsage } from "node:process";
+import { mkdir, rename, statfs, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { ensureAppraiserInputs } from "../appraiser/acquire.js";
@@ -16,6 +17,7 @@ export async function preparePilot(options: {
   runId: string;
   sampleSeed: string;
 }): Promise<PreparedPilot> {
+  const startedAt = performance.now();
   const appraiser = await ensureAppraiserInputs(options.dataDir);
   const loaded = await loadPilotCandidateData(appraiser.paths);
   const selection = selectPilot(loaded.candidates, options.sampleSeed);
@@ -81,13 +83,21 @@ export async function preparePilot(options: {
     owners: ownerResult.owners.get(selected.parcel.exactFolio) ?? [],
     permits: [],
   }));
+  const filesystem = await statfs(options.dataDir);
 
   const prepared: PreparedPilot = {
     artifacts: [...appraiser.artifacts, gis.artifact],
+    gisMetrics: gis.metrics,
     permitRequestCount,
     properties,
+    resourceMetrics: {
+      diskAvailableBytes: filesystem.bavail * filesystem.bsize,
+      elapsedMs: Math.round(performance.now() - startedAt),
+      peakRssBytes: resourceUsage().maxRSS * 1_024,
+    },
     sampleAlgorithm: PILOT_SAMPLE_ALGORITHM,
     sampleSeed: options.sampleSeed,
+    selectionSize: properties.length,
     sourceCounts: loaded.counts,
     sourceLimitations: [
       "Pasco Accela collection stopped after challenge/CAPTCHA content was detected on the anonymous form GET; no permit search POST was sent, and permits and contractors are unavailable for this pilot.",

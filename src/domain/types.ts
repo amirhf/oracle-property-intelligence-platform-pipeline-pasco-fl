@@ -1,6 +1,7 @@
 export interface SourceParseCount {
   accepted: number;
   parsed: number;
+  rejectionReasons: Record<string, number>;
   rejected: number;
   source: number;
 }
@@ -101,34 +102,66 @@ export interface PreparedProperty extends PilotSelectionEntry {
 
 export interface PreparedPilot {
   artifacts: ArtifactCapture[];
+  gisMetrics: GisAcquisitionMetrics;
   permitRequestCount: number;
   properties: PreparedProperty[];
-  sampleAlgorithm: "pasco-pilot-stratified-v1";
+  resourceMetrics: {
+    diskAvailableBytes: number;
+    elapsedMs: number;
+    peakRssBytes: number;
+  };
+  sampleAlgorithm: string;
   sampleSeed: string;
+  selectionSize: number;
   sourceCounts: SourceParseCounts;
   sourceLimitations: string[];
+}
+
+export interface GisAcquisitionMetrics {
+  batchCount: number;
+  batchSize: number;
+  concurrency: number;
+  requestCount: number;
+  retryCount: number;
+  reusedBatchCount: number;
+  statusCounts: Record<string, number>;
 }
 
 export interface PilotRunRequest {
   asOf: string;
   runId: string;
+  sampleAlgorithm?: string;
   sampleSeed: string;
+  selectionSize?: number;
   workflowId: string;
 }
 
 export interface PilotRunSummary {
   acceptedProperties: number;
+  buildings: number;
   changedProperties: number;
   coordinates: number;
+  databaseGrowthBytes: number;
+  databaseSizeAfterBytes: number;
+  databaseSizeBeforeBytes: number;
+  diskAvailableBytes: number;
   duplicateProperties: number;
+  elapsedMs: number;
+  explicitUnavailableFacts: number;
+  gisMetrics: GisAcquisitionMetrics;
+  missingCoordinates: number;
   newProperties: number;
   ownership: number;
+  peakRssBytes: number;
   permitRequestCount: number;
   permits: number;
   rejectedRecords: number;
+  roofSignals: number;
   roofSignalBasis: Record<string, number>;
   runId: string;
+  selectionSize: number;
   sourceCounts: SourceParseCounts;
+  throughputPropertiesPerSecond: number;
   unchangedProperties: number;
   workflowId: string;
 }

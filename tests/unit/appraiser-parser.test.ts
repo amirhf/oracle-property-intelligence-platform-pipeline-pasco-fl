@@ -81,6 +81,7 @@ describe("Pasco appraiser source parsing", () => {
       expect(result.count).toEqual({
         accepted: 1,
         parsed: 1,
+        rejectionReasons: { malformed_csv: 1 },
         rejected: 1,
         source: 2,
       });
