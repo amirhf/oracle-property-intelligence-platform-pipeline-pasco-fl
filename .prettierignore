@@ -1,0 +1,13 @@
+/contracts/
+ACCEPTANCE.md
+AGENTS.md
+ARCHITECTURE.md
+README.md
+UPSTREAMS.lock.json
+docs/builder-prompts.md
+docs/evaluator-evidence.md
+docs/publication-plan.md
+docs/soofi-restate-exceptions.md
+node_modules/
+data/
+pnpm-lock.yaml
