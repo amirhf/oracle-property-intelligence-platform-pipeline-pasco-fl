@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { MCP_SCHEMA_SHA256, MCP_TOOL_NAMES } from "../../src/mcp/constants.js";
+import {
+  MCP_CONTRACT_VERSION,
+  MCP_SCHEMA_SHA256,
+  MCP_TOOL_NAMES,
+} from "../../src/mcp/constants.js";
 import type { OracleMcpProvider } from "../../src/mcp/provider.js";
 import { haversineMeters, OracleMcpRuntime } from "../../src/mcp/runtime.js";
 import { coordinatesSearch, realMcpHarness } from "../helpers/mcp-real.js";
@@ -9,7 +13,7 @@ function resultData(result: Record<string, unknown>): Record<string, unknown> {
   return result.data as Record<string, unknown>;
 }
 
-describe("Oracle MCP v1.1.0 runtime", () => {
+describe("Oracle MCP v1.2.0 runtime", () => {
   it("returns contract-valid metadata for all three metadata tools", async () => {
     const { contracts, runtime } = await realMcpHarness();
     for (const tool of [
@@ -23,6 +27,9 @@ describe("Oracle MCP v1.1.0 runtime", () => {
       expect((response.result.meta as Record<string, unknown>).schemaHash).toBe(
         MCP_SCHEMA_SHA256,
       );
+      expect(
+        (response.result.meta as Record<string, unknown>).contractVersion,
+      ).toBe(MCP_CONTRACT_VERSION);
     }
 
     const service = await runtime.execute("prism_v1_get_service_info", {});
@@ -77,7 +84,30 @@ describe("Oracle MCP v1.1.0 runtime", () => {
       value: null,
     });
     expect(property.permits).toEqual([]);
-    expect(property).not.toHaveProperty("ownership");
+    const ownership = property.ownership as Record<string, unknown>;
+    const currentOwners = ownership.currentOwners as Record<string, unknown>;
+    expect(currentOwners.availability).toBe("available");
+    expect((currentOwners.value as unknown[]).length).toBeGreaterThan(0);
+    expect(ownership.classification).toMatchObject({
+      availability: "unavailable",
+      value: null,
+      reason: "not_provided_by_source",
+    });
+    expect(ownership.phone).toMatchObject({
+      availability: "unavailable",
+      value: null,
+      reason: "not_provided_by_source",
+    });
+    expect(ownership.email).toMatchObject({
+      availability: "unavailable",
+      value: null,
+      reason: "not_provided_by_source",
+    });
+    expect(ownership.privacy).toEqual({
+      accuracyQualification: "source_reported_not_independently_verified",
+      publicationStatus: "approved_for_publication",
+      recordNature: "official_public_record",
+    });
     const evidence = property.evidence as Array<Record<string, unknown>>;
     const evidenceIds = new Set(evidence.map((item) => item.evidenceId));
     expect(evidence.length).toBeGreaterThan(0);
@@ -93,7 +123,56 @@ describe("Oracle MCP v1.1.0 runtime", () => {
     expect(
       roofEvidenceRefs.every((reference) => evidenceIds.has(reference)),
     ).toBe(true);
+    const ownershipJson = JSON.stringify(ownership);
+    expect(
+      (currentOwners.value as Array<Record<string, unknown>>).every((owner) =>
+        (owner.evidenceRefs as string[]).every((reference) =>
+          evidenceIds.has(reference),
+        ),
+      ),
+    ).toBe(true);
+    expect(ownershipJson).not.toContain(process.cwd());
     expect(JSON.stringify(response.result)).not.toContain(process.cwd());
+  });
+
+  it("returns the active v1.2 version and hash from every tool", async () => {
+    const { provider, runtime } = await realMcpHarness();
+    const center = (await provider.getQueryRows()).find(
+      (row) => row.latitude !== null && row.longitude !== null,
+    )!;
+    const searchRequest = coordinatesSearch({
+      latitude: center.latitude!,
+      longitude: center.longitude!,
+      limit: 1,
+    });
+    const search = await runtime.execute(
+      "prism_v1_search_roofing_opportunities",
+      searchRequest,
+    );
+    const propertyId = (
+      (
+        resultData(search.result).opportunities as Array<
+          Record<string, unknown>
+        >
+      )[0]!.property as Record<string, unknown>
+    ).propertyId as string;
+    const results = [
+      await runtime.execute("prism_v1_get_service_info", {}),
+      await runtime.execute("prism_v1_get_pipeline_run_summary", {}),
+      search,
+      await runtime.execute("prism_v1_get_property", { propertyId }),
+      await runtime.execute("prism_v1_get_permit", {
+        permitId: "perm_ffffffffffffffffffffffffffffffff",
+      }),
+      await runtime.execute("prism_v1_get_query_schema", {}),
+    ];
+    expect(results).toHaveLength(MCP_TOOL_NAMES.length);
+    for (const response of results) {
+      expect(response.result.meta).toMatchObject({
+        contractVersion: MCP_CONTRACT_VERSION,
+        schemaHash: MCP_SCHEMA_SHA256,
+      });
+    }
   });
 
   it("paginates deterministically with a query-bound opaque cursor", async () => {
@@ -370,6 +449,26 @@ describe("Oracle MCP v1.1.0 runtime", () => {
     );
     expect(
       (oversized.result.error as Record<string, unknown>).message,
+    ).toContain("response-size");
+
+    const row = (await provider.getQueryRows())[0]!;
+    const baseline = await new OracleMcpRuntime(provider, contracts, {
+      maxRequestBytes: 65_536,
+      maxResponseBytes: 2 * 1024 * 1024,
+      requestTimeoutMs: 10_000,
+    }).execute("prism_v1_get_property", { propertyId: row.propertyId });
+    expect(baseline.isError).toBe(false);
+    const expandedPropertyBytes = Buffer.byteLength(
+      JSON.stringify(baseline.result),
+    );
+    const ownershipBound = await new OracleMcpRuntime(provider, contracts, {
+      maxRequestBytes: 65_536,
+      maxResponseBytes: expandedPropertyBytes - 1,
+      requestTimeoutMs: 10_000,
+    }).execute("prism_v1_get_property", { propertyId: row.propertyId });
+    expect(ownershipBound.isError).toBe(true);
+    expect(
+      (ownershipBound.result.error as Record<string, unknown>).message,
     ).toContain("response-size");
   });
 });

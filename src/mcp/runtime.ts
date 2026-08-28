@@ -16,6 +16,7 @@ import type {
   OracleMcpProvider,
   QueryPropertyRow,
 } from "./provider.js";
+import { projectPublicOwnership } from "./ownership.js";
 
 type ErrorCode =
   | "invalid_argument"
@@ -220,7 +221,10 @@ function freshness(value: unknown): JsonObject {
   };
 }
 
-function toPublicProperty(canonical: JsonObject, publicId: string): JsonObject {
+export function projectPublicProperty(
+  canonical: JsonObject,
+  publicId: string,
+): JsonObject {
   const refs = evidenceIds(canonical);
   const permits = Array.isArray(canonical.permits)
     ? canonical.permits.map((permit) => {
@@ -248,6 +252,7 @@ function toPublicProperty(canonical: JsonObject, publicId: string): JsonObject {
       "not_provided_by_source",
       refs.slice(0, 1),
     ),
+    ownership: projectPublicOwnership(canonical),
     openRoofingPermitCount: unavailableFact(
       "derived",
       "source_unavailable",
@@ -838,7 +843,7 @@ export class OracleMcpRuntime {
         }
         return {
           ok: true,
-          data: toPublicProperty(canonical, propertyId),
+          data: projectPublicProperty(canonical, propertyId),
           meta: responseMeta(metadata),
         };
       }
@@ -921,7 +926,7 @@ export class OracleMcpRuntime {
           ? (coordinateFact.evidenceRefs as string[])
           : [];
         return {
-          property: toPublicProperty(canonical, candidate.row.propertyId),
+          property: projectPublicProperty(canonical, candidate.row.propertyId),
           distanceMeters: availableFact(
             candidate.distanceMeters,
             "derived",

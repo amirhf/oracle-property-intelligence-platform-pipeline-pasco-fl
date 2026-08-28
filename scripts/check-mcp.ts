@@ -2,7 +2,11 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 
-import { MCP_SCHEMA_SHA256, MCP_TOOL_NAMES } from "../src/mcp/constants.js";
+import {
+  MCP_CONTRACT_VERSION,
+  MCP_SCHEMA_SHA256,
+  MCP_TOOL_NAMES,
+} from "../src/mcp/constants.js";
 
 function structured(
   value: Awaited<ReturnType<Client["callTool"]>>,
@@ -11,6 +15,25 @@ function structured(
     throw new Error("MCP response did not contain structured content");
   }
   return value.structuredContent as Record<string, unknown>;
+}
+
+function payload(
+  value: Awaited<ReturnType<Client["callTool"]>>,
+): Record<string, unknown> {
+  if ("structuredContent" in value && value.structuredContent) {
+    return value.structuredContent as Record<string, unknown>;
+  }
+  const content = (Array.isArray(value.content) ? value.content : []).find(
+    (item): item is { text: string; type: "text" } =>
+      item !== null &&
+      typeof item === "object" &&
+      item.type === "text" &&
+      typeof item.text === "string",
+  );
+  if (!content) {
+    throw new Error("MCP response did not contain a JSON payload");
+  }
+  return JSON.parse(content.text) as Record<string, unknown>;
 }
 
 function maskIdentifier(value: string): string {
@@ -95,16 +118,38 @@ try {
       )
     : null;
   const directProperty = property.data as Record<string, unknown>;
+  const ownership = directProperty.ownership as Record<string, unknown>;
+  const currentOwners = ownership.currentOwners as Record<string, unknown>;
+  const mailing = ownership.publicMailingAddress as Record<string, unknown>;
   const roofSignal = directProperty.roofAgeSignal as Record<string, unknown>;
   const pipeline = summary.data as Record<string, unknown>;
   const coverage = pipeline.coverage as Record<string, Record<string, unknown>>;
   const queryData = querySchema.data as Record<string, unknown>;
+  for (const response of [
+    service,
+    summary,
+    search,
+    property,
+    payload(permit),
+    querySchema,
+  ]) {
+    const meta = response.meta as Record<string, unknown>;
+    if (
+      meta.contractVersion !== MCP_CONTRACT_VERSION ||
+      meta.schemaHash !== MCP_SCHEMA_SHA256
+    ) {
+      throw new Error(
+        "A tool response did not contain active contract metadata",
+      );
+    }
+  }
   console.log(
     JSON.stringify(
       {
         ok: true,
         url: new URL(mcpUrl).origin + new URL(mcpUrl).pathname,
         tools: names,
+        contractVersion: MCP_CONTRACT_VERSION,
         schemaHash: MCP_SCHEMA_SHA256,
         exampleProperty: maskIdentifier(propertyId),
         firstPageCount: opportunities.length,
@@ -118,6 +163,19 @@ try {
         coordinateCoverage: coverage.coordinates,
         permitCoverage: coverage.permits,
         permitLookupIsError: permit.isError === true,
+        currentOwnersAvailable: currentOwners.availability === "available",
+        currentOwnerCount:
+          currentOwners.availability === "available"
+            ? (currentOwners.value as unknown[]).length
+            : 0,
+        publicMailingAvailable: mailing.availability === "available",
+        classificationAvailability: (
+          ownership.classification as Record<string, unknown>
+        ).availability,
+        phoneAvailability: (ownership.phone as Record<string, unknown>)
+          .availability,
+        emailAvailability: (ownership.email as Record<string, unknown>)
+          .availability,
         arbitrarySql: (queryData.queryRestrictions as Record<string, unknown>)
           .arbitrarySql,
       },

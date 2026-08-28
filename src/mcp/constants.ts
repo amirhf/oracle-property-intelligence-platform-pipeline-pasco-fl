@@ -1,6 +1,6 @@
-export const MCP_CONTRACT_VERSION = "1.1.0";
+export const MCP_CONTRACT_VERSION = "1.2.0";
 export const MCP_SCHEMA_SHA256 =
-  "1ef6f43072bc93ee8557aa9fcd0ce55eab26560fe4d061fac7c9388b2d0301c5";
+  "9fc112ef8a4e2120593c3dc20c90073b0eb96596817c96112f63fd258bb7c131";
 export const MCP_SERVICE_NAME = "prism-pasco-oracle-mcp";
 export const MCP_SERVICE_VERSION = "0.1.0";
 

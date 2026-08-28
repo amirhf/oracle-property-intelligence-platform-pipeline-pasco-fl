@@ -5,12 +5,37 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { MCP_SCHEMA_SHA256, MCP_TOOL_NAMES } from "../../src/mcp/constants.js";
+import {
+  MCP_CONTRACT_VERSION,
+  MCP_SCHEMA_SHA256,
+  MCP_TOOL_NAMES,
+} from "../../src/mcp/constants.js";
 import {
   createOracleMcpHttpServer,
   listenOracleMcpServer,
 } from "../../src/mcp/server.js";
 import { coordinatesSearch, realMcpHarness } from "../helpers/mcp-real.js";
+
+function responsePayload(
+  response: Awaited<ReturnType<Client["callTool"]>>,
+): Record<string, unknown> {
+  if ("structuredContent" in response && response.structuredContent) {
+    return response.structuredContent as Record<string, unknown>;
+  }
+  const content = (
+    Array.isArray(response.content) ? response.content : []
+  ).find(
+    (item): item is { text: string; type: "text" } =>
+      item !== null &&
+      typeof item === "object" &&
+      item.type === "text" &&
+      typeof item.text === "string",
+  );
+  if (!content) {
+    throw new Error("MCP response did not contain a JSON payload");
+  }
+  return JSON.parse(content.text) as Record<string, unknown>;
+}
 
 describe("stateless MCP Streamable HTTP transport", () => {
   let client: Client;
@@ -83,7 +108,7 @@ describe("stateless MCP Streamable HTTP transport", () => {
         >
       ).schemaHash,
     ).toBe(MCP_SCHEMA_SHA256);
-    await client.callTool({
+    const summary = await client.callTool({
       name: "prism_v1_get_pipeline_run_summary",
       arguments: {},
     });
@@ -118,6 +143,19 @@ describe("stateless MCP Streamable HTTP transport", () => {
       arguments: {},
     });
     expect(capabilities.isError).not.toBe(true);
+    for (const response of [
+      service,
+      summary,
+      search,
+      property,
+      permit,
+      capabilities,
+    ]) {
+      expect(responsePayload(response).meta).toMatchObject({
+        contractVersion: MCP_CONTRACT_VERSION,
+        schemaHash: MCP_SCHEMA_SHA256,
+      });
+    }
   });
 
   it("enforces the HTTP request-body bound", async () => {
