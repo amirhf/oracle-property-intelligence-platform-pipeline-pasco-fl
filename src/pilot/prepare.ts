@@ -10,6 +10,7 @@ import {
 import type { PreparedPilot } from "../domain/types.js";
 import { fetchPascoCoordinates } from "../gis/pasco.js";
 import { sha256 } from "../lib/hash.js";
+import { PASCO_PARCEL_AUTHORITY_SOURCE_IDENTIFIER } from "../snapshot/coverage.js";
 import {
   createSourceObject,
   sourceObjectFromArtifact,
@@ -39,16 +40,20 @@ export async function preparePilot(options: {
     ),
   );
   const extractedSourceObjects = await Promise.all(
-    Object.entries(appraiser.paths).map(([name, filePath]) =>
-      createSourceObject({
+    Object.entries(appraiser.paths).map(([name, filePath]) => {
+      const downloaded = downloadedSourceObjects.find((object) =>
+        object.sourceIdentifier.endsWith(`/${name}.zip`),
+      );
+      return createSourceObject({
         dataDir: options.dataDir,
+        derivedFromSha256: downloaded?.sha256 ?? null,
         filePath,
         observedAt: appraiserObservedAt,
         sourceIdentifier: `pasco_appraiser:extracted:${name}`,
         sourceSystem: "pasco_appraiser",
         stage: "extracted_source",
-      }),
-    ),
+      });
+    }),
   );
   const loaded = await loadPilotCandidateData(appraiser.paths);
   const selection = selectPilot(loaded.candidates, options.sampleSeed);
@@ -138,8 +143,32 @@ export async function preparePilot(options: {
     selectedRecordSha256,
     selectionSize: properties.length,
   };
+  const parcelAuthority = extractedSourceObjects.find(
+    (object) =>
+      object.sourceIdentifier === PASCO_PARCEL_AUTHORITY_SOURCE_IDENTIFIER,
+  );
+  if (!parcelAuthority) {
+    throw new Error("Prepared snapshot is missing the official parcel object");
+  }
+  const parcelCounts = loaded.counts.parcel;
+  if (!parcelCounts) {
+    throw new Error("Prepared snapshot is missing parcel parse counts");
+  }
   const snapshot = await writeSourceSnapshot({
     asOf: options.asOf,
+    coverage: {
+      authoritySourceId: parcelAuthority.sourceId,
+      counts: {
+        acceptedRecords: parcelCounts.accepted,
+        expectedSourceRecords: parcelCounts.source,
+        observedSourceRecords: parcelCounts.source,
+        parsedRecords: parcelCounts.parsed,
+        rejectedRecords: parcelCounts.rejected,
+      },
+      membershipRule:
+        "deterministic 25-property stratified appraisal sample eligibility v1",
+      selectionKind: "deterministic_sample",
+    },
     dataDir: options.dataDir,
     sampling,
     sourceObjects: [
@@ -168,7 +197,7 @@ export async function preparePilot(options: {
     sourceCounts: loaded.counts,
     sourceLimitations: [
       "Pasco Accela collection stopped after challenge/CAPTCHA content was detected on the anonymous form GET; no permit search POST was sent, and permits and contractors are unavailable for this pilot.",
-      "Temporal deletion and current-state reconciliation are not implemented in this checkpoint.",
+      "This deterministic sample is not authoritative for property absence and cannot inactivate canonical properties.",
     ],
   };
   return writePreparedInput({

@@ -143,7 +143,9 @@ export interface PilotRunRequest {
 
 export interface PilotRunSummary {
   acceptedProperties: number;
+  activeProperties: number;
   buildings: number;
+  // Content-hash delta counts remain independent of lifecycle transitions.
   changedProperties: number;
   coordinates: number;
   databaseGrowthBytes: number;
@@ -154,6 +156,8 @@ export interface PilotRunSummary {
   elapsedMs: number;
   explicitUnavailableFacts: number;
   gisMetrics: GisAcquisitionMetrics;
+  inactiveProperties: number;
+  inactivatedProperties: number;
   missingCoordinates: number;
   newProperties: number;
   ownership: number;
@@ -161,6 +165,7 @@ export interface PilotRunSummary {
   permitRequestCount: number;
   permits: number;
   rejectedRecords: number;
+  reactivatedProperties: number;
   roofSignals: number;
   roofSignalBasis: Record<string, number>;
   runId: string;

@@ -8,6 +8,11 @@ import type {
 } from "../../src/domain/types.js";
 import { deterministicId, propertyId, sha256 } from "../../src/lib/hash.js";
 import {
+  AUTHORITATIVE_PARCEL_SELECTION_ALGORITHM,
+  AUTHORITATIVE_PARCEL_SELECTION_SEED,
+  PASCO_PARCEL_AUTHORITY_SOURCE_IDENTIFIER,
+} from "../../src/snapshot/coverage.js";
+import {
   createSourceObject,
   writePreparedInput,
   writeSourceSnapshot,
@@ -24,6 +29,16 @@ export interface SyntheticSnapshot {
   reference: PreparedInputReference;
   request: PilotRunRequest;
   snapshot: SourceSnapshotManifest;
+}
+
+export interface SyntheticLifecycleSnapshotOptions {
+  changedFolios?: readonly string[];
+  coverage: "authoritative" | "incomplete" | "sample";
+  createdAt?: string;
+  folios: readonly string[];
+  label: string;
+  membershipRule?: string;
+  previousAuthoritativeSnapshotId?: string | null;
 }
 
 function sourceCount(count: number) {
@@ -118,35 +133,92 @@ export async function createSyntheticSnapshot(
   label: "a" | "b",
 ): Promise<SyntheticSnapshot> {
   const folios = syntheticFolios(label);
-  const sourcePath = path.join(dataDir, "synthetic", `snapshot-${label}.bin`);
-  await mkdir(path.dirname(sourcePath), { recursive: true });
-  await writeFile(sourcePath, `synthetic-source-snapshot-${label}\n`, {
+  return createSyntheticLifecycleSnapshot(dataDir, {
+    changedFolios: label === "b" ? ["SYNTH-02"] : [],
+    coverage: "sample",
+    folios,
+    label: `sample-${label}`,
+  });
+}
+
+export async function createSyntheticLifecycleSnapshot(
+  dataDir: string,
+  options: SyntheticLifecycleSnapshotOptions,
+): Promise<SyntheticSnapshot> {
+  if (options.folios.length !== 25) {
+    throw new Error(
+      "Synthetic Loader snapshots must contain exactly 25 records",
+    );
+  }
+  const rawPath = path.join(dataDir, "synthetic", `${options.label}.zip`);
+  const extractedPath = path.join(dataDir, "synthetic", `${options.label}.csv`);
+  await mkdir(path.dirname(rawPath), { recursive: true });
+  await writeFile(rawPath, `synthetic-source-${options.label}\n`, {
     mode: 0o600,
   });
-  const sourceObject = await createSourceObject({
+  await writeFile(
+    extractedPath,
+    `${options.folios.join("\n")}\nsynthetic-${options.label}\n`,
+    { mode: 0o600 },
+  );
+  const downloadedSource = await createSourceObject({
     dataDir,
-    filePath: sourcePath,
+    filePath: rawPath,
     observedAt: SYNTHETIC_AS_OF,
-    sourceIdentifier: `synthetic://snapshot-${label}`,
-    sourceSystem: "synthetic_test",
+    sourceIdentifier: `https://synthetic.invalid/${options.label}/parcel.zip`,
+    sourceSystem: "pasco_appraiser",
     stage: "downloaded_source",
   });
+  const parcelSource = await createSourceObject({
+    dataDir,
+    derivedFromSha256: downloadedSource.sha256,
+    filePath: extractedPath,
+    observedAt: SYNTHETIC_AS_OF,
+    sourceIdentifier: PASCO_PARCEL_AUTHORITY_SOURCE_IDENTIFIER,
+    sourceSystem: "pasco_appraiser",
+    stage: "extracted_source",
+  });
+  const folios = [...options.folios];
   const selectedRecordSha256 = sha256(JSON.stringify([...folios].sort()));
+  const completeIntent = options.coverage !== "sample";
   const sampling = {
-    algorithm: SYNTHETIC_SAMPLE_ALGORITHM,
-    seed: SYNTHETIC_SAMPLE_SEED,
+    algorithm: completeIntent
+      ? AUTHORITATIVE_PARCEL_SELECTION_ALGORITHM
+      : SYNTHETIC_SAMPLE_ALGORITHM,
+    seed: completeIntent
+      ? AUTHORITATIVE_PARCEL_SELECTION_SEED
+      : SYNTHETIC_SAMPLE_SEED,
     selectedRecordSha256,
     selectionSize: 25,
   };
+  const incomplete = options.coverage === "incomplete";
   const snapshotResult = await writeSourceSnapshot({
     asOf: SYNTHETIC_AS_OF,
-    createdAt: `2026-08-29T00:00:0${label === "a" ? "1" : "2"}.000Z`,
+    coverage: {
+      authoritySourceId: parcelSource.sourceId,
+      counts: {
+        acceptedRecords: 25,
+        expectedSourceRecords: incomplete ? 26 : 25,
+        observedSourceRecords: incomplete ? 26 : 25,
+        parsedRecords: incomplete ? 26 : 25,
+        rejectedRecords: incomplete ? 1 : 0,
+      },
+      membershipRule:
+        options.membershipRule ?? "all official parcel rows in Pasco v1",
+      previousAuthoritativeSnapshotId:
+        options.previousAuthoritativeSnapshotId ?? null,
+      selectionKind: completeIntent
+        ? "complete_source"
+        : "deterministic_sample",
+    },
+    createdAt: options.createdAt ?? "2026-08-29T00:00:01.000Z",
     dataDir,
     sampling,
-    sourceObjects: [sourceObject],
+    sourceObjects: [downloadedSource, parcelSource],
   });
+  const changedFolios = new Set(options.changedFolios ?? []);
   const properties = folios.map((folio) =>
-    syntheticProperty(folio, label === "b" && folio === "SYNTH-02"),
+    syntheticProperty(folio, changedFolios.has(folio)),
   );
   const prepared: PreparedPilot = {
     artifacts: [],
@@ -166,8 +238,8 @@ export async function createSyntheticSnapshot(
       elapsedMs: 1,
       peakRssBytes: 64 * 1024 ** 2,
     },
-    sampleAlgorithm: SYNTHETIC_SAMPLE_ALGORITHM,
-    sampleSeed: SYNTHETIC_SAMPLE_SEED,
+    sampleAlgorithm: sampling.algorithm,
+    sampleSeed: sampling.seed,
     selectedRecordSha256,
     selectionSize: 25,
     snapshotId: snapshotResult.manifest.snapshotId,
@@ -175,12 +247,15 @@ export async function createSyntheticSnapshot(
     sourceCounts: {
       buildings: sourceCount(25),
       owners: sourceCount(25),
-      parcels: sourceCount(25),
+      parcel: {
+        ...sourceCount(incomplete ? 26 : 25),
+        accepted: 25,
+        rejected: incomplete ? 1 : 0,
+        rejectionReasons: incomplete ? { synthetic_malformed: 1 } : {},
+      },
       siteAddresses: sourceCount(25),
     },
-    sourceLimitations: [
-      "Synthetic non-PII transition fixture; deletion/current-state reconciliation is intentionally absent.",
-    ],
+    sourceLimitations: ["Synthetic non-PII temporal transition fixture."],
   };
   const reference = await writePreparedInput({
     createdAt: snapshotResult.manifest.createdAt,
@@ -191,7 +266,7 @@ export async function createSyntheticSnapshot(
     snapshot: snapshotResult.manifest,
     snapshotReference: snapshotResult.reference,
   });
-  const workflowId = `pasco-synthetic-snapshot-${label}`;
+  const workflowId = `pasco-synthetic-${options.label}`;
   const request: PilotRunRequest = {
     asOf: SYNTHETIC_AS_OF,
     county: "pasco",
@@ -201,8 +276,8 @@ export async function createSyntheticSnapshot(
       "pasco",
       workflowId,
     ]),
-    sampleAlgorithm: SYNTHETIC_SAMPLE_ALGORITHM,
-    sampleSeed: SYNTHETIC_SAMPLE_SEED,
+    sampleAlgorithm: sampling.algorithm,
+    sampleSeed: sampling.seed,
     selectionSize: 25,
     workflowId,
   };

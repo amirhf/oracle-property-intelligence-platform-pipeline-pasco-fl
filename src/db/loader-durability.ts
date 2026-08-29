@@ -53,7 +53,10 @@ export async function beginLoaderEffect(
     INSERT INTO oracle_source_snapshots (
       snapshot_id, county, source_set_id, manifest_version, manifest_sha256,
       observation_start, observation_end, parser_version, transform_version,
-      canonical_schema_sha256, sampling, source_objects, manifest_created_at
+      canonical_schema_sha256, sampling, source_objects, manifest_created_at,
+      coverage_mode, scope_id, entity_type, authority_source_system,
+      authority_source_identifier, coverage_metadata,
+      previous_authoritative_snapshot_id
     ) VALUES (
       ${snapshot.snapshotId}, ${snapshot.county}, ${snapshot.sourceSetId},
       ${snapshot.manifestVersion}, ${prepared.snapshotManifest.sha256},
@@ -62,19 +65,25 @@ export async function beginLoaderEffect(
       ${snapshot.canonicalSchemaSha256},
       ${transaction.json(snapshot.sampling as unknown as postgres.JSONValue)},
       ${transaction.json(snapshot.sourceObjects as unknown as postgres.JSONValue)},
-      ${snapshot.createdAt}
+      ${snapshot.createdAt}, ${snapshot.coverage.mode},
+      ${snapshot.coverage.scopeId}, ${snapshot.coverage.entityType},
+      ${snapshot.coverage.authoritySource.sourceSystem},
+      ${snapshot.coverage.authoritySource.sourceIdentifier},
+      ${transaction.json(snapshot.coverage as unknown as postgres.JSONValue)},
+      ${snapshot.coverage.previousAuthoritativeSnapshotId}
     )
     ON CONFLICT (snapshot_id) DO NOTHING
   `;
   const snapshotRows = await transaction<
-    { manifest_sha256: string; source_set_id: string }[]
+    { manifest_sha256: string; scope_id: string; source_set_id: string }[]
   >`
-    SELECT manifest_sha256, source_set_id
+    SELECT manifest_sha256, source_set_id, scope_id
     FROM oracle_source_snapshots WHERE snapshot_id = ${snapshot.snapshotId}
   `;
   if (
     snapshotRows[0]?.manifest_sha256 !== prepared.snapshotManifest.sha256 ||
-    snapshotRows[0]?.source_set_id !== snapshot.sourceSetId
+    snapshotRows[0]?.source_set_id !== snapshot.sourceSetId ||
+    snapshotRows[0]?.scope_id !== snapshot.coverage.scopeId
   ) {
     conflict("source snapshot", snapshot.snapshotId);
   }
@@ -129,6 +138,8 @@ export async function beginLoaderEffect(
     UPDATE oracle_pipeline_runs SET
       snapshot_id = ${snapshot.snapshotId},
       request_sha256 = ${context.requestSha256},
+      coverage_mode = ${snapshot.coverage.mode},
+      coverage_scope_id = ${snapshot.coverage.scopeId},
       window_start = ${snapshot.observationWindow.start},
       window_end = ${snapshot.observationWindow.end}
     WHERE run_id = ${context.runId}

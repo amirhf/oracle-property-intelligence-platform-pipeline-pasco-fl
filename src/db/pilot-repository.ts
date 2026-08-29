@@ -30,6 +30,11 @@ import {
   type LoaderDurabilityContext,
 } from "./loader-durability.js";
 import { countyIngestRequestSha256 } from "../workflow/schemas.js";
+import {
+  applyTemporalReconciliation,
+  prepareTemporalReconciliation,
+  type PropertyTemporalDelta,
+} from "./temporal-reconciliation.js";
 
 function pipelineLimitations(selectionSize: number): string[] {
   return [
@@ -37,7 +42,7 @@ function pipelineLimitations(selectionSize: number): string[] {
     "Pasco Accela coverage can exclude incorporated-city permit systems.",
     "Pasco Accela collection stopped after challenge/CAPTCHA content was detected; permit search results and contractor identity are unavailable.",
     "Sunbiz and BBB are intentionally not collected in this checkpoint.",
-    "Temporal deletion and current-state reconciliation are not implemented in this checkpoint.",
+    "This bounded sample is not authoritative for absence and cannot inactivate properties.",
   ];
 }
 
@@ -194,6 +199,10 @@ export async function loadPreparedPilot(
     return await sql.begin(async (transaction) => {
       const replay = await beginLoaderEffect(transaction, durability);
       if (replay) return replay;
+      const temporalPlan = await prepareTemporalReconciliation(
+        transaction,
+        durability.snapshot,
+      );
       const attemptId = deterministicId("attempt", [
         "1.0.0",
         "attempt",
@@ -239,6 +248,7 @@ export async function loadPreparedPilot(
       let newProperties = 0;
       let changedProperties = 0;
       let unchangedProperties = 0;
+      const temporalDeltas: PropertyTemporalDelta[] = [];
       for (const entry of prepared.properties) {
         const exactFolio = entry.parcel.exactFolio;
         const propertyHash = sourceRecordHash({
@@ -259,6 +269,11 @@ export async function loadPreparedPilot(
         if (delta === "new") newProperties += 1;
         else if (delta === "unchanged") unchangedProperties += 1;
         else changedProperties += 1;
+        temporalDeltas.push({
+          classification: delta,
+          propertyId: entry.propertyId,
+          sourceRecordHash: propertyHash,
+        });
 
         await transaction`
           INSERT INTO oracle_properties (
@@ -479,6 +494,13 @@ export async function loadPreparedPilot(
         }
       }
 
+      const temporal = await applyTemporalReconciliation(
+        transaction,
+        temporalPlan,
+        request.runId,
+        temporalDeltas,
+      );
+
       const propertyIds = prepared.properties.map((entry) => entry.propertyId);
       const countRows = await transaction<
         {
@@ -548,6 +570,7 @@ export async function loadPreparedPilot(
       const elapsedMs = Number(runMetrics[0]?.elapsed_ms ?? 0);
       const summary: PilotRunSummary = {
         acceptedProperties: prepared.properties.length,
+        activeProperties: temporal.activeProperties,
         buildings: counts.buildings,
         changedProperties,
         coordinates: counts.coordinates,
@@ -562,6 +585,8 @@ export async function loadPreparedPilot(
         elapsedMs,
         explicitUnavailableFacts: counts.availability,
         gisMetrics: prepared.gisMetrics,
+        inactiveProperties: temporal.inactiveProperties,
+        inactivatedProperties: temporal.inactivatedProperties,
         missingCoordinates: prepared.properties.length - counts.coordinates,
         newProperties,
         ownership: counts.ownership,
@@ -572,6 +597,7 @@ export async function loadPreparedPilot(
         permitRequestCount: prepared.permitRequestCount,
         permits: counts.permits,
         rejectedRecords,
+        reactivatedProperties: temporal.reactivatedProperties,
         roofSignals: counts.roof_signals,
         roofSignalBasis,
         runId: request.runId,

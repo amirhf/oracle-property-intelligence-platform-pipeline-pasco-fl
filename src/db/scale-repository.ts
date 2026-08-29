@@ -17,6 +17,11 @@ import {
   completeLoaderEffect,
   type LoaderDurabilityContext,
 } from "./loader-durability.js";
+import {
+  applyTemporalReconciliation,
+  prepareTemporalReconciliation,
+  type PropertyTemporalDelta,
+} from "./temporal-reconciliation.js";
 
 const UNAVAILABLE_FEATURES = [
   ["permits", "source_unavailable"],
@@ -45,7 +50,7 @@ function limitations(selectionSize: number): string[] {
     "Permit source unavailable after the Accela challenge stop; missing permits do not mean none exist.",
     "Contractor source unavailable because no compliant permit source was established.",
     "Sunbiz and BBB were not collected and remain explicitly unavailable.",
-    "Temporal deletion and current-state reconciliation are not implemented in this checkpoint.",
+    "This bounded sample is not authoritative for absence and cannot inactivate properties.",
   ];
 }
 
@@ -76,6 +81,10 @@ export async function loadPreparedScale(
     return await sql.begin(async (transaction) => {
       const replay = await beginLoaderEffect(transaction, durability);
       if (replay) return replay;
+      const temporalPlan = await prepareTemporalReconciliation(
+        transaction,
+        durability.snapshot,
+      );
       const attemptId = deterministicId("attempt", [
         "1.0.0",
         "attempt",
@@ -135,6 +144,7 @@ export async function loadPreparedScale(
       let newProperties = 0;
       let changedProperties = 0;
       let unchangedProperties = 0;
+      const temporalDeltas: PropertyTemporalDelta[] = [];
       for (const propertyBatch of batches(prepared.properties, 500)) {
         const propertyRows = propertyBatch.map((entry) => {
           const exactFolio = entry.parcel.exactFolio;
@@ -152,6 +162,11 @@ export async function loadPreparedScale(
           if (delta === "new") newProperties += 1;
           else if (delta === "changed") changedProperties += 1;
           else unchangedProperties += 1;
+          temporalDeltas.push({
+            classification: delta,
+            propertyId: entry.propertyId,
+            sourceRecordHash: propertyHash,
+          });
           return {
             acres: entry.parcel.acres,
             county: "pasco",
@@ -353,6 +368,13 @@ export async function loadPreparedScale(
         `;
       }
 
+      const temporal = await applyTemporalReconciliation(
+        transaction,
+        temporalPlan,
+        request.runId,
+        temporalDeltas,
+      );
+
       const propertyIds = prepared.properties.map((entry) => entry.propertyId);
       const counts = await transaction<
         {
@@ -416,6 +438,7 @@ export async function loadPreparedScale(
       const elapsedMs = Number(runMetrics[0]?.elapsed_ms ?? 0);
       const summary: PilotRunSummary = {
         acceptedProperties: prepared.properties.length,
+        activeProperties: temporal.activeProperties,
         buildings: observed.buildings,
         changedProperties,
         coordinates: observed.coordinates,
@@ -430,6 +453,8 @@ export async function loadPreparedScale(
         elapsedMs,
         explicitUnavailableFacts: observed.availability,
         gisMetrics: prepared.gisMetrics,
+        inactiveProperties: temporal.inactiveProperties,
+        inactivatedProperties: temporal.inactivatedProperties,
         missingCoordinates: prepared.properties.length - observed.coordinates,
         newProperties,
         ownership: observed.ownership,
@@ -443,6 +468,7 @@ export async function loadPreparedScale(
           (sum, count) => sum + count.rejected,
           0,
         ),
+        reactivatedProperties: temporal.reactivatedProperties,
         roofSignalBasis: Object.fromEntries(
           roofBasisRows.map((row) => [row.basis, row.count]),
         ),

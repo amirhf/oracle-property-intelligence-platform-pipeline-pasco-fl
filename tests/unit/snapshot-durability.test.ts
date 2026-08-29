@@ -18,6 +18,7 @@ import {
   parsePreparedPilot,
 } from "../../src/workflow/schemas.js";
 import {
+  createSyntheticLifecycleSnapshot,
   createSyntheticSnapshot,
   syntheticLoaderIdempotencyKey,
 } from "../helpers/durability.js";
@@ -53,6 +54,11 @@ describe("source snapshot and prepared-input durability", () => {
     expect(snapshotA.snapshot.sourceObjects[0]?.sha256).not.toBe(
       snapshotB.snapshot.sourceObjects[0]?.sha256,
     );
+    expect(snapshotA.snapshot.coverage).toMatchObject({
+      completeness: { result: "not_applicable" },
+      mode: "sample",
+      selection: { kind: "deterministic_sample", selectionSize: 25 },
+    });
 
     const first = await verifyPreparedInput(
       dataDir,
@@ -77,6 +83,31 @@ describe("source snapshot and prepared-input durability", () => {
         snapshotB.snapshot.snapshotId,
       ),
     ).rejects.toThrow("Prepared input snapshot mismatch");
+  });
+
+  it("excludes creation time from deterministic snapshot identity", async () => {
+    const dataDir = await temporaryDataDir();
+    const folios = Array.from(
+      { length: 25 },
+      (_, index) => `IDENT-${(index + 1).toString().padStart(2, "0")}`,
+    );
+    const first = await createSyntheticLifecycleSnapshot(dataDir, {
+      coverage: "sample",
+      createdAt: "2026-08-29T00:00:01.000Z",
+      folios,
+      label: "identity-created-at",
+    });
+    const second = await createSyntheticLifecycleSnapshot(dataDir, {
+      coverage: "sample",
+      createdAt: "2026-08-29T12:00:00.000Z",
+      folios,
+      label: "identity-created-at",
+    });
+    expect(second.snapshot.snapshotId).toBe(first.snapshot.snapshotId);
+    expect(second.reference.preparedInputId).toBe(
+      first.reference.preparedInputId,
+    );
+    expect(second.snapshot.createdAt).toBe(first.snapshot.createdAt);
   });
 
   it("rejects modified, missing, mismatched, and path-escaping inputs", async () => {
@@ -176,6 +207,9 @@ describe("strict durable workflow requests", () => {
     expect(() => parseCountyIngestRequest({ ...valid, extra: true })).toThrow(
       "CountyIngest request failed strict validation",
     );
+    expect(() =>
+      parseCountyIngestRequest({ ...valid, authoritativeComplete: true }),
+    ).toThrow("CountyIngest request failed strict validation");
     expect(() =>
       parseCountyIngestRequest({ ...valid, county: "other" }),
     ).toThrow("CountyIngest request failed strict validation");

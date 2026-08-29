@@ -26,15 +26,21 @@ try {
       result_counts: PilotRunSummary;
       run_id: string;
       status: string;
+      coverage_mode: string;
       workflow_id: string;
     }[]
   >`
-    SELECT run_id, workflow_id, status, result_counts
+    SELECT run_id, workflow_id, status, coverage_mode, result_counts
     FROM oracle_pipeline_runs
     WHERE workflow_id = ANY(${workflows})
     ORDER BY workflow_id
   `;
-  if (runs.length !== 2 || runs.some((run) => run.status !== "completed")) {
+  if (
+    runs.length !== 2 ||
+    runs.some(
+      (run) => run.status !== "completed" || run.coverage_mode !== "sample",
+    )
+  ) {
     throw new Error(`Both ${selectionSize}-property scale runs must complete`);
   }
   const initial = runs.find((run) => run.workflow_id.endsWith("initial"));
@@ -102,17 +108,26 @@ try {
 
   const scopedCounts = await sql<
     {
+      active: number;
       canonical: number;
       contractors: number;
       distinct_ids: number;
+      inactive: number;
       permits: number;
+      tombstones: number;
     }[]
   >`
     SELECT
       count(*)::int AS canonical,
       count(DISTINCT property_id)::int AS distinct_ids,
+      count(*) FILTER (WHERE is_active)::int AS active,
+      count(*) FILTER (WHERE NOT is_active)::int AS inactive,
       (SELECT count(*)::int FROM oracle_permits) AS permits,
-      (SELECT count(*)::int FROM oracle_contractors) AS contractors
+      (SELECT count(*)::int FROM oracle_contractors) AS contractors,
+      (SELECT count(*)::int
+       FROM oracle_property_lifecycle_events
+       WHERE property_id = ANY(${scopedPropertyIds})
+         AND event_type = 'inactivated') AS tombstones
     FROM oracle_properties
     WHERE property_id = ANY(${scopedPropertyIds})
   `;
@@ -120,6 +135,9 @@ try {
   if (
     counts?.canonical !== selectionSize ||
     counts.distinct_ids !== selectionSize ||
+    counts.active !== selectionSize ||
+    counts.inactive !== 0 ||
+    counts.tombstones !== 0 ||
     counts.permits !== 0 ||
     counts.contractors !== 0
   ) {
@@ -144,11 +162,13 @@ try {
         gatePassed,
         selectionHash,
         initial: {
+          coverageMode: initial.coverage_mode,
           result: initial.result_counts,
           runId: initial.run_id,
           workflowId: initial.workflow_id,
         },
         repeat: {
+          coverageMode: repeat.coverage_mode,
           result: repeat.result_counts,
           runId: repeat.run_id,
           workflowId: repeat.workflow_id,

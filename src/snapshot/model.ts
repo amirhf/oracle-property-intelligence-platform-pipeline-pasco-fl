@@ -15,8 +15,14 @@ import type { ArtifactCapture, PreparedPilot } from "../domain/types.js";
 import { canonicalJson, canonicalJsonSha256 } from "../lib/canonical-json.js";
 import { DurableInputError } from "../lib/durability-errors.js";
 import { deterministicId, sha256 } from "../lib/hash.js";
+import {
+  deriveSnapshotCoverage,
+  snapshotCoverageSchema,
+  validateSnapshotCoverage,
+  type CoveragePreparation,
+} from "./coverage.js";
 
-export const SNAPSHOT_MANIFEST_VERSION = "1.0.0";
+export const SNAPSHOT_MANIFEST_VERSION = "1.1.0";
 export const PREPARED_INPUT_MANIFEST_VERSION = "1.0.0";
 export const CANONICAL_SCHEMA_SHA256 =
   "59c6472c2cd6d18041cf72c779fb970a082b00bef09aea724b99687e84198306";
@@ -67,6 +73,7 @@ export const snapshotSamplingSchema = z.strictObject({
 export const sourceSnapshotManifestSchema = z.strictObject({
   canonicalSchemaSha256: sha256Schema,
   county: z.literal("pasco"),
+  coverage: snapshotCoverageSchema,
   createdAt: isoDateTimeSchema,
   manifestVersion: z.literal(SNAPSHOT_MANIFEST_VERSION),
   observationWindow: z.strictObject({
@@ -239,6 +246,14 @@ export function validateSnapshotIdentity(
       "Source snapshot canonical schema hash mismatch",
     );
   }
+  validateSnapshotCoverage({
+    coverage: manifest.coverage,
+    observationWindow: manifest.observationWindow,
+    parserVersion: manifest.parserVersion,
+    sampling: manifest.sampling,
+    sourceObjects: manifest.sourceObjects,
+    transformVersion: manifest.transformVersion,
+  });
   return manifest;
 }
 
@@ -337,6 +352,7 @@ export async function verifySourceObjectBindings(
 
 export async function writeSourceSnapshot(options: {
   asOf: string;
+  coverage: CoveragePreparation;
   createdAt?: string;
   dataDir: string;
   sampling: SourceSnapshotManifest["sampling"];
@@ -354,12 +370,42 @@ export async function writeSourceSnapshot(options: {
   if (sha256(canonicalSchemaBytes) !== CANONICAL_SCHEMA_SHA256) {
     throw new DurableInputError("Canonical schema bytes do not match the lock");
   }
+  const observationWindow = observedWindow(sourceObjects, options.asOf);
+  const authoritySource = sourceObjects.find(
+    (object) => object.sourceId === options.coverage.authoritySourceId,
+  );
+  if (!authoritySource) {
+    throw new DurableInputError(
+      "Coverage authority object is not in the snapshot",
+    );
+  }
+  const coverage = deriveSnapshotCoverage({
+    authoritySource,
+    counts: options.coverage.counts,
+    membershipRule: options.coverage.membershipRule,
+    observationWindow,
+    parserVersion: PASCO_PARSER_VERSION,
+    previousAuthoritativeSnapshotId:
+      options.coverage.previousAuthoritativeSnapshotId ?? null,
+    sampling: options.sampling,
+    selectionKind: options.coverage.selectionKind,
+    transformVersion: PASCO_TRANSFORM_VERSION,
+  });
+  validateSnapshotCoverage({
+    coverage,
+    observationWindow,
+    parserVersion: PASCO_PARSER_VERSION,
+    sampling: options.sampling,
+    sourceObjects,
+    transformVersion: PASCO_TRANSFORM_VERSION,
+  });
   const withoutId: Omit<SourceSnapshotManifest, "snapshotId"> = {
     canonicalSchemaSha256: CANONICAL_SCHEMA_SHA256,
     county: "pasco",
+    coverage,
     createdAt: options.createdAt ?? new Date().toISOString(),
     manifestVersion: SNAPSHOT_MANIFEST_VERSION,
-    observationWindow: observedWindow(sourceObjects, options.asOf),
+    observationWindow,
     parserVersion: PASCO_PARSER_VERSION,
     sampling: options.sampling,
     sourceObjects,

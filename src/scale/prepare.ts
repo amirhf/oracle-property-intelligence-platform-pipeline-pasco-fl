@@ -10,6 +10,7 @@ import {
 import type { PreparedPilot } from "../domain/types.js";
 import { fetchPascoCoordinateBatches } from "../gis/pasco.js";
 import { sha256 } from "../lib/hash.js";
+import { PASCO_PARCEL_AUTHORITY_SOURCE_IDENTIFIER } from "../snapshot/coverage.js";
 import {
   createSourceObject,
   sourceObjectFromArtifact,
@@ -59,16 +60,20 @@ export async function prepareScaleDataset(options: {
     ),
   );
   const extractedSourceObjects = await Promise.all(
-    Object.entries(appraiser.paths).map(([name, filePath]) =>
-      createSourceObject({
+    Object.entries(appraiser.paths).map(([name, filePath]) => {
+      const downloaded = downloadedSourceObjects.find((object) =>
+        object.sourceIdentifier.endsWith(`/${name}.zip`),
+      );
+      return createSourceObject({
         dataDir: options.dataDir,
+        derivedFromSha256: downloaded?.sha256 ?? null,
         filePath,
         observedAt: appraiserObservedAt,
         sourceIdentifier: `pasco_appraiser:extracted:${name}`,
         sourceSystem: "pasco_appraiser",
         stage: "extracted_source",
-      }),
-    ),
+      });
+    }),
   );
   const loaded = await loadPilotCandidateData(appraiser.paths);
   const selection = selectCountywideSample(
@@ -168,8 +173,31 @@ export async function prepareScaleDataset(options: {
     selectedRecordSha256: selectionHash,
     selectionSize: options.selectionSize,
   };
+  const parcelAuthority = extractedSourceObjects.find(
+    (object) =>
+      object.sourceIdentifier === PASCO_PARCEL_AUTHORITY_SOURCE_IDENTIFIER,
+  );
+  if (!parcelAuthority) {
+    throw new Error("Prepared snapshot is missing the official parcel object");
+  }
+  const parcelCounts = loaded.counts.parcel;
+  if (!parcelCounts) {
+    throw new Error("Prepared snapshot is missing parcel parse counts");
+  }
   const snapshot = await writeSourceSnapshot({
     asOf: options.asOf,
+    coverage: {
+      authoritySourceId: parcelAuthority.sourceId,
+      counts: {
+        acceptedRecords: parcelCounts.accepted,
+        expectedSourceRecords: parcelCounts.source,
+        observedSourceRecords: parcelCounts.source,
+        parsedRecords: parcelCounts.parsed,
+        rejectedRecords: parcelCounts.rejected,
+      },
+      membershipRule: `${COUNTYWIDE_SAMPLE_ALGORITHM} eligibility and deterministic selection v1`,
+      selectionKind: "deterministic_sample",
+    },
     dataDir: options.dataDir,
     sampling,
     sourceObjects: [
@@ -200,7 +228,7 @@ export async function prepareScaleDataset(options: {
       "Permit source is unavailable after the Accela challenge stop; missing permits must not be interpreted as none existing.",
       "Contractor source is unavailable because no compliant permit source was established.",
       "Sunbiz and BBB were not collected and remain explicitly unavailable.",
-      "Temporal deletion and current-state reconciliation are not implemented in this checkpoint.",
+      "This deterministic sample is not authoritative for property absence and cannot inactivate canonical properties.",
     ],
   };
   return writePreparedInput({

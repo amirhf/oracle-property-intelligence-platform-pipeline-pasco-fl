@@ -64,7 +64,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(5);
+  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(7);
   expect(await runMigrations(schemaDatabaseUrl)).toEqual([]);
   snapshotA = await createSyntheticSnapshot(dataDir, "a");
   snapshotB = await createSyntheticSnapshot(dataDir, "b");
@@ -93,9 +93,13 @@ describe("Loader/pasco durability", () => {
     expect(restartedReplay).toEqual(first);
     expect(first).toMatchObject({
       acceptedProperties: 25,
+      activeProperties: 25,
       changedProperties: 0,
       duplicateProperties: 0,
       newProperties: 25,
+      inactiveProperties: 0,
+      inactivatedProperties: 0,
+      reactivatedProperties: 0,
       unchangedProperties: 0,
     });
 
@@ -166,9 +170,13 @@ describe("Loader/pasco durability", () => {
     expect(replay).toEqual(initial);
     expect(initial).toMatchObject({
       acceptedProperties: 25,
+      activeProperties: 25,
       changedProperties: 1,
       duplicateProperties: 0,
       newProperties: 1,
+      inactiveProperties: 0,
+      inactivatedProperties: 0,
+      reactivatedProperties: 0,
       unchangedProperties: 23,
     });
 
