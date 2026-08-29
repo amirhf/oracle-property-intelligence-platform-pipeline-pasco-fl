@@ -20,6 +20,7 @@ import {
 } from "../publication/plan.js";
 
 const IPNS_ID_PATTERN = /^k51[a-z0-9]{20,120}$/;
+const CIDV1_BASE32_PATTERN = /^b[a-z2-7]{20,120}$/;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const CANONICAL_SCHEMA_SHA256 =
   "59c6472c2cd6d18041cf72c779fb970a082b00bef09aea724b99687e84198306";
@@ -97,8 +98,14 @@ function responseCid(headers: Headers, location: string | null): string | null {
     .flatMap((value) => value.split(/[\s,]+/));
   return (
     candidates
-      .flatMap((value) => value.match(/Qm[1-9A-HJ-NP-Za-km-z]{44}/g) ?? [])
-      .find((value) => CIDV0_PATTERN.test(value)) ?? null
+      .flatMap(
+        (value) =>
+          value.match(/Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,120}/g) ?? [],
+      )
+      .find(
+        (value) =>
+          CIDV0_PATTERN.test(value) || CIDV1_BASE32_PATTERN.test(value),
+      ) ?? null
   );
 }
 

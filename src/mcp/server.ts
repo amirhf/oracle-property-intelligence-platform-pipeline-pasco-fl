@@ -201,88 +201,92 @@ export function createOracleMcpHttpServer(options: {
   providerMode: "local-artifact" | "public-ipns";
   runtime: OracleMcpRuntime;
 }): HttpServer {
-  return createNodeServer((request, response) => {
-    void (async () => {
-      if (request.method === "GET" && request.url === "/") {
-        explorerHtmlResponse(response);
-        return;
+  return createNodeServer(createOracleMcpRequestHandler(options));
+}
+
+export function createOracleMcpRequestHandler(options: {
+  contracts: McpContractRegistry;
+  limits: McpLimits;
+  providerMode: "local-artifact" | "public-ipns";
+  runtime: OracleMcpRuntime;
+}): (request: IncomingMessage, response: ServerResponse) => Promise<void> {
+  return async (request, response) => {
+    if (request.method === "GET" && request.url === "/") {
+      explorerHtmlResponse(response);
+      return;
+    }
+    if (request.method === "GET" && request.url === "/health") {
+      jsonResponse(response, 200, {
+        status: "ok",
+        service: MCP_SERVICE_NAME,
+        serviceVersion: MCP_SERVICE_VERSION,
+        contractVersion: MCP_CONTRACT_VERSION,
+        schemaHash: MCP_SCHEMA_SHA256,
+        providerMode: options.providerMode,
+      });
+      return;
+    }
+    if (request.method === "GET" && request.url === "/explorer/api/bootstrap") {
+      try {
+        explorerJsonResponse(
+          response,
+          await explorerBootstrap(options.runtime),
+          options.limits.maxResponseBytes,
+        );
+      } catch {
+        jsonResponse(response, 503, {
+          error: "Validated explorer metadata is unavailable",
+        });
       }
-      if (request.method === "GET" && request.url === "/health") {
-        jsonResponse(response, 200, {
-          status: "ok",
-          service: MCP_SERVICE_NAME,
-          serviceVersion: MCP_SERVICE_VERSION,
-          contractVersion: MCP_CONTRACT_VERSION,
-          schemaHash: MCP_SCHEMA_SHA256,
-          providerMode: options.providerMode,
+      return;
+    }
+    if (
+      request.method === "POST" &&
+      (request.url === "/explorer/api/search" ||
+        request.url === "/explorer/api/property")
+    ) {
+      let body: unknown;
+      try {
+        body = await readBoundedJson(request, options.limits.maxRequestBytes);
+      } catch (error) {
+        const tooLarge =
+          error instanceof Error && error.message === "request_too_large";
+        jsonResponse(response, tooLarge ? 413 : 400, {
+          error: tooLarge
+            ? "Request body exceeds the limit"
+            : "Invalid JSON body",
         });
         return;
       }
-      if (
-        request.method === "GET" &&
-        request.url === "/explorer/api/bootstrap"
-      ) {
-        try {
-          explorerJsonResponse(
-            response,
-            await explorerBootstrap(options.runtime),
-            options.limits.maxResponseBytes,
-          );
-        } catch {
-          jsonResponse(response, 503, {
-            error: "Validated explorer metadata is unavailable",
-          });
-        }
-        return;
+      const result =
+        request.url === "/explorer/api/search"
+          ? await explorerSearch(options.runtime, body)
+          : await explorerProperty(options.runtime, body);
+      explorerJsonResponse(response, result, options.limits.maxResponseBytes);
+      return;
+    }
+    if (request.method !== "POST" || request.url !== "/mcp") {
+      jsonResponse(response, 404, { error: "Not found" });
+      return;
+    }
+    try {
+      await handleMcpRequest(
+        request,
+        response,
+        options.runtime,
+        options.contracts,
+        options.limits,
+      );
+    } catch {
+      if (!response.headersSent) {
+        jsonResponse(response, 500, {
+          error: "Internal MCP transport error",
+        });
+      } else if (!response.writableEnded) {
+        response.end();
       }
-      if (
-        request.method === "POST" &&
-        (request.url === "/explorer/api/search" ||
-          request.url === "/explorer/api/property")
-      ) {
-        let body: unknown;
-        try {
-          body = await readBoundedJson(request, options.limits.maxRequestBytes);
-        } catch (error) {
-          const tooLarge =
-            error instanceof Error && error.message === "request_too_large";
-          jsonResponse(response, tooLarge ? 413 : 400, {
-            error: tooLarge
-              ? "Request body exceeds the limit"
-              : "Invalid JSON body",
-          });
-          return;
-        }
-        const result =
-          request.url === "/explorer/api/search"
-            ? await explorerSearch(options.runtime, body)
-            : await explorerProperty(options.runtime, body);
-        explorerJsonResponse(response, result, options.limits.maxResponseBytes);
-        return;
-      }
-      if (request.method !== "POST" || request.url !== "/mcp") {
-        jsonResponse(response, 404, { error: "Not found" });
-        return;
-      }
-      try {
-        await handleMcpRequest(
-          request,
-          response,
-          options.runtime,
-          options.contracts,
-          options.limits,
-        );
-      } catch {
-        if (!response.headersSent) {
-          jsonResponse(response, 500, {
-            error: "Internal MCP transport error",
-          });
-        } else if (!response.writableEnded) {
-          response.end();
-        }
-      }
-    })();
-  });
+    }
+  };
 }
 
 export async function listenOracleMcpServer(

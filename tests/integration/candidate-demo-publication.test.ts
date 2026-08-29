@@ -1,0 +1,271 @@
+import postgres from "postgres";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import {
+  approveCandidateDemoPlan,
+  assertCandidateIpnsMutationReady,
+  beginCandidateDemoExecution,
+  checkpointCandidateIpnsVerified,
+  checkpointCandidateObjectVerified,
+  completeCandidateDemoPlan,
+  markCandidateIpnsUpdateInFlight,
+  recordCandidateDemoPlan,
+  recordCandidateIpnsIntents,
+  recordCandidateResolutionCycle,
+} from "../../src/db/candidate-demo-publication.js";
+import { runMigrations } from "../../src/db/migrations.js";
+import { createCandidateDemoPlan } from "../../src/publication/candidate-demo.js";
+import { syntheticSamplePublicationPlan } from "../helpers/candidate-demo.js";
+
+const adminDatabaseUrl =
+  process.env.ORACLE_TEST_DATABASE_URL ??
+  "postgresql://postgres:elephant@localhost:5433/elephant";
+const schemaName = `candidate_demo_${process.pid}_${Date.now()}`;
+const databaseUrl = `${adminDatabaseUrl}${adminDatabaseUrl.includes("?") ? "&" : "?"}options=-csearch_path%3D${schemaName}`;
+const priorOpen = "QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH";
+const priorQuery = "QmYwAPJzv5CZsnAzt8auVZRnGi9VQUg9nHfS3aB2NFv7fC";
+
+function targetObservations(targetCid: string) {
+  return ["filebase_control", "ipfs_io", "dweb_link"].map(
+    (resolver, index) => ({
+      cacheAgeSeconds: index === 0 ? null : 0,
+      httpStatus: 200,
+      observedAt: `2026-08-30T00:00:0${index}.000Z`,
+      observedCid: targetCid,
+      ordinal: index + 1,
+      outcome: "resolved",
+      resolver,
+      resolverType: index === 0 ? "control_plane" : "public_resolver",
+      responseBytes: index === 0 ? 128 : 0,
+      responseSha256: `${index + 1}`.repeat(64),
+    }),
+  );
+}
+
+beforeAll(async () => {
+  const admin = postgres(adminDatabaseUrl, { max: 1 });
+  try {
+    await admin.unsafe(`CREATE SCHEMA ${schemaName}`);
+  } finally {
+    await admin.end({ timeout: 5 });
+  }
+  expect(await runMigrations(databaseUrl)).toHaveLength(16);
+  expect(await runMigrations(databaseUrl)).toEqual([]);
+});
+
+afterAll(async () => {
+  const admin = postgres(adminDatabaseUrl, { max: 1 });
+  try {
+    await admin.unsafe(`DROP SCHEMA ${schemaName} CASCADE`);
+  } finally {
+    await admin.end({ timeout: 5 });
+  }
+});
+
+describe("candidate demo publication durability", () => {
+  it("keeps sample demo approval/effects/intents separate and orders mutation admission", async () => {
+    const sourcePlan = await syntheticSamplePublicationPlan();
+    const demoPlan = await createCandidateDemoPlan({
+      limits: {
+        maxBudgetUsd: 10,
+        maxConcurrency: 2,
+        maxObjectBytes: 2 * 1024 * 1024,
+        maxObjects: 100,
+        maxRequests: 1_000,
+        maxRetries: 1,
+        maxTotalBytes: 10 * 1024 * 1024,
+        requestTimeoutMs: 2_000,
+        requestUsdPerThousand: 0.01,
+        storageUsdPerGib: 0.1,
+      },
+      preflightEvidenceSha256: "d".repeat(64),
+      preflightObservedAt: "2026-08-30T00:00:00.000Z",
+      sourcePlan,
+      targets: {
+        openData: {
+          bucket: "candidate-prism-open-data-demo",
+          ipnsLabel: "candidate-prism-open-data-demo",
+          ipnsNetworkKey: `k51${"2".repeat(59)}`,
+          priorCid: priorOpen,
+        },
+        queryTable: {
+          bucket: "candidate-prism-query-table-demo",
+          ipnsLabel: "candidate-prism-query-table-demo",
+          ipnsNetworkKey: `k51${"3".repeat(59)}`,
+          priorCid: priorQuery,
+        },
+      },
+    });
+    const recorded = await recordCandidateDemoPlan(
+      databaseUrl,
+      demoPlan,
+      sourcePlan,
+    );
+    expect(recorded).toMatchObject({
+      approvalId: null,
+      state: "awaiting_approval",
+    });
+    await expect(
+      beginCandidateDemoExecution(databaseUrl, {
+        demoPlanId: demoPlan.demoPlanId,
+        demoPlanSha256: demoPlan.demoPlanSha256,
+      }),
+    ).rejects.toThrow("requires exact approval");
+    const approval = await approveCandidateDemoPlan(databaseUrl, {
+      approvedAt: "2026-08-30T00:00:00.000Z",
+      approverReference: "synthetic-controller",
+      demoPlanId: demoPlan.demoPlanId,
+      demoPlanSha256: demoPlan.demoPlanSha256,
+    });
+    expect(approval.state).toBe("approved");
+    expect(
+      await approveCandidateDemoPlan(databaseUrl, {
+        approvedAt: "2026-08-30T00:00:00.000Z",
+        approverReference: "synthetic-controller",
+        demoPlanId: demoPlan.demoPlanId,
+        demoPlanSha256: demoPlan.demoPlanSha256,
+      }),
+    ).toEqual(approval);
+    expect(
+      (
+        await beginCandidateDemoExecution(databaseUrl, {
+          demoPlanId: demoPlan.demoPlanId,
+          demoPlanSha256: demoPlan.demoPlanSha256,
+        })
+      ).state,
+    ).toBe("executing");
+    await expect(
+      assertCandidateIpnsMutationReady(databaseUrl, {
+        demoPlanId: demoPlan.demoPlanId,
+        demoPlanSha256: demoPlan.demoPlanSha256,
+      }),
+    ).rejects.toThrow("durable intents in domain order");
+    for (const artifact of demoPlan.objects) {
+      await checkpointCandidateObjectVerified(databaseUrl, {
+        demoPlanId: demoPlan.demoPlanId,
+        demoPlanSha256: demoPlan.demoPlanSha256,
+        domain: artifact.domain,
+        objectKey: artifact.objectKey,
+        providerCid: artifact.expectedCid,
+        receiptSha256: "a".repeat(64),
+      });
+    }
+    await recordCandidateIpnsIntents(databaseUrl, {
+      demoPlanId: demoPlan.demoPlanId,
+      demoPlanSha256: demoPlan.demoPlanSha256,
+      evidenceSha256: {
+        openData: "b".repeat(64),
+        queryTable: "c".repeat(64),
+      },
+      intendedAt: "2026-08-30T00:00:01.000Z",
+      priorCid: { openData: priorOpen, queryTable: priorQuery },
+    });
+    await expect(
+      assertCandidateIpnsMutationReady(databaseUrl, {
+        demoPlanId: demoPlan.demoPlanId,
+        demoPlanSha256: demoPlan.demoPlanSha256,
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      assertCandidateIpnsMutationReady(
+        databaseUrl,
+        {
+          demoPlanId: demoPlan.demoPlanId,
+          demoPlanSha256: demoPlan.demoPlanSha256,
+        },
+        "query_table",
+      ),
+    ).rejects.toThrow("domain order");
+    await markCandidateIpnsUpdateInFlight(
+      databaseUrl,
+      {
+        demoPlanId: demoPlan.demoPlanId,
+        demoPlanSha256: demoPlan.demoPlanSha256,
+      },
+      "open_data",
+    );
+    await expect(
+      recordCandidateResolutionCycle(databaseUrl, {
+        demoPlanId: demoPlan.demoPlanId,
+        demoPlanSha256: demoPlan.demoPlanSha256,
+        domain: "open_data",
+        observations: targetObservations(demoPlan.targets.openData.targetCid),
+      }),
+    ).resolves.toMatchObject({
+      classification: "target_observed",
+      sequence: 1,
+    });
+    await checkpointCandidateIpnsVerified(databaseUrl, {
+      demoPlanId: demoPlan.demoPlanId,
+      demoPlanSha256: demoPlan.demoPlanSha256,
+      domain: "open_data",
+    });
+    await expect(
+      assertCandidateIpnsMutationReady(
+        databaseUrl,
+        {
+          demoPlanId: demoPlan.demoPlanId,
+          demoPlanSha256: demoPlan.demoPlanSha256,
+        },
+        "query_table",
+      ),
+    ).resolves.toBeUndefined();
+    await markCandidateIpnsUpdateInFlight(
+      databaseUrl,
+      {
+        demoPlanId: demoPlan.demoPlanId,
+        demoPlanSha256: demoPlan.demoPlanSha256,
+      },
+      "query_table",
+    );
+    await expect(
+      recordCandidateResolutionCycle(databaseUrl, {
+        demoPlanId: demoPlan.demoPlanId,
+        demoPlanSha256: demoPlan.demoPlanSha256,
+        domain: "query_table",
+        observations: targetObservations(demoPlan.targets.queryTable.targetCid),
+      }),
+    ).resolves.toMatchObject({
+      classification: "target_observed",
+      sequence: 1,
+    });
+    await checkpointCandidateIpnsVerified(databaseUrl, {
+      demoPlanId: demoPlan.demoPlanId,
+      demoPlanSha256: demoPlan.demoPlanSha256,
+      domain: "query_table",
+    });
+    expect(
+      (
+        await completeCandidateDemoPlan(databaseUrl, {
+          demoPlanId: demoPlan.demoPlanId,
+          demoPlanSha256: demoPlan.demoPlanSha256,
+        })
+      ).state,
+    ).toBe("completed");
+    const sql = postgres(databaseUrl, { max: 1 });
+    try {
+      const counts = await sql<
+        {
+          approvals: number;
+          cycles: number;
+          intents: number;
+          official_approvals: number;
+        }[]
+      >`
+        SELECT
+          (SELECT count(*)::int FROM oracle_candidate_demo_approvals) AS approvals,
+          (SELECT count(*)::int FROM oracle_candidate_demo_resolution_cycles) AS cycles,
+          (SELECT count(*)::int FROM oracle_candidate_demo_ipns_intents) AS intents,
+          (SELECT count(*)::int FROM oracle_publication_approvals) AS official_approvals
+      `;
+      expect(counts[0]).toEqual({
+        approvals: 1,
+        cycles: 2,
+        intents: 2,
+        official_approvals: 0,
+      });
+    } finally {
+      await sql.end({ timeout: 5 });
+    }
+  });
+});

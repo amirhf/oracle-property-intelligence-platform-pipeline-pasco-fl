@@ -154,10 +154,14 @@ export interface PublicationTargetConfiguration {
 }
 
 export interface PublicationBuildOptions {
+  /** Candidate-demo-only deterministic subset of an existing bounded sample. */
+  candidateDemoPilot?: true;
   dataDir: string;
   databaseUrl: string;
   exportMode: "authoritative" | "bounded";
   generatedAt?: string;
+  /** Candidate/test builds may leave the official dry-run journal untouched. */
+  persistDryRun?: boolean;
   runId: string;
   targets?: PublicationTargetConfiguration;
   /** Test-only failure injection; production uses the durable repository. */
@@ -168,6 +172,7 @@ interface ResolvedExportScope {
   activeProperties: number;
   authoritativeBaseSnapshotId: string | null;
   authoritativeHeadSnapshotId: string | null;
+  boundedExactFolios: string[] | null;
   coverage: SnapshotCoverage | null;
   inactiveProperties: number;
   materializationId: string | null;
@@ -810,6 +815,7 @@ async function resolveExportScope(
       activeProperties: materialization.active_count,
       authoritativeBaseSnapshotId: head.authoritative_base_snapshot_id,
       authoritativeHeadSnapshotId: run.snapshot_id,
+      boundedExactFolios: null,
       coverage,
       inactiveProperties: materialization.inactive_count,
       materializationId: materialization.materialization_id,
@@ -839,14 +845,35 @@ async function resolveExportScope(
     WHERE last_seen_run_id = ${run.run_id}
     ORDER BY exact_folio
   `;
-  const selectionHash = selectedRecordSha256(
-    membership.map((row) => row.exact_folio),
-  );
   if (membership.length !== run.selection_size) {
     throw new Error(
       `Bounded publication membership contains ${membership.length} records, expected ${run.selection_size}`,
     );
   }
+  const selectedMembership = options.candidateDemoPilot
+    ? membership.slice(0, 25)
+    : membership;
+  if (
+    options.candidateDemoPilot &&
+    (run.coverage_mode !== "sample" ||
+      run.snapshot_id !== null ||
+      selectedMembership.length !== 25)
+  ) {
+    throw new Error(
+      "Candidate demo pilot requires 25 records from a legacy bounded sample",
+    );
+  }
+  const selectedRun = options.candidateDemoPilot
+    ? {
+        ...run,
+        sample_algorithm: "candidate-demo-stable-prefix-v1",
+        sample_seed: "candidate-demo-25-v1",
+        selection_size: 25,
+      }
+    : run;
+  const selectionHash = selectedRecordSha256(
+    selectedMembership.map((row) => row.exact_folio),
+  );
   let snapshot: SnapshotRow | null = null;
   let coverage: SnapshotCoverage | null = null;
   if (run.snapshot_id !== null) {
@@ -875,21 +902,25 @@ async function resolveExportScope(
       "pasco",
       run.coverage_mode,
       run.run_id,
-      run.sample_algorithm,
-      run.sample_seed,
-      String(run.selection_size),
+      selectedRun.sample_algorithm,
+      selectedRun.sample_seed,
+      String(selectedRun.selection_size),
       selectionHash,
     ]);
   return {
-    activeProperties: membership.filter((row) => row.is_active).length,
+    activeProperties: selectedMembership.filter((row) => row.is_active).length,
     authoritativeBaseSnapshotId: null,
     authoritativeHeadSnapshotId: null,
+    boundedExactFolios: options.candidateDemoPilot
+      ? selectedMembership.map((row) => row.exact_folio)
+      : null,
     coverage,
-    inactiveProperties: membership.filter((row) => !row.is_active).length,
+    inactiveProperties: selectedMembership.filter((row) => !row.is_active)
+      .length,
     materializationId: null,
     materializationSha256: null,
     predecessorChainSnapshotIds: [],
-    run,
+    run: selectedRun,
     selectedRecordSha256: selectionHash,
     scopeId,
     snapshot,
@@ -1172,6 +1203,10 @@ export async function buildPublicationDryRun(
           (
             ${options.exportMode === "bounded"}
             AND p.last_seen_run_id = ${run.run_id}
+            AND (
+              ${scope.boundedExactFolios === null}
+              OR p.exact_folio = ANY(${scope.boundedExactFolios ?? []})
+            )
           ) OR (
             ${options.exportMode === "authoritative"}
             AND p.lifecycle_scope_id = ${scope.scopeId}
@@ -2101,7 +2136,8 @@ export async function buildPublicationDryRun(
       queryTableSha256,
       schemaSha256,
     };
-    await sql`
+    if (options.persistDryRun !== false)
+      await sql`
       INSERT INTO oracle_publication_dry_runs (
         dry_run_id, run_id, county, status,
         open_data_manifest_sha256, query_table_sha256, plan_sha256,

@@ -37,3 +37,18 @@ HTTP transport remains unusable until the exact IPNS identities, root CIDs,
 manifest CID/hash and immutable plan CID/file hash from one published plan are
 provided. Hosting additionally requires the intended public runtime/project
 identity. None of those inputs authorizes publication or mutation.
+
+## Candidate preview deployment
+
+`api/index.ts` adapts the same Node request handler to a Vercel Function.
+`vercel.json` routes only `/`, `/health`, `/mcp` and the three explorer API
+paths to that handler. A hosted deployment uses `NODE_ENV=production` and must
+set `ORACLE_MCP_PROVIDER=public-ipns`; local-artifact and fixture fallbacks stay
+rejected. The preview requires the complete hash-bound `MCP_PUBLIC_*` and IPNS
+configuration listed in `.env.example`. Environment changes require a new
+preview deployment. No Vercel project or hosted runtime is selected by this
+repository configuration.
+
+Temporary candidate-owned Filebase demonstration of protocol compatibility.
+The buckets and IPNS identities are candidate-controlled and are not represented
+as Elephant-owned, owner-approved, or the final canonical assessment publication.

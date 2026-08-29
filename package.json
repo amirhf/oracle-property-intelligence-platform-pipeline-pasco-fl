@@ -10,9 +10,9 @@
   "scripts": {
     "dev": "node --watch --import tsx services/app.ts",
     "start": "node --import tsx services/app.ts",
-    "format": "prettier --write \"services/**/*.ts\" \"src/**/*.ts\" \"scripts/**/*.ts\" \"tests/**/*.ts\" \"docs/**/*.md\" \"config/**/*.json\" docker-compose.yml eslint.config.js package.json tsconfig.json",
-    "format:check": "prettier --check \"services/**/*.ts\" \"src/**/*.ts\" \"scripts/**/*.ts\" \"tests/**/*.ts\" \"docs/**/*.md\" \"config/**/*.json\" docker-compose.yml eslint.config.js package.json tsconfig.json",
-    "lint": "eslint --max-warnings 0 \"services/**/*.ts\" \"src/**/*.ts\" \"scripts/**/*.ts\" \"tests/**/*.ts\"",
+    "format": "prettier --write \"api/**/*.ts\" \"services/**/*.ts\" \"src/**/*.ts\" \"scripts/**/*.ts\" \"tests/**/*.ts\" \"docs/**/*.md\" \"config/**/*.json\" docker-compose.yml eslint.config.js package.json tsconfig.json vercel.json",
+    "format:check": "prettier --check \"api/**/*.ts\" \"services/**/*.ts\" \"src/**/*.ts\" \"scripts/**/*.ts\" \"tests/**/*.ts\" \"docs/**/*.md\" \"config/**/*.json\" docker-compose.yml eslint.config.js package.json tsconfig.json vercel.json",
+    "lint": "eslint --max-warnings 0 \"api/**/*.ts\" \"services/**/*.ts\" \"src/**/*.ts\" \"scripts/**/*.ts\" \"tests/**/*.ts\"",
     "mcp:start": "node --import tsx services/mcp.ts",
     "mcp:check": "node --import tsx scripts/check-mcp.ts",
     "typecheck": "tsc --noEmit",
@@ -31,9 +31,14 @@
     "scale:check": "node --import tsx scripts/check-scale.ts",
     "publication:build": "node --import tsx scripts/build-publication.ts",
     "publication:check": "node --import tsx scripts/check-publication.ts",
-    "publication:determinism": "node --import tsx scripts/check-publication-determinism.ts"
+    "publication:determinism": "node --import tsx scripts/check-publication-determinism.ts",
+    "candidate-demo:preflight": "node --import tsx scripts/preflight-candidate-demo.ts",
+    "candidate-demo:plan": "node --import tsx scripts/build-candidate-demo-plan.ts",
+    "candidate-demo:execute": "node --import tsx scripts/execute-candidate-demo.ts",
+    "candidate-demo:recover": "node --import tsx scripts/execute-candidate-demo.ts --recover"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1054.0",
     "@duckdb/node-api": "1.5.5-r.4",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@restatedev/restate-sdk": "1.16.9",

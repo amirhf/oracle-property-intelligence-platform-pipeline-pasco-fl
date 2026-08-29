@@ -65,7 +65,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(13);
+  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(16);
   expect(await runMigrations(schemaDatabaseUrl)).toEqual([]);
   snapshotA = await createSyntheticSnapshot(dataDir, "a");
   snapshotB = await createSyntheticSnapshot(dataDir, "b");
