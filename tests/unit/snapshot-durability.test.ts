@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { DurableInputError } from "../../src/lib/durability-errors.js";
 import { pascoLoaderAdvisoryLockKey } from "../../src/db/loader-durability.js";
+import { planProjectionFactChanges } from "../../src/db/projection-repository.js";
 import {
   resolveBoundDataPath,
   verifyPreparedInput,
@@ -40,6 +41,65 @@ afterEach(async () => {
 });
 
 describe("source snapshot and prepared-input durability", () => {
+  it("applies replace-set, positive-upsert, and explicit-tombstone fact semantics", () => {
+    const propertyId = "property_00000000000000000000000000000000";
+    const result = planProjectionFactChanges({
+      facts: [
+        {
+          collectionSemantics: "replace_set",
+          evidenceRefs: ["evidence_new"],
+          factType: "ownership",
+          naturalKey: "owner:new",
+          payload: { state: "available" },
+          sourceRecordHash: `sha256:${"a".repeat(64)}`,
+        },
+        {
+          collectionSemantics: "explicit_tombstone",
+          evidenceRefs: ["evidence_tombstone"],
+          factType: "availability",
+          naturalKey: "permits",
+          payload: { state: "unavailable" },
+          sourceRecordHash: `sha256:${"b".repeat(64)}`,
+        },
+      ],
+      priorFacts: [
+        {
+          fact_type: "ownership",
+          fact_version_id: "factversion_old_owner",
+          natural_key: "owner:old",
+          property_id: propertyId,
+        },
+        {
+          fact_type: "coordinate",
+          fact_version_id: "factversion_coordinate",
+          natural_key: "pasco_gis:parcel_centroid",
+          property_id: propertyId,
+        },
+        {
+          fact_type: "availability",
+          fact_version_id: "factversion_permits",
+          natural_key: "permits",
+          property_id: propertyId,
+        },
+      ],
+      propertyId,
+      replaceSetTypes: ["building", "ownership"],
+    });
+    expect(
+      result.nextFacts.map((fact) => `${fact.fact_type}:${fact.natural_key}`),
+    ).toEqual(["coordinate:pasco_gis:parcel_centroid", "ownership:owner:new"]);
+    expect(
+      result.changes.map((change) => ({
+        eventType: change.eventType,
+        key: `${change.factType}:${change.naturalKey}`,
+      })),
+    ).toEqual([
+      { eventType: "removed", key: "availability:permits" },
+      { eventType: "new", key: "ownership:owner:new" },
+      { eventType: "removed", key: "ownership:owner:old" },
+    ]);
+  });
+
   it("binds exact bytes and keeps Snapshot A distinct from Snapshot B", async () => {
     const dataDir = await temporaryDataDir();
     const snapshotA = await createSyntheticSnapshot(dataDir, "a");
@@ -108,6 +168,34 @@ describe("source snapshot and prepared-input durability", () => {
       first.reference.preparedInputId,
     );
     expect(second.snapshot.createdAt).toBe(first.snapshot.createdAt);
+  });
+
+  it("atomically finalizes identical concurrent snapshot preparation", async () => {
+    const dataDir = await temporaryDataDir();
+    const options = {
+      coverage: "sample" as const,
+      createdAt: "2026-08-29T00:00:01.000Z",
+      folios: Array.from(
+        { length: 25 },
+        (_, index) => `CONCURRENT-${(index + 1).toString().padStart(2, "0")}`,
+      ),
+      label: "concurrent-identical-snapshot",
+    };
+    const [first, second] = await Promise.all([
+      createSyntheticLifecycleSnapshot(dataDir, options),
+      createSyntheticLifecycleSnapshot(dataDir, options),
+    ]);
+    expect(second.snapshot).toEqual(first.snapshot);
+    expect(second.reference).toEqual(first.reference);
+    const finalizedDirectory = path.join(
+      dataDir,
+      path.dirname(first.reference.manifest.relativePath),
+    );
+    expect(
+      (await readdir(finalizedDirectory)).filter((name) =>
+        name.endsWith(".part"),
+      ),
+    ).toEqual([]);
   });
 
   it("rejects modified, missing, mismatched, and path-escaping inputs", async () => {
@@ -232,6 +320,6 @@ describe("strict durable workflow requests", () => {
   });
 
   it("uses a stable, two-part Pasco advisory-lock key", () => {
-    expect(pascoLoaderAdvisoryLockKey()).toEqual([-1827269144, -1784306027]);
+    expect(pascoLoaderAdvisoryLockKey()).toEqual([-1112522388, -1784306027]);
   });
 });

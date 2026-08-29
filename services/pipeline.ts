@@ -158,7 +158,8 @@ export function createPipelineServices(dependencies: PipelineDependencies) {
             runId: request.request.runId,
             snapshot: verified.snapshot,
           };
-          return verified.reference.kind === "pilot"
+          return verified.snapshot.manifestVersion === "1.2.0" ||
+            verified.reference.kind === "pilot"
             ? loadPreparedPilot(
                 dependencies.databaseUrl,
                 request.request,

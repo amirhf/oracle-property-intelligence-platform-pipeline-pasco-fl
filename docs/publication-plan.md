@@ -1,6 +1,9 @@
 # Pasco publication plan
 
-This document specifies publication control. It does not prove that buckets, credentials, CIDs, IPNS network keys or published artifacts exist.
+This document specifies publication control. Local deterministic graph and
+object CIDs have been computed and validated. Provider-returned or remotely
+verified CIDs and remote publication-effect records do not yet exist. Buckets,
+credentials, IPNS network keys and published artifacts also remain unproven.
 
 ## Exactly two domains
 
@@ -62,7 +65,18 @@ Dry run performs export and validation without S3 PUT, Filebase object creation,
 - Publication plan hash.
 - `publishedCid: null` and `ipnsMutationPerformed: false`.
 
-A locally predicted CID is not described as final unless deterministic CAR/UnixFS construction and Filebase preservation of that exact CID are independently proven.
+The local publication graph uses the pinned `ipfs-only-hash@4.0.0` / `ipfs-unixfs-importer@7.0.3` CIDv0 UnixFS-file profile. A plan is not approvable until every property, shard, root, manifest and Parquet object's bytes, SHA-256 and expected CID are fixed and the complete graph traverses successfully.
+
+The reader-facing graph is fixed as:
+
+```text
+open-data IPNS -> index.json CID -> shard CID -> property JSON CID
+query-table IPNS -> Parquet CID -> property_cid -> same property JSON CID
+```
+
+The expected CIDs are deterministic local artifact identities. Remote execution must still reject a missing or unequal Filebase-returned CID before any IPNS mutation. No real Filebase executor is selected by the local runtime.
+
+Publication plans use schema version `1.1.0`. The plan binds the exact sealed projection materialization (or isolated historical sample run), graph edges and roots, CID and Parquet profiles, complete object inventory and both remote target identities. Sample plans create no authoritative head and are never approvable for authoritative IPNS publication.
 
 ## Approval and invalidation
 
@@ -74,6 +88,8 @@ Amir is the execution approver only after:
 4. The exact plan is reviewed.
 
 Approval binds to artifact manifest hash, plan hash, schema hash, buckets, labels, object keys, counts, representation mode and source/run watermark. Any change invalidates approval and requires a new dry run and review. Credentials alone never authorize a live action.
+
+Before any future IPNS mutation, `Publish/pasco` must persist immutable intents for both `open_data` and `query_table` in one transaction. Each intent retains the true prior CID, approved target CID and agreeing provider/public resolution evidence. Timeout, split resolution or an unexpected third CID is recorded durably; a third CID is a hard conflict and is never overwritten automatically. The per-record MCP `publicationStatus` remains data-release eligibility and does not approve a plan or authorize a remote effect.
 
 ## Approved execution and verification
 
@@ -93,3 +109,52 @@ After approval:
 10. Record the immutable prior CID and the new run/publication relationship.
 
 Filebase credentials remain **PENDING**. No live publication is authorized by this baseline.
+
+## Assessment trust boundary and executor gate
+
+This checkpoint proves trusted-service application durability only. PostgreSQL
+is private to the Oracle service/operator, there is no arbitrary SQL endpoint,
+and the assessment does not claim resistance to a malicious holder of Oracle
+database credentials. Loader, approval, execution admission and future
+irreversible-effect admission share one short transaction-scoped Pasco
+projection-head fence. Plans and approvals are immutable, approvals retain the
+exact fenced head/snapshot/authoritative-base/materialization/revision, resolver
+observations are reconstructible from bounded immutable evidence, and builders
+clean only their private contender directories. The production remote executor
+remains disabled.
+
+Recovery observations use receipt schema `1.0.0`, a strict closed object that
+stores only outcome, bounded HTTP status/byte/latency values, optional SHA-256
+digests for provider request identity and response bytes, and an enumerated
+error code. Raw request IDs, headers, URLs, bodies, credentials, cookies,
+tokens, arbitrary strings and arbitrary keys are not accepted by either the
+application or PostgreSQL. The total outcome matrix is NULL-safe at both
+boundaries: `resolved` requires HTTP 200–299 and no error; `unavailable`
+requires no status and `provider_unavailable`; `http_error` requires HTTP
+400–599 and `http_error` or `rate_limited`; `timeout` and `transport_error`
+require no status and their matching error code. Migration 013 enforces this
+with an exhaustive PostgreSQL `CASE` and `IS [NOT] DISTINCT FROM`, so JSON null
+cannot become SQL `UNKNOWN`. Resolution-cycle IDs are derived from the exact
+plan, intent, domain, attempt and sequence. Exact derived-cycle replay compares
+all canonical observation and receipt bytes; changed evidence conflicts, and a
+unique `(intent_id, evidence_sha256)` constraint prevents the same evidence
+from being relabeled as another cycle. The two initial domain cycles are
+persisted atomically.
+
+Before a real executor can be enabled, a separate reviewed checkpoint must add
+and verify all of the following:
+
+- Separate migration-owner and runtime database roles.
+- Runtime-table DML revocation and DB-owned publication-transition procedures.
+- Hostile direct-SQL tests against the restricted runtime role.
+- Authenticated operator approval identity.
+- Migration checksums rooted in the committed production baseline.
+- Real Filebase-returned CID receipts matching every locally expected CID.
+- Approved byte/request/cost, rate, retry and concurrency ceilings.
+- Real IPNS mutation, ambiguous-result recovery and public-resolution evidence.
+
+There is no production database or historical production migration 009. The
+current local database is development evidence only. A production deployment
+must begin from a fresh committed migration sequence; local additive 012→013
+convergence does not prove compatibility with an unknown historical production
+database.

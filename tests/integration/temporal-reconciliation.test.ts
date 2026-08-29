@@ -11,7 +11,10 @@ import {
 } from "../../src/db/pilot-repository.js";
 import { runMigrations } from "../../src/db/migrations.js";
 import type { PreparedPilot } from "../../src/domain/types.js";
-import { DurableConflictError } from "../../src/lib/durability-errors.js";
+import {
+  DurableConflictError,
+  DurableInputError,
+} from "../../src/lib/durability-errors.js";
 import { verifyPreparedInput } from "../../src/snapshot/model.js";
 import {
   countyIngestRequestSha256,
@@ -69,7 +72,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(8);
+  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(13);
   expect(await runMigrations(schemaDatabaseUrl)).toEqual([]);
 }, 30_000);
 
@@ -89,6 +92,7 @@ describe("temporal property current-state reconciliation", () => {
       coverage: "authoritative",
       folios: range(1, 25),
       label: "authority-a",
+      observedAt: "2026-08-29T00:00:00.000Z",
     });
     expect(snapshotA.snapshot.coverage.mode).toBe("authoritative_complete");
     await recordRunStarted(schemaDatabaseUrl, snapshotA.request);
@@ -108,6 +112,7 @@ describe("temporal property current-state reconciliation", () => {
       coverage: "authoritative",
       folios: [...range(1, 24), "TEMP-26"],
       label: "authority-b",
+      observedAt: "2026-08-29T01:00:00.000Z",
       previousAuthoritativeSnapshotId: snapshotA.snapshot.snapshotId,
     });
     expect(snapshotB.snapshot.coverage.scopeId).toBe(
@@ -136,6 +141,7 @@ describe("temporal property current-state reconciliation", () => {
       coverage: "authoritative",
       folios: [...range(1, 23), "TEMP-25", "TEMP-26"],
       label: "authority-c",
+      observedAt: "2026-08-29T02:00:00.000Z",
       previousAuthoritativeSnapshotId: snapshotB.snapshot.snapshotId,
     });
     await recordRunStarted(schemaDatabaseUrl, snapshotC.request);
@@ -147,7 +153,7 @@ describe("temporal property current-state reconciliation", () => {
       inactivatedProperties: 1,
       newProperties: 0,
       reactivatedProperties: 1,
-      unchangedProperties: 25,
+      unchangedProperties: 24,
     });
 
     const failedLoad = await createSyntheticLifecycleSnapshot(dataDir, {
@@ -155,6 +161,7 @@ describe("temporal property current-state reconciliation", () => {
       coverage: "authoritative",
       folios: [...range(1, 22), "TEMP-25", "TEMP-26", "TEMP-37"],
       label: "authority-failed-transaction",
+      observedAt: "2026-08-29T03:00:00.000Z",
       previousAuthoritativeSnapshotId: snapshotC.snapshot.snapshotId,
     });
     await recordRunStarted(schemaDatabaseUrl, failedLoad.request);
@@ -165,6 +172,12 @@ describe("temporal property current-state reconciliation", () => {
         last.coordinates.latitude = 999;
       }),
     ).rejects.toThrow();
+    await expect(
+      load(failedLoad, (prepared) => {
+        prepared.properties[0]!.propertyId =
+          "property_00000000000000000000000000000000";
+      }),
+    ).rejects.toThrow("Projection property identity is malformed");
     const rollbackSql = postgres(schemaDatabaseUrl, { max: 1 });
     try {
       const rollback = await rollbackSql<
@@ -176,14 +189,20 @@ describe("temporal property current-state reconciliation", () => {
         }[]
       >`
         SELECT
-          (SELECT current_snapshot_id FROM oracle_authoritative_scope_heads
+          (SELECT current_snapshot_id FROM oracle_projection_heads
            WHERE scope_id = ${snapshotC.snapshot.coverage.scopeId}) AS current_snapshot_id,
-          (SELECT count(*)::int FROM oracle_property_lifecycle_events
+          (SELECT count(*)::int FROM oracle_projection_property_changes
            WHERE snapshot_id = ${failedLoad.snapshot.snapshotId}) AS failed_events,
-          (SELECT count(*)::int FROM oracle_properties
-           WHERE property_id = ${failedLoad.prepared.properties.at(-1)!.propertyId}) AS failed_property,
-          (SELECT is_active FROM oracle_properties
-           WHERE exact_folio = 'TEMP-23') AS preserved_active
+          (SELECT count(*)::int FROM oracle_property_versions
+           WHERE source_snapshot_id = ${failedLoad.snapshot.snapshotId}) AS failed_property,
+          (SELECT membership.is_active
+           FROM oracle_projection_materialized_properties membership
+           JOIN oracle_projection_materializations materialization
+             USING (materialization_id)
+           JOIN oracle_property_versions version
+             ON version.version_id = membership.property_version_id
+           WHERE materialization.snapshot_id = ${snapshotC.snapshot.snapshotId}
+             AND version.parcel_identifier = 'TEMP-23') AS preserved_active
       `;
       expect(rollback[0]).toEqual({
         current_snapshot_id: snapshotC.snapshot.snapshotId,
@@ -200,6 +219,7 @@ describe("temporal property current-state reconciliation", () => {
       coverage: "incomplete",
       folios: [...range(1, 20), ...range(27, 31)],
       label: "incomplete-authority",
+      observedAt: "2026-08-29T04:00:00.000Z",
       previousAuthoritativeSnapshotId: snapshotC.snapshot.snapshotId,
     });
     expect(incomplete.snapshot.coverage.mode).toBe("partial");
@@ -219,7 +239,7 @@ describe("temporal property current-state reconciliation", () => {
     const sample = await createSyntheticLifecycleSnapshot(dataDir, {
       changedFolios: ["TEMP-02"],
       coverage: "sample",
-      folios: [...range(1, 20), ...range(32, 36)],
+      folios: [...range(1, 19), "TEMP-24", ...range(32, 36)],
       label: "bounded-sample",
     });
     expect(sample.snapshot.coverage.mode).toBe("sample");
@@ -233,15 +253,164 @@ describe("temporal property current-state reconciliation", () => {
       changedProperties: 0,
       inactiveProperties: 0,
       inactivatedProperties: 0,
-      newProperties: 5,
+      newProperties: 25,
       reactivatedProperties: 0,
-      unchangedProperties: 20,
+      unchangedProperties: 0,
     });
+    const sampleGuardSql = postgres(schemaDatabaseUrl, { max: 1 });
+    try {
+      const guard = await sampleGuardSql<
+        {
+          authoritative_inactive: boolean;
+          current_snapshot_id: string;
+          isolated_sample_rows: number;
+        }[]
+      >`
+        SELECT
+          (SELECT current_snapshot_id FROM oracle_projection_heads
+           WHERE scope_id = ${snapshotA.snapshot.coverage.scopeId}) AS current_snapshot_id,
+          (SELECT count(*)::int FROM oracle_sample_property_versions
+           WHERE snapshot_id = ${sample.snapshot.snapshotId}
+             AND parcel_identifier = 'TEMP-24') AS isolated_sample_rows,
+          (SELECT NOT membership.is_active
+           FROM oracle_projection_materialized_properties membership
+           JOIN oracle_projection_materializations materialization
+             USING (materialization_id)
+           JOIN oracle_property_versions version
+             ON version.version_id = membership.property_version_id
+           WHERE materialization.snapshot_id = ${incomplete.snapshot.snapshotId}
+             AND version.parcel_identifier = 'TEMP-24') AS authoritative_inactive
+      `;
+      expect(guard[0]).toEqual({
+        authoritative_inactive: true,
+        current_snapshot_id: incomplete.snapshot.snapshotId,
+        isolated_sample_rows: 1,
+      });
+    } finally {
+      await sampleGuardSql.end({ timeout: 5 });
+    }
+
+    const partialReactivation = await createSyntheticLifecycleSnapshot(
+      dataDir,
+      {
+        coordinateMissingFolios: ["TEMP-01"],
+        coverage: "incomplete",
+        folios: [...range(1, 19), "TEMP-24", ...range(27, 31)],
+        label: "partial-positive-reactivation",
+        observedAt: "2026-08-29T05:00:00.000Z",
+        ownerlessFolios: ["TEMP-01"],
+        previousAuthoritativeSnapshotId: snapshotC.snapshot.snapshotId,
+        previousProjectionSnapshotId: incomplete.snapshot.snapshotId,
+      },
+    );
+    await recordRunStarted(schemaDatabaseUrl, partialReactivation.request);
+    expect(await load(partialReactivation)).toMatchObject({
+      activeProperties: 31,
+      changedProperties: 1,
+      inactiveProperties: 0,
+      inactivatedProperties: 0,
+      newProperties: 0,
+      reactivatedProperties: 1,
+      unchangedProperties: 23,
+    });
+    const factSql = postgres(schemaDatabaseUrl, { max: 1 });
+    try {
+      const facts = await factSql<
+        {
+          coordinate_facts: number;
+          owner_facts: number;
+          removed_owner_events: number;
+        }[]
+      >`
+        SELECT
+          count(*) FILTER (WHERE fact.fact_type = 'ownership')::int AS owner_facts,
+          count(*) FILTER (WHERE fact.fact_type = 'coordinate')::int AS coordinate_facts,
+          (SELECT count(*)::int FROM oracle_projection_fact_changes change
+           JOIN oracle_property_versions version
+             ON version.property_id = change.property_id
+           WHERE change.snapshot_id = ${partialReactivation.snapshot.snapshotId}
+             AND change.event_type = 'removed'
+             AND change.fact_type = 'ownership'
+             AND version.parcel_identifier = 'TEMP-01') AS removed_owner_events
+        FROM oracle_projection_materialized_facts fact
+        JOIN oracle_projection_materializations materialization
+          USING (materialization_id)
+        JOIN oracle_property_versions version
+          ON version.property_id = fact.property_id
+        WHERE materialization.snapshot_id = ${partialReactivation.snapshot.snapshotId}
+          AND version.parcel_identifier = 'TEMP-01'
+      `;
+      expect(facts[0]).toEqual({
+        coordinate_facts: 1,
+        owner_facts: 0,
+        removed_owner_events: 1,
+      });
+    } finally {
+      await factSql.end({ timeout: 5 });
+    }
+
+    for (const invalid of [
+      await createSyntheticLifecycleSnapshot(dataDir, {
+        coverage: "incomplete",
+        folios: [...range(1, 19), "TEMP-24", ...range(27, 31)],
+        label: "partial-missing-predecessor",
+        observedAt: "2026-08-29T05:10:00.000Z",
+        previousAuthoritativeSnapshotId: snapshotC.snapshot.snapshotId,
+        previousProjectionSnapshotId: null,
+      }),
+      await createSyntheticLifecycleSnapshot(dataDir, {
+        coverage: "incomplete",
+        folios: [...range(1, 19), "TEMP-24", ...range(27, 31)],
+        label: "partial-stale-watermark",
+        observedAt: "2026-08-29T04:30:00.000Z",
+        previousAuthoritativeSnapshotId: snapshotC.snapshot.snapshotId,
+        previousProjectionSnapshotId: partialReactivation.snapshot.snapshotId,
+      }),
+      await createSyntheticLifecycleSnapshot(dataDir, {
+        coverage: "incomplete",
+        folios: [...range(1, 19), "TEMP-24", ...range(27, 31)],
+        label: "partial-same-time-different-bytes",
+        observedAt: "2026-08-29T05:00:00.000Z",
+        previousAuthoritativeSnapshotId: snapshotC.snapshot.snapshotId,
+        previousProjectionSnapshotId: partialReactivation.snapshot.snapshotId,
+      }),
+    ]) {
+      await recordRunStarted(schemaDatabaseUrl, invalid.request);
+      await expect(load(invalid)).rejects.toBeInstanceOf(DurableConflictError);
+    }
+
+    const wrongAuthority = await createSyntheticLifecycleSnapshot(dataDir, {
+      authoritySourceSystem: "pasco_gis",
+      coverage: "incomplete",
+      folios: [...range(1, 19), "TEMP-24", ...range(27, 31)],
+      label: "partial-wrong-authority",
+      observedAt: "2026-08-29T05:30:00.000Z",
+      previousAuthoritativeSnapshotId: snapshotC.snapshot.snapshotId,
+      previousProjectionSnapshotId: partialReactivation.snapshot.snapshotId,
+    });
+    await recordRunStarted(schemaDatabaseUrl, wrongAuthority.request);
+    await expect(load(wrongAuthority)).rejects.toBeInstanceOf(
+      DurableInputError,
+    );
+
+    const staleAuthoritative = await createSyntheticLifecycleSnapshot(dataDir, {
+      coverage: "authoritative",
+      folios: [...range(1, 23), "TEMP-25", "TEMP-26"],
+      label: "stale-authority-after-partial",
+      observedAt: "2026-08-29T06:00:00.000Z",
+      previousAuthoritativeSnapshotId: snapshotC.snapshot.snapshotId,
+      previousProjectionSnapshotId: snapshotC.snapshot.snapshotId,
+    });
+    await recordRunStarted(schemaDatabaseUrl, staleAuthoritative.request);
+    await expect(load(staleAuthoritative)).rejects.toBeInstanceOf(
+      DurableConflictError,
+    );
 
     const incompatibleScope = await createSyntheticLifecycleSnapshot(dataDir, {
       coverage: "authoritative",
       folios: [...range(1, 23), "TEMP-25", "TEMP-26"],
       label: "different-scope",
+      observedAt: "2026-08-29T05:00:00.000Z",
       membershipRule: "different authoritative parcel membership v1",
       previousAuthoritativeSnapshotId: snapshotC.snapshot.snapshotId,
     });
@@ -264,24 +433,27 @@ describe("temporal property current-state reconciliation", () => {
         }[]
       >`
         SELECT
-          (SELECT count(*)::int FROM oracle_properties WHERE is_active) AS active,
-          (SELECT count(*)::int FROM oracle_properties WHERE NOT is_active) AS inactive,
+          (SELECT active_count::int FROM oracle_projection_materializations
+           WHERE snapshot_id = ${incomplete.snapshot.snapshotId}) AS active,
+          (SELECT inactive_count::int FROM oracle_projection_materializations
+           WHERE snapshot_id = ${incomplete.snapshot.snapshotId}) AS inactive,
           count(*) FILTER (WHERE event_type = 'new')::int AS new_events,
           count(*) FILTER (WHERE event_type = 'changed')::int AS changed_events,
           count(*) FILTER (WHERE event_type = 'unchanged')::int AS unchanged_events,
           count(*) FILTER (WHERE event_type = 'inactivated')::int AS inactivated_events,
           count(*) FILTER (WHERE event_type = 'reactivated')::int AS reactivated_events
-        FROM oracle_property_lifecycle_events
-        WHERE scope_id = ${snapshotA.snapshot.coverage.scopeId}
+        FROM oracle_projection_property_changes changes
+        JOIN oracle_projection_snapshots snapshots USING (snapshot_id)
+        WHERE snapshots.scope_id = ${snapshotA.snapshot.coverage.scopeId}
       `;
       expect(lifecycle[0]).toEqual({
-        active: 35,
-        changed_events: 1,
+        active: 30,
+        changed_events: 2,
         inactive: 1,
         inactivated_events: 2,
         new_events: 31,
-        reactivated_events: 1,
-        unchanged_events: 67,
+        reactivated_events: 2,
+        unchanged_events: 90,
       });
       const bEffects = await sql<{ effects: number }[]>`
         SELECT count(*)::int AS effects FROM oracle_loader_effects
@@ -291,47 +463,87 @@ describe("temporal property current-state reconciliation", () => {
       const boundaries = await sql<
         {
           exact_folio: string;
-          lifecycle_status: "active" | "inactive";
-          valid_from_snapshot_id: string;
-          valid_to_snapshot_id: string | null;
+          is_active: boolean;
+          last_event_snapshot_id: string;
         }[]
       >`
-        SELECT property.exact_folio, state.lifecycle_status,
-               state.valid_from_snapshot_id, state.valid_to_snapshot_id
-        FROM oracle_property_scope_state state
-        JOIN oracle_properties property USING (property_id)
-        WHERE state.scope_id = ${snapshotA.snapshot.coverage.scopeId}
-          AND property.exact_folio = ANY(${["TEMP-02", "TEMP-24", "TEMP-25"]})
-        ORDER BY property.exact_folio
+        SELECT version.parcel_identifier AS exact_folio,
+               membership.is_active,
+               (
+                 SELECT change.snapshot_id
+                 FROM oracle_projection_property_changes change
+                 WHERE change.property_id = membership.property_id
+                 ORDER BY (
+                   SELECT watermark_observed_through
+                   FROM oracle_projection_snapshots snapshot
+                   WHERE snapshot.snapshot_id = change.snapshot_id
+                 ) DESC LIMIT 1
+               ) AS last_event_snapshot_id
+        FROM oracle_projection_materialized_properties membership
+        JOIN oracle_projection_materializations materialization
+          USING (materialization_id)
+        JOIN oracle_property_versions version
+          ON version.version_id = membership.property_version_id
+        WHERE materialization.snapshot_id = ${partialReactivation.snapshot.snapshotId}
+          AND version.parcel_identifier = ANY(${["TEMP-02", "TEMP-24", "TEMP-25"]})
+        ORDER BY version.parcel_identifier
       `;
       expect(boundaries).toEqual([
         {
           exact_folio: "TEMP-02",
-          lifecycle_status: "active",
-          valid_from_snapshot_id: snapshotB.snapshot.snapshotId,
-          valid_to_snapshot_id: null,
+          is_active: true,
+          last_event_snapshot_id: partialReactivation.snapshot.snapshotId,
         },
         {
           exact_folio: "TEMP-24",
-          lifecycle_status: "inactive",
-          valid_from_snapshot_id: snapshotA.snapshot.snapshotId,
-          valid_to_snapshot_id: snapshotC.snapshot.snapshotId,
+          is_active: true,
+          last_event_snapshot_id: partialReactivation.snapshot.snapshotId,
         },
         {
           exact_folio: "TEMP-25",
-          lifecycle_status: "active",
-          valid_from_snapshot_id: snapshotC.snapshot.snapshotId,
-          valid_to_snapshot_id: null,
+          is_active: true,
+          last_event_snapshot_id: snapshotC.snapshot.snapshotId,
         },
       ]);
       await expect(
         sql`
-          UPDATE oracle_property_lifecycle_events SET reason = 'changed'
+          UPDATE oracle_projection_property_changes SET reason = 'changed'
           WHERE snapshot_id = ${snapshotA.snapshot.snapshotId}
         `,
       ).rejects.toThrow("immutable");
     } finally {
       await sql.end({ timeout: 5 });
     }
+
+    const concurrentOptions = {
+      coverage: "incomplete" as const,
+      folios: [...range(1, 19), "TEMP-24", ...range(27, 31)],
+      previousAuthoritativeSnapshotId: snapshotC.snapshot.snapshotId,
+      previousProjectionSnapshotId: partialReactivation.snapshot.snapshotId,
+    };
+    const [concurrentOne, concurrentTwo] = await Promise.all([
+      createSyntheticLifecycleSnapshot(dataDir, {
+        ...concurrentOptions,
+        label: "partial-concurrent-one",
+        observedAt: "2026-08-29T06:10:00.000Z",
+      }),
+      createSyntheticLifecycleSnapshot(dataDir, {
+        ...concurrentOptions,
+        label: "partial-concurrent-two",
+        observedAt: "2026-08-29T06:20:00.000Z",
+      }),
+    ]);
+    await recordRunStarted(schemaDatabaseUrl, concurrentOne.request);
+    await recordRunStarted(schemaDatabaseUrl, concurrentTwo.request);
+    const concurrent = await Promise.allSettled([
+      load(concurrentOne),
+      load(concurrentTwo),
+    ]);
+    expect(
+      concurrent.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      concurrent.filter((result) => result.status === "rejected"),
+    ).toHaveLength(1);
   }, 60_000);
 });

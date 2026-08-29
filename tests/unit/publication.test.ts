@@ -4,6 +4,7 @@ import {
   queryTableColumns,
   unavailablePublicationFields,
 } from "../../src/publication/dry-run.js";
+import { verifyPublicationUploadReceipt } from "../../src/publication/remote-boundary.js";
 import {
   parsePreparePublicationRequest,
   parsePublicationApprovalRequest,
@@ -76,5 +77,32 @@ describe("local publication dry run", () => {
     expect(() => parsePublicationStatusRequest({ county: "pasco" })).toThrow(
       "strict validation",
     );
+  });
+
+  it("treats a missing or mismatched provider CID as terminal", () => {
+    const artifact = {
+      byteSize: 1,
+      domain: "open_data" as const,
+      expectedCid: "QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH",
+      objectKey: "index.json",
+      role: "root" as const,
+      sha256: "a".repeat(64),
+    };
+    expect(() =>
+      verifyPublicationUploadReceipt(artifact, {
+        cid: null,
+        domain: "open_data",
+        objectKey: "index.json",
+        sha256: artifact.sha256,
+      }),
+    ).toThrow("Terminal publication CID mismatch");
+    expect(() =>
+      verifyPublicationUploadReceipt(artifact, {
+        cid: "QmYCTciJdFNMNUPCHSNS6dKMmUAqkGQ9tQQeGgbELhQQcn",
+        domain: "open_data",
+        objectKey: "index.json",
+        sha256: artifact.sha256,
+      }),
+    ).toThrow("Terminal publication CID mismatch");
   });
 });

@@ -60,6 +60,11 @@ export async function loadPreparedScale(
   prepared: PreparedPilot,
   durability: LoaderDurabilityContext,
 ): Promise<PilotRunSummary> {
+  if (durability.snapshot.manifestVersion === "1.2.0") {
+    throw new DurableInputError(
+      "Versioned snapshots must use the sealed projection Loader path",
+    );
+  }
   if (prepared.selectionSize !== 5_000 && prepared.selectionSize !== 25_000) {
     throw new DurableInputError(
       "Scaled load requires exactly 5,000 or 25,000 properties",

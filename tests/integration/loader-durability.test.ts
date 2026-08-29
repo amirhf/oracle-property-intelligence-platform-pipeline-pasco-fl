@@ -9,6 +9,7 @@ import {
   loadPreparedPilot,
   recordRunStarted,
 } from "../../src/db/pilot-repository.js";
+import { loadPreparedScale } from "../../src/db/scale-repository.js";
 import { runMigrations } from "../../src/db/migrations.js";
 import { DurableConflictError } from "../../src/lib/durability-errors.js";
 import { verifyPreparedInput } from "../../src/snapshot/model.js";
@@ -64,7 +65,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(8);
+  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(13);
   expect(await runMigrations(schemaDatabaseUrl)).toEqual([]);
   snapshotA = await createSyntheticSnapshot(dataDir, "a");
   snapshotB = await createSyntheticSnapshot(dataDir, "b");
@@ -81,6 +82,35 @@ afterAll(async () => {
 });
 
 describe("Loader/pasco durability", () => {
+  it("rejects direct mutable-scale handling for a versioned snapshot", async () => {
+    const verified = await verifyPreparedInput(
+      dataDir,
+      snapshotA.reference,
+      parsePreparedPilot,
+      snapshotA.snapshot.snapshotId,
+    );
+    await expect(
+      loadPreparedScale(
+        schemaDatabaseUrl,
+        snapshotA.request,
+        verified.prepared,
+        {
+          idempotencyKey: syntheticLoaderIdempotencyKey(
+            snapshotA.request.workflowId,
+            snapshotA.reference.preparedInputId,
+          ),
+          preparedManifest: verified.manifest,
+          preparedReference: verified.reference,
+          requestSha256: countyIngestRequestSha256(snapshotA.request),
+          runId: snapshotA.request.runId,
+          snapshot: verified.snapshot,
+        },
+      ),
+    ).rejects.toThrow(
+      "Versioned snapshots must use the sealed projection Loader path",
+    );
+  });
+
   it("serializes concurrent Snapshot A calls and returns the stored replay", async () => {
     await recordRunStarted(schemaDatabaseUrl, snapshotA.request);
     const [first, concurrentReplay] = await Promise.all([
@@ -109,20 +139,23 @@ describe("Loader/pasco durability", () => {
         {
           completed_effects: number;
           hashed_results: number;
-          properties: number;
+          canonical_properties: number;
+          sample_properties: number;
           reconciliations: number;
         }[]
       >`
         SELECT
           (SELECT count(*)::int FROM oracle_loader_effects WHERE status = 'completed') AS completed_effects,
           (SELECT count(*)::int FROM oracle_loader_effects WHERE result_sha256 ~ '^[a-f0-9]{64}$') AS hashed_results,
-          (SELECT count(*)::int FROM oracle_properties) AS properties,
+          (SELECT count(*)::int FROM oracle_properties) AS canonical_properties,
+          (SELECT count(*)::int FROM oracle_sample_property_versions) AS sample_properties,
           (SELECT count(*)::int FROM oracle_reconciliation_outcomes) AS reconciliations
       `;
       expect(counts[0]).toEqual({
         completed_effects: 1,
         hashed_results: 1,
-        properties: 25,
+        canonical_properties: 0,
+        sample_properties: 25,
         reconciliations: 4,
       });
     } finally {
@@ -171,50 +204,41 @@ describe("Loader/pasco durability", () => {
     expect(initial).toMatchObject({
       acceptedProperties: 25,
       activeProperties: 25,
-      changedProperties: 1,
+      changedProperties: 0,
       duplicateProperties: 0,
-      newProperties: 1,
+      newProperties: 25,
       inactiveProperties: 0,
       inactivatedProperties: 0,
       reactivatedProperties: 0,
-      unchangedProperties: 23,
+      unchangedProperties: 0,
     });
 
     const sql = postgres(schemaDatabaseUrl, { max: 1 });
     try {
       const counts = await sql<
         {
-          availability: number;
-          coordinates: number;
-          distinct_properties: number;
           effects: number;
-          ownerships: number;
-          properties: number;
+          canonical_properties: number;
           reconciliations: number;
-          roof_signals: number;
+          sample_facts: number;
+          sample_properties: number;
           snapshots: number;
         }[]
       >`
         SELECT
           (SELECT count(*)::int FROM oracle_loader_effects) AS effects,
           (SELECT count(*)::int FROM oracle_source_snapshots) AS snapshots,
-          (SELECT count(*)::int FROM oracle_properties) AS properties,
-          (SELECT count(DISTINCT property_id)::int FROM oracle_properties) AS distinct_properties,
-          (SELECT count(*)::int FROM oracle_coordinates) AS coordinates,
-          (SELECT count(*)::int FROM oracle_ownerships) AS ownerships,
-          (SELECT count(*)::int FROM oracle_roof_signals) AS roof_signals,
-          (SELECT count(*)::int FROM oracle_property_availability) AS availability,
+          (SELECT count(*)::int FROM oracle_properties) AS canonical_properties,
+          (SELECT count(*)::int FROM oracle_sample_property_versions) AS sample_properties,
+          (SELECT count(*)::int FROM oracle_sample_fact_versions) AS sample_facts,
           (SELECT count(*)::int FROM oracle_reconciliation_outcomes) AS reconciliations
       `;
       expect(counts[0]).toEqual({
-        availability: 156,
-        coordinates: 26,
-        distinct_properties: 26,
+        canonical_properties: 0,
         effects: 2,
-        ownerships: 26,
-        properties: 26,
         reconciliations: 8,
-        roof_signals: 26,
+        sample_facts: 500,
+        sample_properties: 50,
         snapshots: 2,
       });
     } finally {

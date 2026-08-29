@@ -35,6 +35,7 @@ import {
   prepareTemporalReconciliation,
   type PropertyTemporalDelta,
 } from "./temporal-reconciliation.js";
+import { recordProjectionLoad } from "./projection-repository.js";
 
 function pipelineLimitations(selectionSize: number): string[] {
   return [
@@ -199,6 +200,158 @@ export async function loadPreparedPilot(
     return await sql.begin(async (transaction) => {
       const replay = await beginLoaderEffect(transaction, durability);
       if (replay) return replay;
+      if (durability.snapshot.manifestVersion === "1.2.0") {
+        const attemptId = deterministicId("attempt", [
+          "1.0.0",
+          "attempt",
+          request.runId,
+          "Loader",
+          "load",
+          "1",
+        ]);
+        await transaction`
+          INSERT INTO oracle_pipeline_attempts (
+            attempt_id, run_id, service_name, handler_name, attempt_number, status
+          ) VALUES (${attemptId}, ${request.runId}, 'Loader', 'load', 1, 'running')
+          ON CONFLICT (attempt_id) DO NOTHING
+        `;
+        const projection = await recordProjectionLoad(
+          transaction,
+          durability.snapshot,
+          request.runId,
+          prepared,
+        );
+        const runMetrics = await transaction<
+          {
+            database_size_after_bytes: string;
+            database_size_before_bytes: string;
+            elapsed_ms: string;
+          }[]
+        >`
+          SELECT
+            pg_database_size(current_database())::bigint AS database_size_after_bytes,
+            COALESCE(database_size_before_bytes, 0)::bigint AS database_size_before_bytes,
+            GREATEST(0, EXTRACT(EPOCH FROM (now() - started_at)) * 1000)::bigint AS elapsed_ms
+          FROM oracle_pipeline_runs WHERE run_id = ${request.runId}
+        `;
+        const databaseSizeAfterBytes = Number(
+          runMetrics[0]?.database_size_after_bytes ?? 0,
+        );
+        const databaseSizeBeforeBytes = Number(
+          runMetrics[0]?.database_size_before_bytes ?? 0,
+        );
+        const elapsedMs = Number(runMetrics[0]?.elapsed_ms ?? 0);
+        const coordinates = prepared.properties.filter(
+          (property) => property.coordinates !== null,
+        ).length;
+        const ownership = prepared.properties.reduce(
+          (total, property) => total + property.owners.length,
+          0,
+        );
+        const buildings = prepared.properties.reduce(
+          (total, property) => total + property.buildings.length,
+          0,
+        );
+        const rejectedRecords = Object.values(prepared.sourceCounts).reduce(
+          (sum, count) => sum + count.rejected,
+          0,
+        );
+        const summary: PilotRunSummary = {
+          acceptedProperties: prepared.properties.length,
+          activeProperties: projection.activeProperties,
+          buildings,
+          changedProperties: projection.changedProperties,
+          coordinates,
+          databaseGrowthBytes: Math.max(
+            0,
+            databaseSizeAfterBytes - databaseSizeBeforeBytes,
+          ),
+          databaseSizeAfterBytes,
+          databaseSizeBeforeBytes,
+          diskAvailableBytes: prepared.resourceMetrics.diskAvailableBytes,
+          duplicateProperties: 0,
+          elapsedMs,
+          explicitUnavailableFacts: prepared.properties.length * 6,
+          gisMetrics: prepared.gisMetrics,
+          inactiveProperties: projection.inactiveProperties,
+          inactivatedProperties: projection.inactivatedProperties,
+          missingCoordinates: prepared.properties.length - coordinates,
+          newProperties: projection.newProperties,
+          ownership,
+          peakRssBytes: Math.max(
+            prepared.resourceMetrics.peakRssBytes,
+            resourceUsage().maxRSS * 1_024,
+          ),
+          permitRequestCount: prepared.permitRequestCount,
+          permits: 0,
+          reactivatedProperties: projection.reactivatedProperties,
+          rejectedRecords,
+          roofSignalBasis: { year_built_proxy: prepared.properties.length },
+          roofSignals: prepared.properties.length,
+          runId: request.runId,
+          selectionSize: prepared.selectionSize,
+          sourceCounts: prepared.sourceCounts,
+          throughputPropertiesPerSecond:
+            elapsedMs > 0
+              ? Number(
+                  (prepared.properties.length / (elapsedMs / 1_000)).toFixed(2),
+                )
+              : 0,
+          unchangedProperties: projection.unchangedProperties,
+          workflowId: request.workflowId,
+        };
+        for (const [checkName, observed, expected] of [
+          [
+            projection.sampleIsolated
+              ? "isolated_sample_property_count"
+              : "sealed_projection_property_count",
+            prepared.properties.length,
+            prepared.selectionSize,
+          ],
+          ["duplicate_exact_folio", 0, 0],
+          ["coordinate_coverage", coordinates, prepared.selectionSize],
+          ["ownership_coverage", ownership, prepared.selectionSize],
+        ] as const) {
+          const reconciliationId = deterministicId("reconciliation", [
+            "1.0.0",
+            "reconciliation",
+            request.runId,
+            checkName,
+          ]);
+          await transaction`
+            INSERT INTO oracle_reconciliation_outcomes (
+              reconciliation_id, run_id, check_name, status,
+              observed_count, expected_count
+            ) VALUES (
+              ${reconciliationId}, ${request.runId}, ${checkName},
+              ${observed === expected ? "pass" : "warn"}, ${observed}, ${expected}
+            ) ON CONFLICT (reconciliation_id) DO UPDATE SET
+              status = EXCLUDED.status,
+              observed_count = EXCLUDED.observed_count,
+              expected_count = EXCLUDED.expected_count
+          `;
+        }
+        await transaction`
+          UPDATE oracle_pipeline_runs SET
+            status = 'completed', completed_at = now(),
+            source_counts = ${transaction.json(prepared.sourceCounts as unknown as postgres.JSONValue)},
+            result_counts = ${transaction.json(summary as unknown as postgres.JSONValue)},
+            limitations = ${transaction.json([
+              ...pipelineLimitations(prepared.selectionSize),
+              ...prepared.sourceLimitations,
+              projection.sampleIsolated
+                ? "Sample observations are isolated and do not advance a current or authoritative projection head."
+                : `Sealed immutable projection ${projection.materializationId} is the only coherent publication source.`,
+            ])}
+          WHERE run_id = ${request.runId}
+        `;
+        await transaction`
+          UPDATE oracle_pipeline_attempts
+          SET status = 'completed', completed_at = now()
+          WHERE run_id = ${request.runId} AND status = 'running'
+        `;
+        return completeLoaderEffect(transaction, durability, summary);
+      }
       const temporalPlan = await prepareTemporalReconciliation(
         transaction,
         durability.snapshot,

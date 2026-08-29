@@ -2,10 +2,12 @@ import { z } from "zod";
 
 import { canonicalJsonSha256 } from "../lib/canonical-json.js";
 import { deterministicId } from "../lib/hash.js";
+import { CIDV0_PATTERN, IPFS_CID_PROFILE } from "./ipfs-cid.js";
 
-export const PUBLICATION_PLAN_VERSION = "1.0.0";
+export const PUBLICATION_PLAN_VERSION = "1.1.0";
 
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
+const cidSchema = z.string().regex(CIDV0_PATTERN);
 const runIdSchema = z.string().regex(/^run_[a-f0-9]{32}$/);
 const snapshotIdSchema = z.string().regex(/^snapshot_[a-f0-9]{32}$/);
 const scopeIdSchema = z.string().regex(/^scope_[a-f0-9]{32}$/);
@@ -31,12 +33,22 @@ const objectKeySchema = z
 export const publicationArtifactSchema = z.strictObject({
   byteSize: z.number().int().nonnegative(),
   domain: z.enum(["open_data", "query_table"]),
+  expectedCid: cidSchema,
   objectKey: objectKeySchema,
+  role: z.enum([
+    "property",
+    "shard",
+    "root",
+    "manifest",
+    "metadata",
+    "query_table",
+  ]),
   sha256: sha256Schema,
 });
 
 const fileBindingSchema = z.strictObject({
   byteSize: z.number().int().nonnegative(),
+  expectedCid: cidSchema,
   objectKey: objectKeySchema,
   sha256: sha256Schema,
 });
@@ -46,6 +58,38 @@ const publicationTargetSchema = z.strictObject({
   bucketConfirmed: z.boolean(),
   ipnsLabel: z.string().min(1).max(200),
   ipnsNetworkKey: z.string().min(1).max(500).nullable(),
+});
+
+const graphEdgeSchema = z.strictObject({
+  childCid: cidSchema,
+  childKey: objectKeySchema,
+  jsonPointer: z.string().regex(/^\/(?:[^/~]|~[01])+(?:\/(?:[^/~]|~[01])+)*$/),
+  parentKey: objectKeySchema,
+});
+
+const cidProfileSchema = z.strictObject({
+  cidVersion: z.literal(0),
+  chunker: z.literal("fixed"),
+  chunkSize: z.literal(262_144),
+  codec: z.literal("dag-pb"),
+  hashAlg: z.literal("sha2-256"),
+  importer: z.literal("ipfs-unixfs-importer@7.0.3"),
+  layout: z.literal("balanced"),
+  maxChildrenPerNode: z.literal(174),
+  onlyHash: z.literal(true),
+  rawLeaves: z.literal(false),
+  reduceSingleLeafToSelf: z.literal(true),
+  trickle: z.literal(false),
+  unixfsType: z.literal("file"),
+  version: z.literal("ipfs-only-hash@4.0.0"),
+  wrapWithDirectory: z.literal(false),
+});
+
+const parquetProfileSchema = z.strictObject({
+  compression: z.literal("ZSTD"),
+  duckdbVersion: z.string().min(1).max(100),
+  rowGroupSize: z.literal(10_000),
+  schemaSha256: sha256Schema,
 });
 
 export const publicationPlanSchema = z
@@ -132,9 +176,30 @@ export const publicationPlanSchema = z
       observedAt: isoDateTimeSchema,
     }),
     generatedAt: isoDateTimeSchema,
+    graph: z.strictObject({
+      cidProfile: cidProfileSchema,
+      edges: z.array(graphEdgeSchema),
+      openDataRoot: z.strictObject({
+        expectedCid: cidSchema,
+        objectKey: z.literal("index.json"),
+      }),
+      parquetProfile: parquetProfileSchema,
+      propertyCidCount: z.number().int().nonnegative(),
+      queryTableRoot: z.strictObject({
+        expectedCid: cidSchema,
+        objectKey: z.literal("query-tables/pasco/query-table.parquet"),
+      }),
+      traversalValidated: z.literal(true),
+    }),
     limitations: z.array(z.string().min(1).max(1_000)),
     planId: planIdSchema,
     planSha256: sha256Schema,
+    projection: z.strictObject({
+      authoritativeBaseSnapshotId: snapshotIdSchema.nullable(),
+      materializationId: z.string().regex(/^materialization_[a-f0-9]{32}$/),
+      materializationSha256: sha256Schema,
+      snapshotContentSha256: sha256Schema.nullable(),
+    }),
     remoteState: z.strictObject({
       openDataPublishedCid: z.null(),
       openDataIpnsMutationPerformed: z.literal(false),
@@ -149,18 +214,56 @@ export const publicationPlanSchema = z
     version: z.literal(PUBLICATION_PLAN_VERSION),
   })
   .superRefine((plan, context) => {
-    const inventoryKeys = new Set<string>();
+    const inventory = new Map<
+      string,
+      z.infer<typeof publicationArtifactSchema>
+    >();
     for (const artifact of plan.artifacts.objectInventory) {
       const key = `${artifact.domain}:${artifact.objectKey}`;
-      if (inventoryKeys.has(key)) {
+      if (inventory.has(key))
         context.addIssue({
           code: "custom",
           message: "publication object inventory contains a duplicate key",
           path: ["artifacts", "objectInventory"],
         });
-      }
-      inventoryKeys.add(key);
+      inventory.set(key, artifact);
     }
+    const graphObjects = new Map(
+      [...inventory.values()]
+        .filter((artifact) => artifact.domain === "open_data")
+        .map((artifact) => [artifact.objectKey, artifact]),
+    );
+    for (const edge of plan.graph.edges) {
+      const child = graphObjects.get(edge.childKey);
+      const parent = graphObjects.get(edge.parentKey);
+      if (!parent || !child || child.expectedCid !== edge.childCid) {
+        context.addIssue({
+          code: "custom",
+          message: "publication graph edge is not bound to inventory",
+          path: ["graph", "edges"],
+        });
+        break;
+      }
+    }
+    const root = inventory.get("open_data:index.json");
+    const parquet = inventory.get(
+      "query_table:query-tables/pasco/query-table.parquet",
+    );
+    const graphComplete =
+      root?.expectedCid === plan.graph.openDataRoot.expectedCid &&
+      root.role === "root" &&
+      parquet?.expectedCid === plan.graph.queryTableRoot.expectedCid &&
+      parquet.role === "query_table" &&
+      plan.graph.propertyCidCount === plan.counts.canonicalDocuments &&
+      plan.graph.edges.length ===
+        plan.counts.canonicalDocuments + plan.artifacts.shards.length;
+    if (!graphComplete)
+      context.addIssue({
+        code: "custom",
+        message: "publication graph/root binding is incomplete",
+        path: ["graph"],
+      });
+
     const missingConfiguration =
       !plan.configuration.credentialsAvailable ||
       plan.configuration.missing.length > 0 ||
@@ -170,29 +273,45 @@ export const publicationPlanSchema = z
       plan.targets.queryTable.bucket === null ||
       plan.targets.openData.ipnsNetworkKey === null ||
       plan.targets.queryTable.ipnsNetworkKey === null;
+    const coverageEligible =
+      plan.coverage.mode === "authoritative_complete" ||
+      (plan.coverage.mode === "partial" &&
+        plan.projection.authoritativeBaseSnapshotId !== null);
+    const shouldExecute =
+      !missingConfiguration && graphComplete && coverageEligible;
     if (
-      plan.approvable !== !missingConfiguration ||
-      plan.executable !== !missingConfiguration
+      plan.approvable !== shouldExecute ||
+      plan.executable !== shouldExecute
     ) {
       context.addIssue({
         code: "custom",
-        message: "publication approval flags do not match target configuration",
+        message:
+          "publication approval flags do not match graph, target, and coverage eligibility",
         path: ["approvable"],
       });
     }
     if (plan.exportMode === "authoritative") {
+      const currentProjection =
+        plan.coverage.sourceSnapshotId !== null &&
+        plan.coverage.sourceSnapshotManifestSha256 !== null &&
+        plan.coverage.authoritativeHeadSnapshotId ===
+          plan.coverage.sourceSnapshotId;
+      const eligibleCoverage =
+        (plan.coverage.mode === "authoritative_complete" &&
+          plan.coverage.completenessResult === "passed" &&
+          plan.projection.authoritativeBaseSnapshotId ===
+            plan.coverage.sourceSnapshotId) ||
+        (plan.coverage.mode === "partial" &&
+          plan.projection.authoritativeBaseSnapshotId !== null);
       if (
-        plan.coverage.mode !== "authoritative_complete" ||
-        plan.coverage.completenessResult !== "passed" ||
-        plan.coverage.sourceSnapshotId === null ||
-        plan.coverage.sourceSnapshotManifestSha256 === null ||
-        plan.coverage.authoritativeHeadSnapshotId !==
-          plan.coverage.sourceSnapshotId
+        !currentProjection ||
+        !eligibleCoverage ||
+        plan.projection.snapshotContentSha256 === null
       ) {
         context.addIssue({
           code: "custom",
           message:
-            "authoritative publication lacks a verified current scope head",
+            "current projection publication lacks a verified authoritative base and exact head",
           path: ["coverage"],
         });
       }
@@ -211,13 +330,9 @@ export type PublicationTarget = z.infer<typeof publicationTargetSchema>;
 export type PublicationPlanInput = Omit<
   PublicationPlan,
   "generatedAt" | "planId" | "planSha256"
-> & {
-  generatedAt: string;
-};
+> & { generatedAt: string };
 
-function planIdentity(
-  plan: Omit<PublicationPlan, "planId" | "planSha256">,
-): Omit<PublicationPlan, "generatedAt" | "planId" | "planSha256"> {
+function planIdentity(plan: Omit<PublicationPlan, "planId" | "planSha256">) {
   const { generatedAt: _generatedAt, ...identity } = plan;
   return identity;
 }
@@ -232,7 +347,7 @@ export function createPublicationPlan(
   input: PublicationPlanInput,
 ): PublicationPlan {
   const planSha256 = expectedPublicationPlanSha256(input);
-  const plan = {
+  return validatePublicationPlan({
     ...input,
     planId: deterministicId("plan", [
       PUBLICATION_PLAN_VERSION,
@@ -240,11 +355,68 @@ export function createPublicationPlan(
       planSha256,
     ]),
     planSha256,
-  };
-  return validatePublicationPlan(plan);
+  });
 }
 
 export function validatePublicationPlan(value: unknown): PublicationPlan {
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (value as Record<string, unknown>).version === "1.0.0"
+  ) {
+    const record = value as Record<string, unknown>;
+    const expectedKeys = new Set([
+      "approvable",
+      "artifacts",
+      "configuration",
+      "contracts",
+      "counts",
+      "county",
+      "coverage",
+      "executable",
+      "exportMode",
+      "fixtureExclusion",
+      "freshness",
+      "generatedAt",
+      "limitations",
+      "planId",
+      "planSha256",
+      "remoteState",
+      "targets",
+      "temporalFactLimitation",
+      "version",
+    ]);
+    if (
+      Object.keys(record).some((key) => !expectedKeys.has(key)) ||
+      typeof record.planId !== "string" ||
+      typeof record.planSha256 !== "string" ||
+      typeof record.generatedAt !== "string"
+    ) {
+      throw new Error("Historical publication plan failed strict validation");
+    }
+    const {
+      generatedAt: _generatedAt,
+      planId: _planId,
+      planSha256: _planSha256,
+      ...identity
+    } = record;
+    const expectedSha256 = canonicalJsonSha256(identity);
+    const expectedPlanId = deterministicId("plan", [
+      "1.0.0",
+      "Publish/pasco",
+      expectedSha256,
+    ]);
+    if (
+      record.planSha256 !== expectedSha256 ||
+      record.planId !== expectedPlanId
+    ) {
+      throw new Error("Historical publication plan identity is invalid");
+    }
+    // v1.0 is read-only historical compatibility for the existing local MCP
+    // artifact. New plans can only be created as v1.1.0.
+    return record as unknown as PublicationPlan;
+  }
   const parsed = publicationPlanSchema.safeParse(value);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
@@ -260,9 +432,8 @@ export function validatePublicationPlan(value: unknown): PublicationPlan {
     "Publish/pasco",
     expectedSha256,
   ]);
-  if (plan.planSha256 !== expectedSha256 || plan.planId !== expectedPlanId) {
+  if (plan.planSha256 !== expectedSha256 || plan.planId !== expectedPlanId)
     throw new Error("Publication plan deterministic identity is invalid");
-  }
   return plan;
 }
 
@@ -273,28 +444,20 @@ export function publicationConfigurationMissing(options: {
 }): PublicationPlan["configuration"]["missing"] {
   const missing: PublicationPlan["configuration"]["missing"] = [];
   if (!options.credentialsAvailable) missing.push("filebase_credentials");
-  if (!options.openData.bucket || !options.openData.bucketConfirmed) {
+  if (!options.openData.bucket || !options.openData.bucketConfirmed)
     missing.push("open_data_bucket");
-  }
-  if (!options.openData.ipnsNetworkKey) {
+  if (!options.openData.ipnsNetworkKey)
     missing.push("open_data_ipns_network_key");
-  }
-  if (!options.queryTable.bucket || !options.queryTable.bucketConfirmed) {
+  if (!options.queryTable.bucket || !options.queryTable.bucketConfirmed)
     missing.push("query_table_bucket");
-  }
-  if (!options.queryTable.ipnsNetworkKey) {
+  if (!options.queryTable.ipnsNetworkKey)
     missing.push("query_table_ipns_network_key");
-  }
   return missing;
 }
 
-export function localIncompletePascoTargets(): {
-  credentialsAvailable: false;
-  openData: PublicationTarget;
-  queryTable: PublicationTarget;
-} {
+export function localIncompletePascoTargets() {
   return {
-    credentialsAvailable: false,
+    credentialsAvailable: false as const,
     openData: {
       bucket: "elephant-oracle-open-data-pasco",
       bucketConfirmed: true,
@@ -309,3 +472,5 @@ export function localIncompletePascoTargets(): {
     },
   };
 }
+
+export const pinnedPublicationCidProfile = () => ({ ...IPFS_CID_PROFILE });

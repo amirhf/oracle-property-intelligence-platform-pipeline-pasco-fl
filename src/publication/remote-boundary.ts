@@ -1,7 +1,7 @@
 import type { PublicationArtifact, PublicationPlan } from "./plan.js";
 
 export interface PublicationUploadReceipt {
-  cid: string;
+  cid: string | null;
   domain: PublicationArtifact["domain"];
   objectKey: string;
   sha256: string;
@@ -38,4 +38,21 @@ export function createRemotePublicationExecutor(_plan: PublicationPlan): never {
   throw new Error(
     "Remote publication is not configured; no production or local publisher is available",
   );
+}
+
+export function verifyPublicationUploadReceipt(
+  artifact: PublicationArtifact,
+  receipt: PublicationUploadReceipt,
+): void {
+  if (
+    receipt.cid === null ||
+    receipt.cid !== artifact.expectedCid ||
+    receipt.domain !== artifact.domain ||
+    receipt.objectKey !== artifact.objectKey ||
+    receipt.sha256 !== artifact.sha256
+  ) {
+    throw new Error(
+      `Terminal publication CID mismatch (${artifact.domain}:${artifact.objectKey})`,
+    );
+  }
 }

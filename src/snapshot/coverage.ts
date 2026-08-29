@@ -4,7 +4,7 @@ import { canonicalJson, canonicalJsonSha256 } from "../lib/canonical-json.js";
 import { DurableInputError } from "../lib/durability-errors.js";
 import { deterministicId } from "../lib/hash.js";
 
-export const COVERAGE_METADATA_VERSION = "1.0.0";
+export const COVERAGE_METADATA_VERSION = "1.1.0";
 export const PASCO_PARCEL_AUTHORITY_SOURCE_IDENTIFIER =
   "pasco_appraiser:extracted:parcel";
 export const AUTHORITATIVE_PARCEL_SELECTION_ALGORITHM =
@@ -47,6 +47,7 @@ export const snapshotCoverageSchema = z.strictObject({
   membershipRule: z.string().min(1).max(500),
   mode: z.enum(["sample", "partial", "authoritative_complete"]),
   previousAuthoritativeSnapshotId: snapshotIdSchema.nullable(),
+  previousProjectionSnapshotId: snapshotIdSchema.nullable(),
   scopeId: z.string().regex(/^scope_[a-f0-9]{32}$/),
   selection: z.strictObject({
     algorithm: z.string().min(1).max(200),
@@ -62,6 +63,11 @@ export const snapshotCoverageSchema = z.strictObject({
   sourceObservationWindow: z.strictObject({
     end: isoDateTimeSchema,
     start: isoDateTimeSchema,
+  }),
+  membershipWatermark: z.strictObject({
+    kind: z.literal("pasco-appraiser-observation-end-v1"),
+    observedThrough: isoDateTimeSchema,
+    sourceObjectSha256: sha256Schema,
   }),
   version: z.literal(COVERAGE_METADATA_VERSION),
 });
@@ -82,6 +88,7 @@ export interface CoveragePreparation {
   counts: z.infer<typeof coverageCountsSchema>;
   membershipRule: string;
   previousAuthoritativeSnapshotId?: string | null;
+  previousProjectionSnapshotId?: string | null;
   selectionKind: SnapshotCoverage["selection"]["kind"];
 }
 
@@ -92,6 +99,7 @@ interface CoverageDerivationOptions {
   observationWindow: SnapshotCoverage["sourceObservationWindow"];
   parserVersion: string;
   previousAuthoritativeSnapshotId: string | null;
+  previousProjectionSnapshotId: string | null;
   sampling: {
     algorithm: string;
     seed: string;
@@ -124,13 +132,15 @@ function completenessPassed(options: CoverageDerivationOptions): boolean {
 
 function expectedScopeId(options: CoverageDerivationOptions): string {
   const sampleMembership =
-    options.selectionKind === "complete_source"
-      ? []
-      : [
+    options.selectionKind === "deterministic_sample"
+      ? [
+          options.selectionKind,
+          options.sampling.algorithm,
           options.sampling.seed,
           options.sampling.selectedRecordSha256,
           String(options.sampling.selectionSize),
-        ];
+        ]
+      : [];
   return deterministicId("scope", [
     COVERAGE_METADATA_VERSION,
     "coverage-scope",
@@ -141,8 +151,6 @@ function expectedScopeId(options: CoverageDerivationOptions): string {
     options.membershipRule,
     options.parserVersion,
     options.transformVersion,
-    options.selectionKind,
-    options.sampling.algorithm,
     ...sampleMembership,
   ]);
 }
@@ -197,12 +205,18 @@ export function deriveSnapshotCoverage(
           ? "authoritative_complete"
           : "partial",
     previousAuthoritativeSnapshotId: options.previousAuthoritativeSnapshotId,
+    previousProjectionSnapshotId: options.previousProjectionSnapshotId,
     scopeId: expectedScopeId(options),
     selection: {
       ...options.sampling,
       kind: options.selectionKind,
     },
     sourceObservationWindow: options.observationWindow,
+    membershipWatermark: {
+      kind: "pasco-appraiser-observation-end-v1",
+      observedThrough: options.observationWindow.end,
+      sourceObjectSha256: options.authoritySource.sha256,
+    },
     version: COVERAGE_METADATA_VERSION,
   };
 }
@@ -248,6 +262,7 @@ export function validateSnapshotCoverage(options: {
     observationWindow: options.observationWindow,
     parserVersion: options.parserVersion,
     previousAuthoritativeSnapshotId: coverage.previousAuthoritativeSnapshotId,
+    previousProjectionSnapshotId: coverage.previousProjectionSnapshotId,
     sampling: options.sampling,
     selectionKind: coverage.selection.kind,
     transformVersion: options.transformVersion,

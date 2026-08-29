@@ -1,9 +1,11 @@
 import { createReadStream } from "node:fs";
+import { randomUUID } from "node:crypto";
 import {
+  link,
   mkdir,
   readFile,
   realpath,
-  rename,
+  rm,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -22,7 +24,7 @@ import {
   type CoveragePreparation,
 } from "./coverage.js";
 
-export const SNAPSHOT_MANIFEST_VERSION = "1.1.0";
+export const SNAPSHOT_MANIFEST_VERSION = "1.2.0";
 export const PREPARED_INPUT_MANIFEST_VERSION = "1.0.0";
 export const CANONICAL_SCHEMA_SHA256 =
   "59c6472c2cd6d18041cf72c779fb970a082b00bef09aea724b99687e84198306";
@@ -259,9 +261,21 @@ export function validateSnapshotIdentity(
 
 async function atomicWrite(filePath: string, body: string): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true });
-  const partial = `${filePath}.part`;
+  const partial = `${filePath}.${process.pid}.${randomUUID()}.part`;
   await writeFile(partial, body, { encoding: "utf8", mode: 0o600 });
-  await rename(partial, filePath);
+  try {
+    await link(partial, filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const winner = await readFile(filePath, "utf8");
+    if (winner !== body) {
+      throw new DurableInputError(
+        `Immutable snapshot artifact conflict (pathHash=${sha256(filePath).slice(0, 16)})`,
+      );
+    }
+  } finally {
+    await rm(partial, { force: true });
+  }
 }
 
 function observedWindow(
@@ -387,6 +401,8 @@ export async function writeSourceSnapshot(options: {
     parserVersion: PASCO_PARSER_VERSION,
     previousAuthoritativeSnapshotId:
       options.coverage.previousAuthoritativeSnapshotId ?? null,
+    previousProjectionSnapshotId:
+      options.coverage.previousProjectionSnapshotId ?? null,
     sampling: options.sampling,
     selectionKind: options.coverage.selectionKind,
     transformVersion: PASCO_TRANSFORM_VERSION,

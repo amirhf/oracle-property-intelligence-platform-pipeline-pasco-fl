@@ -32,13 +32,18 @@ export interface SyntheticSnapshot {
 }
 
 export interface SyntheticLifecycleSnapshotOptions {
+  authoritySourceSystem?: string;
   changedFolios?: readonly string[];
+  coordinateMissingFolios?: readonly string[];
   coverage: "authoritative" | "incomplete" | "sample";
   createdAt?: string;
   folios: readonly string[];
   label: string;
   membershipRule?: string;
+  observedAt?: string;
+  ownerlessFolios?: readonly string[];
   previousAuthoritativeSnapshotId?: string | null;
+  previousProjectionSnapshotId?: string | null;
 }
 
 function sourceCount(count: number) {
@@ -168,24 +173,24 @@ export async function createSyntheticLifecycleSnapshot(
   const downloadedSource = await createSourceObject({
     dataDir,
     filePath: rawPath,
-    observedAt: SYNTHETIC_AS_OF,
+    observedAt: options.observedAt ?? SYNTHETIC_AS_OF,
     sourceIdentifier: `https://synthetic.invalid/${options.label}/parcel.zip`,
-    sourceSystem: "pasco_appraiser",
+    sourceSystem: options.authoritySourceSystem ?? "pasco_appraiser",
     stage: "downloaded_source",
   });
   const parcelSource = await createSourceObject({
     dataDir,
     derivedFromSha256: downloadedSource.sha256,
     filePath: extractedPath,
-    observedAt: SYNTHETIC_AS_OF,
+    observedAt: options.observedAt ?? SYNTHETIC_AS_OF,
     sourceIdentifier: PASCO_PARCEL_AUTHORITY_SOURCE_IDENTIFIER,
-    sourceSystem: "pasco_appraiser",
+    sourceSystem: options.authoritySourceSystem ?? "pasco_appraiser",
     stage: "extracted_source",
   });
   const gisSource = await createSourceObject({
     dataDir,
     filePath: gisPath,
-    observedAt: SYNTHETIC_AS_OF,
+    observedAt: options.observedAt ?? SYNTHETIC_AS_OF,
     sourceIdentifier: `https://synthetic.invalid/${options.label}/gis.geojson`,
     sourceSystem: "pasco_gis",
     stage: "downloaded_source",
@@ -219,6 +224,10 @@ export async function createSyntheticLifecycleSnapshot(
         options.membershipRule ?? "all official parcel rows in Pasco v1",
       previousAuthoritativeSnapshotId:
         options.previousAuthoritativeSnapshotId ?? null,
+      previousProjectionSnapshotId:
+        options.previousProjectionSnapshotId === undefined
+          ? (options.previousAuthoritativeSnapshotId ?? null)
+          : options.previousProjectionSnapshotId,
       selectionKind: completeIntent
         ? "complete_source"
         : "deterministic_sample",
@@ -229,9 +238,16 @@ export async function createSyntheticLifecycleSnapshot(
     sourceObjects: [downloadedSource, parcelSource, gisSource],
   });
   const changedFolios = new Set(options.changedFolios ?? []);
-  const properties = folios.map((folio) =>
-    syntheticProperty(folio, changedFolios.has(folio)),
+  const coordinateMissingFolios = new Set(
+    options.coordinateMissingFolios ?? [],
   );
+  const ownerlessFolios = new Set(options.ownerlessFolios ?? []);
+  const properties = folios.map((folio) => {
+    const property = syntheticProperty(folio, changedFolios.has(folio));
+    if (coordinateMissingFolios.has(folio)) property.coordinates = null;
+    if (ownerlessFolios.has(folio)) property.owners = [];
+    return property;
+  });
   const prepared: PreparedPilot = {
     artifacts: [],
     gisMetrics: {

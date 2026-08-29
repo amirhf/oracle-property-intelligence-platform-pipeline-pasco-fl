@@ -1,5 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  link,
   mkdir,
   readdir,
   readFile,
@@ -7,24 +8,26 @@ import {
   rename,
   rm,
   stat,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-import { DuckDBInstance } from "@duckdb/node-api";
+import { DuckDBInstance, type DuckDBValue } from "@duckdb/node-api";
 import type { Ajv2020 as Ajv2020Class, ErrorObject } from "ajv/dist/2020.js";
 import type { FormatsPlugin } from "ajv-formats";
 import postgres from "postgres";
 
 import type { PilotRunSummary } from "../domain/types.js";
 import {
+  preflightPublicationPlan,
   recordPublicationPlan,
   type PublicationStateView,
 } from "../db/publication-durability.js";
 import { canonicalJson, canonicalJsonSha256 } from "../lib/canonical-json.js";
-import { deterministicId, sha256 } from "../lib/hash.js";
+import { deterministicId, parcelId, sha256 } from "../lib/hash.js";
 import {
   PASCO_PARCEL_AUTHORITY_SOURCE_IDENTIFIER,
   snapshotCoverageSchema,
@@ -38,9 +41,14 @@ import {
   type PublicationPlan,
   type PublicationTarget,
 } from "./plan.js";
+import {
+  buildPublicationGraph,
+  publicationCanonicalJson,
+  type GraphPropertyInput,
+} from "./graph.js";
+import { calculateIpfsCid, IPFS_CID_PROFILE } from "./ipfs-cid.js";
 
 const CONTRACT_VERSION = "1.0.0";
-const PROPERTY_SHARD_SIZE = 1_000;
 const APPRAISER_ARTIFACT_URI = "artifact://pasco/appraiser/2026-08-23";
 const GIS_ARTIFACT_URI = "artifact://pasco/gis/countywide-25000";
 const APPRAISER_URL = "https://ftp01.pascopa.com/real_estate/parcel.zip";
@@ -112,7 +120,9 @@ interface SnapshotRow {
 
 interface ManifestEntry {
   bytes: number;
+  cid: string;
   objectKey: string;
+  parcelIdentifier: string;
   propertyId: string;
   sha256: string;
 }
@@ -150,18 +160,24 @@ export interface PublicationBuildOptions {
   generatedAt?: string;
   runId: string;
   targets?: PublicationTargetConfiguration;
+  /** Test-only failure injection; production uses the durable repository. */
+  publicationPlanRecorder?: typeof recordPublicationPlan;
 }
 
 interface ResolvedExportScope {
   activeProperties: number;
+  authoritativeBaseSnapshotId: string | null;
   authoritativeHeadSnapshotId: string | null;
   coverage: SnapshotCoverage | null;
   inactiveProperties: number;
+  materializationId: string | null;
+  materializationSha256: string | null;
   predecessorChainSnapshotIds: string[];
   run: ExportRunRow;
   selectedRecordSha256: string;
   scopeId: string;
   snapshot: SnapshotRow | null;
+  snapshotContentSha256: string | null;
 }
 
 function iso(value: Date | string): string {
@@ -200,9 +216,24 @@ function unavailable(
 
 async function atomicWrite(filePath: string, body: string | Buffer) {
   await mkdir(path.dirname(filePath), { recursive: true });
-  const partPath = `${filePath}.part`;
+  const partPath = `${filePath}.${process.pid}.${randomUUID()}.part`;
   await writeFile(partPath, body, { mode: 0o600 });
-  await rename(partPath, filePath);
+  try {
+    await link(partPath, filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const [winner, contender] = await Promise.all([
+      readFile(filePath),
+      readFile(partPath),
+    ]);
+    if (!winner.equals(contender)) {
+      throw new Error("Immutable publication artifact finalization conflict", {
+        cause: error,
+      });
+    }
+  } finally {
+    await unlink(partPath).catch(() => undefined);
+  }
 }
 
 async function fileSha256(filePath: string): Promise<string> {
@@ -261,15 +292,55 @@ function sqlPath(value: string): string {
 
 export function queryTableColumns(): Record<string, string> {
   return {
+    // Unchanged Elephant query-table reader contract. Keep these names and
+    // DuckDB-compatible scalar types byte-for-byte stable on the producer side;
+    // Oracle-only columns follow them and are additive.
     property_id: "VARCHAR",
+    property_cid: "VARCHAR",
+    request_identifier: "VARCHAR",
+    parcel_identifier: "VARCHAR",
+    source_system: "VARCHAR",
+    county_name: "VARCHAR",
+    state_code: "VARCHAR",
+    address_street: "VARCHAR",
+    address_city: "VARCHAR",
+    address_zip: "VARCHAR",
+    latitude: "DOUBLE",
+    longitude: "DOUBLE",
+    lot_size_acre: "DOUBLE",
+    lot_area_sqft: "DOUBLE",
+    exterior_wall_material: "VARCHAR",
+    roof_covering_material: "VARCHAR",
+    property_type: "VARCHAR",
+    property_usage_type: "VARCHAR",
+    built_year: "BIGINT",
+    livable_floor_area: "DOUBLE",
+    total_area: "DOUBLE",
+    assessed_value: "DOUBLE",
+    market_value: "DOUBLE",
+    land_value: "DOUBLE",
+    avm_value: "DOUBLE",
+    owner_name: "VARCHAR",
+    owners_text: "VARCHAR",
+    owner_count: "BIGINT",
+    owner_occupied: "BOOLEAN",
+    last_sale_date: "VARCHAR",
+    last_sale_price: "DOUBLE",
+    subdivision: "VARCHAR",
+    has_permits: "BOOLEAN",
+    permit_count: "BIGINT",
+    has_sunbiz_tenant: "BOOLEAN",
+    has_bbb_contractor: "BOOLEAN",
+    hoa_flag: "BOOLEAN",
+
+    // Oracle MCP v1.2 local-artifact extensions. These do not replace or
+    // reinterpret any Elephant column above.
     parcel_id: "VARCHAR",
     county: "VARCHAR",
     exact_folio: "VARCHAR",
     site_address: "VARCHAR",
     site_city: "VARCHAR",
     site_zip: "VARCHAR",
-    latitude: "DOUBLE",
-    longitude: "DOUBLE",
     property_use_code: "VARCHAR",
     property_use_description: "VARCHAR",
     acres: "DOUBLE",
@@ -295,7 +366,6 @@ export function queryTableColumns(): Record<string, string> {
     open_roofing_permit_count: "INTEGER",
     maximum_open_roofing_permit_days: "INTEGER",
     property_document_sha256: "VARCHAR",
-    property_cid: "VARCHAR",
     source_record_hash: "VARCHAR",
     coverage_mode: "VARCHAR",
     coverage_scope_id: "VARCHAR",
@@ -307,6 +377,46 @@ export function queryTableColumns(): Record<string, string> {
     published_at: "TIMESTAMPTZ",
   };
 }
+
+export const ELEPHANT_QUERY_TABLE_COLUMNS = Object.freeze({
+  property_id: "VARCHAR",
+  property_cid: "VARCHAR",
+  request_identifier: "VARCHAR",
+  parcel_identifier: "VARCHAR",
+  source_system: "VARCHAR",
+  county_name: "VARCHAR",
+  state_code: "VARCHAR",
+  address_street: "VARCHAR",
+  address_city: "VARCHAR",
+  address_zip: "VARCHAR",
+  latitude: "DOUBLE",
+  longitude: "DOUBLE",
+  lot_size_acre: "DOUBLE",
+  lot_area_sqft: "DOUBLE",
+  exterior_wall_material: "VARCHAR",
+  roof_covering_material: "VARCHAR",
+  property_type: "VARCHAR",
+  property_usage_type: "VARCHAR",
+  built_year: "BIGINT",
+  livable_floor_area: "DOUBLE",
+  total_area: "DOUBLE",
+  assessed_value: "DOUBLE",
+  market_value: "DOUBLE",
+  land_value: "DOUBLE",
+  avm_value: "DOUBLE",
+  owner_name: "VARCHAR",
+  owners_text: "VARCHAR",
+  owner_count: "BIGINT",
+  owner_occupied: "BOOLEAN",
+  last_sale_date: "VARCHAR",
+  last_sale_price: "DOUBLE",
+  subdivision: "VARCHAR",
+  has_permits: "BOOLEAN",
+  permit_count: "BIGINT",
+  has_sunbiz_tenant: "BOOLEAN",
+  has_bbb_contractor: "BOOLEAN",
+  hoa_flag: "BOOLEAN",
+} as const);
 
 export function unavailablePublicationFields() {
   return {
@@ -336,7 +446,7 @@ async function writeParquet(
           format = 'newline_delimited',
           columns = {${columns}}
         )
-        ORDER BY property_id
+        ORDER BY request_identifier, property_id
       ) TO '${sqlPath(parquetPath)}'
       (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 10000)
     `);
@@ -345,7 +455,111 @@ async function writeParquet(
   }
 }
 
-async function validateParquet(parquetPath: string): Promise<{
+/**
+ * Fixed projections copied from the unchanged Elephant MCP reader plus the
+ * reference producer's documented common-SQL acceptance queries. The Oracle
+ * build runs every statement against the generated Parquet so a missing column
+ * or incompatible type is a producer failure, never a hosted-reader surprise.
+ */
+export const ELEPHANT_FIXED_PROPERTY_QUERIES = Object.freeze([
+  "SELECT property_cid FROM properties WHERE parcel_identifier = $1 LIMIT 1",
+  "SELECT property_cid FROM properties WHERE property_id = $1 LIMIT 1",
+  "SELECT count(*) AS c FROM properties",
+  `SELECT property_id, parcel_identifier, property_cid, county_name,
+          address_street, address_city, address_zip, market_value, owner_name
+     FROM properties
+     ORDER BY parcel_identifier
+     LIMIT $1 OFFSET $2`,
+  `SELECT count(*) AS c, any_value(county_name) AS county,
+          any_value(state_code) AS state FROM properties`,
+  `SELECT parcel_identifier, request_identifier, latitude, longitude,
+          avm_value, property_type
+     FROM properties
+     WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+       AND latitude BETWEEN $1 AND $2
+       AND longitude BETWEEN $3 AND $4`,
+  "DESCRIBE properties",
+  "SELECT count(*) FROM properties WHERE lot_size_acre > 2 AND address_city ILIKE 'jupiter'",
+  "SELECT count(*) FROM properties WHERE owners_text ILIKE '%SMITH, JOHN%'",
+  "SELECT count(*) FROM properties WHERE address_zip = '33410' AND exterior_wall_material ILIKE '%concrete%'",
+] as const);
+
+export async function validateElephantQueryTableCompatibility(
+  parquetPath: string,
+): Promise<{ columnCount: number; queryCount: number }> {
+  const instance = await DuckDBInstance.create(":memory:");
+  const connection = await instance.connect();
+  try {
+    await connection.run(
+      `CREATE VIEW properties AS SELECT * FROM read_parquet('${sqlPath(parquetPath)}')`,
+    );
+    const parameters: readonly (readonly DuckDBValue[])[] = [
+      ["__missing_parcel__"],
+      ["__missing_property__"],
+      [],
+      [2, 0],
+      [],
+      [-90, 90, -180, 180],
+      [],
+      [],
+      [],
+      [],
+    ];
+    for (const [index, query] of ELEPHANT_FIXED_PROPERTY_QUERIES.entries()) {
+      await connection.runAndReadAll(query, [...(parameters[index] ?? [])]);
+    }
+    const described = await connection.runAndReadAll("DESCRIBE properties");
+    const actual = new Map(
+      described
+        .getRowObjectsJson()
+        .map((row) => [
+          String(row.column_name),
+          String(row.column_type).toUpperCase(),
+        ]),
+    );
+    for (const [name, expectedType] of Object.entries(
+      ELEPHANT_QUERY_TABLE_COLUMNS,
+    )) {
+      const actualType = actual.get(name);
+      if (actualType !== expectedType) {
+        throw new Error(
+          `Elephant query-table column ${name} has type ${actualType ?? "missing"}, expected ${expectedType}`,
+        );
+      }
+    }
+    const unavailable = await connection.runAndReadAll(`
+      SELECT count(*)::BIGINT AS fabricated
+      FROM properties
+      WHERE assessed_value IS NOT NULL OR market_value IS NOT NULL
+         OR land_value IS NOT NULL OR avm_value IS NOT NULL
+         OR owner_occupied IS NOT NULL OR last_sale_date IS NOT NULL
+         OR last_sale_price IS NOT NULL OR subdivision IS NOT NULL
+         OR has_permits IS NOT NULL OR permit_count IS NOT NULL
+         OR has_sunbiz_tenant IS NOT NULL OR has_bbb_contractor IS NOT NULL
+         OR hoa_flag IS NOT NULL
+    `);
+    const fabricated = Number(
+      (unavailable.getRowObjectsJson()[0] as { fabricated?: unknown })
+        ?.fabricated ?? 0,
+    );
+    if (fabricated !== 0) {
+      throw new Error(
+        "Elephant query-table unavailable fields contain fabricated defaults",
+      );
+    }
+    return {
+      columnCount: Object.keys(ELEPHANT_QUERY_TABLE_COLUMNS).length,
+      queryCount: ELEPHANT_FIXED_PROPERTY_QUERIES.length,
+    };
+  } finally {
+    connection.closeSync();
+  }
+}
+
+async function validateParquet(
+  parquetPath: string,
+  expectedPropertyCids: ReadonlyMap<string, string>,
+): Promise<{
   coordinateRows: number;
   distinctIds: number;
   nullIds: number;
@@ -383,6 +597,26 @@ async function validateParquet(parquetPath: string): Promise<{
     const schemaReader = await connection.runAndReadAll(
       `DESCRIBE SELECT * FROM read_parquet('${sqlPath(parquetPath)}')`,
     );
+    const cidReader = await connection.runAndReadAll(`
+      SELECT property_id, property_cid
+      FROM read_parquet('${sqlPath(parquetPath)}')
+      ORDER BY property_id
+    `);
+    const cidRows = cidReader.getRowObjectsJson() as Array<
+      Record<string, string | null>
+    >;
+    if (cidRows.length !== expectedPropertyCids.size) {
+      throw new Error("Parquet property CID cardinality is inconsistent");
+    }
+    for (const row of cidRows) {
+      if (
+        typeof row.property_id !== "string" ||
+        typeof row.property_cid !== "string" ||
+        expectedPropertyCids.get(row.property_id) !== row.property_cid
+      ) {
+        throw new Error("Parquet property CID is not bound to the graph leaf");
+      }
+    }
     return {
       coordinateRows: Number(summary?.coordinate_rows ?? 0),
       distinctIds: Number(summary?.distinct_ids ?? 0),
@@ -436,7 +670,7 @@ async function resolveExportScope(
   }
   if (options.exportMode === "authoritative") {
     if (
-      run.coverage_mode !== "authoritative_complete" ||
+      !["authoritative_complete", "partial"].includes(run.coverage_mode) ||
       run.snapshot_id === null ||
       run.coverage_scope_id === null
     ) {
@@ -456,8 +690,7 @@ async function resolveExportScope(
     }
     const coverage = strictCoverage(snapshot.coverage_metadata);
     if (
-      coverage.mode !== "authoritative_complete" ||
-      coverage.completeness.result !== "passed" ||
+      coverage.mode !== run.coverage_mode ||
       coverage.scopeId !== run.coverage_scope_id ||
       coverage.authoritySource.sourceSystem !== "pasco_appraiser" ||
       coverage.authoritySource.sourceIdentifier !==
@@ -467,23 +700,33 @@ async function resolveExportScope(
         "Authoritative publication lacks verified official parcel completeness",
       );
     }
+    if (
+      coverage.mode === "authoritative_complete" &&
+      coverage.completeness.result !== "passed"
+    ) {
+      throw new Error(
+        "Authoritative publication lacks verified official parcel completeness",
+      );
+    }
     const heads = await sql<
       {
-        current_run_id: string;
+        authoritative_base_snapshot_id: string | null;
         current_snapshot_id: string;
         scope_id: string;
       }[]
     >`
-      SELECT scope_id, current_snapshot_id, current_run_id
-      FROM oracle_authoritative_scope_heads
-      WHERE county = 'pasco' AND entity_type = 'property_existence'
+      SELECT scope_id, current_snapshot_id, authoritative_base_snapshot_id
+      FROM oracle_projection_heads
+      WHERE scope_id = ${coverage.scopeId}
     `;
     const head = heads[0];
     if (
       !head ||
       head.scope_id !== coverage.scopeId ||
       head.current_snapshot_id !== run.snapshot_id ||
-      head.current_run_id !== run.run_id
+      head.authoritative_base_snapshot_id === null ||
+      (coverage.mode === "authoritative_complete" &&
+        head.authoritative_base_snapshot_id !== run.snapshot_id)
     ) {
       throw new Error(
         "Authoritative publication requires the exact current scope head",
@@ -501,77 +744,93 @@ async function resolveExportScope(
       seen.add(cursor);
       predecessorChainSnapshotIds.push(cursor);
       const rows: {
-        coverage_metadata: unknown;
-        previous_authoritative_snapshot_id: string | null;
+        predecessor_snapshot_id: string | null;
       }[] = await sql`
-        SELECT coverage_metadata, previous_authoritative_snapshot_id
-        FROM oracle_source_snapshots WHERE snapshot_id = ${cursor}
+        SELECT predecessor_snapshot_id
+        FROM oracle_projection_snapshots WHERE snapshot_id = ${cursor}
       `;
       const predecessor:
         | {
-            coverage_metadata: unknown;
-            previous_authoritative_snapshot_id: string | null;
+            predecessor_snapshot_id: string | null;
           }
         | undefined = rows[0];
       if (!predecessor) {
         throw new Error("Authoritative predecessor snapshot is missing");
       }
-      const predecessorCoverage = strictCoverage(predecessor.coverage_metadata);
-      if (
-        predecessorCoverage.mode !== "authoritative_complete" ||
-        predecessorCoverage.scopeId !== coverage.scopeId ||
-        predecessorCoverage.completeness.result !== "passed" ||
-        predecessorCoverage.previousAuthoritativeSnapshotId !==
-          predecessor.previous_authoritative_snapshot_id
-      ) {
-        throw new Error("Authoritative predecessor chain is inconsistent");
-      }
-      cursor = predecessor.previous_authoritative_snapshot_id;
+      cursor = predecessor.predecessor_snapshot_id;
     }
-    const lifecycleCounts = await sql<{ active: number; inactive: number }[]>`
-      SELECT
-        count(*) FILTER (WHERE lifecycle_status = 'active')::int AS active,
-        count(*) FILTER (WHERE lifecycle_status = 'inactive')::int AS inactive
-      FROM oracle_property_scope_state
-      WHERE scope_id = ${coverage.scopeId}
+    const materializations = await sql<
+      {
+        active_count: number;
+        content_sha256: string;
+        inactive_count: number;
+        materialization_id: string;
+        materialization_sha256: string;
+      }[]
+    >`
+      SELECT materialization.materialization_id,
+             materialization.materialization_sha256,
+             materialization.active_count, materialization.inactive_count,
+             snapshot.content_sha256
+      FROM oracle_projection_materializations materialization
+      JOIN oracle_projection_snapshots snapshot
+        ON snapshot.snapshot_id = materialization.snapshot_id
+      WHERE materialization.snapshot_id = ${run.snapshot_id}
+        AND materialization.sealed AND snapshot.sealed
     `;
+    const materialization = materializations[0];
+    if (!materialization) {
+      throw new Error("Authoritative publication has no sealed projection");
+    }
     const activeFolios = await sql<{ exact_folio: string }[]>`
-      SELECT property.exact_folio
-      FROM oracle_property_scope_state state
-      JOIN oracle_properties property USING (property_id)
-      WHERE state.scope_id = ${coverage.scopeId}
-        AND state.lifecycle_status = 'active'
-        AND state.last_reconciled_snapshot_id = ${run.snapshot_id}
-        AND property.is_active
-        AND property.lifecycle_scope_id = ${coverage.scopeId}
-      ORDER BY property.exact_folio
+      SELECT version.parcel_identifier AS exact_folio
+      FROM oracle_projection_materialized_properties membership
+      JOIN oracle_property_versions version
+        ON version.version_id = membership.property_version_id
+      WHERE membership.materialization_id = ${materialization.materialization_id}
+        AND membership.is_active
+      ORDER BY version.parcel_identifier
     `;
+    if (activeFolios.length !== materialization.active_count) {
+      throw new Error(
+        "Current projection materialization active count is inconsistent",
+      );
+    }
     if (
-      selectedRecordSha256(activeFolios.map((row) => row.exact_folio)) !==
+      coverage.mode === "authoritative_complete" &&
+      (selectedRecordSha256(activeFolios.map((row) => row.exact_folio)) !==
         coverage.selection.selectedRecordSha256 ||
-      activeFolios.length !== coverage.selection.selectionSize ||
-      activeFolios.length !== (lifecycleCounts[0]?.active ?? 0)
+        activeFolios.length !== coverage.selection.selectionSize)
     ) {
       throw new Error(
         "Authoritative active membership does not match the snapshot selection hash",
       );
     }
     return {
-      activeProperties: lifecycleCounts[0]?.active ?? 0,
+      activeProperties: materialization.active_count,
+      authoritativeBaseSnapshotId: head.authoritative_base_snapshot_id,
       authoritativeHeadSnapshotId: run.snapshot_id,
       coverage,
-      inactiveProperties: lifecycleCounts[0]?.inactive ?? 0,
+      inactiveProperties: materialization.inactive_count,
+      materializationId: materialization.materialization_id,
+      materializationSha256: materialization.materialization_sha256,
       predecessorChainSnapshotIds,
       run,
       selectedRecordSha256: coverage.selection.selectedRecordSha256,
       scopeId: coverage.scopeId,
       snapshot,
+      snapshotContentSha256: materialization.content_sha256,
     };
   }
 
   if (run.coverage_mode === "authoritative_complete") {
     throw new Error(
       "An authoritative-complete run must use authoritative export mode",
+    );
+  }
+  if (run.snapshot_id !== null) {
+    throw new Error(
+      "Bounded v1.2 snapshot publication is unsupported; publish only an exact sealed current projection derived from an authoritative base",
     );
   }
   const membership = await sql<{ exact_folio: string; is_active: boolean }[]>`
@@ -623,14 +882,18 @@ async function resolveExportScope(
     ]);
   return {
     activeProperties: membership.filter((row) => row.is_active).length,
+    authoritativeBaseSnapshotId: null,
     authoritativeHeadSnapshotId: null,
     coverage,
     inactiveProperties: membership.filter((row) => !row.is_active).length,
+    materializationId: null,
+    materializationSha256: null,
     predecessorChainSnapshotIds: [],
     run,
     selectedRecordSha256: selectionHash,
     scopeId,
     snapshot,
+    snapshotContentSha256: null,
   };
 }
 
@@ -649,10 +912,21 @@ async function publicationInventory(
         artifacts.push({
           byteSize: (await stat(entryPath)).size,
           domain: "open_data",
+          expectedCid: await calculateIpfsCid(await readFile(entryPath)),
           objectKey: path
             .relative(openDataRoot, entryPath)
             .split(path.sep)
             .join("/"),
+          role:
+            entry.name === "index.json"
+              ? "root"
+              : entryPath.includes(`${path.sep}properties${path.sep}`)
+                ? "property"
+                : entryPath.includes(`${path.sep}shards${path.sep}`)
+                  ? "shard"
+                  : entry.name === "manifest.json"
+                    ? "manifest"
+                    : "metadata",
           sha256: await fileSha256(entryPath),
         });
       }
@@ -662,7 +936,9 @@ async function publicationInventory(
   artifacts.push({
     byteSize: (await stat(parquetPath)).size,
     domain: "query_table",
+    expectedCid: await calculateIpfsCid(await readFile(parquetPath)),
     objectKey: "query-tables/pasco/query-table.parquet",
+    role: "query_table",
     sha256: await fileSha256(parquetPath),
   });
   return artifacts.sort((left, right) =>
@@ -681,7 +957,10 @@ export async function buildPublicationDryRun(
     "publish",
     "pasco",
   );
-  const outputRoot = path.join(publishBase, `dry-run-${options.runId}`);
+  let outputRoot = path.join(
+    publishBase,
+    `.build-${options.runId}-${process.pid}-${randomUUID()}`,
+  );
   if (!outputRoot.startsWith(`${publishBase}${path.sep}`)) {
     throw new Error("Publication output escaped the Pasco publish directory");
   }
@@ -693,7 +972,162 @@ export async function buildPublicationDryRun(
     await mkdir(outputRoot, { recursive: true });
     const asOf = iso(run.as_of);
     const loadedAt = iso(run.completed_at);
-    const properties = await sql<ExportPropertyRow[]>`
+    let projectionOwnerRows: ExportOwnerRow[] | null = null;
+    let projectionAvailabilityComplete = false;
+    let properties: ExportPropertyRow[];
+    if (scope.materializationId) {
+      const coreRows = await sql<
+        {
+          parcel_identifier: string;
+          payload: unknown;
+          property_id: string;
+          source_record_sha256: string;
+        }[]
+      >`
+        SELECT membership.property_id, version.parcel_identifier,
+               version.payload, version.source_record_sha256
+        FROM oracle_projection_materialized_properties membership
+        JOIN oracle_property_versions version
+          ON version.version_id = membership.property_version_id
+        WHERE membership.materialization_id = ${scope.materializationId}
+          AND membership.is_active
+        ORDER BY version.parcel_identifier, membership.property_id
+      `;
+      const factRows = await sql<
+        {
+          fact_type: string;
+          natural_key: string;
+          payload: unknown;
+          property_id: string;
+          source_record_sha256: string;
+        }[]
+      >`
+        SELECT membership.property_id, membership.fact_type,
+               membership.natural_key, version.payload,
+               version.source_record_sha256
+        FROM oracle_projection_materialized_facts membership
+        JOIN oracle_child_fact_versions version
+          ON version.version_id = membership.fact_version_id
+        WHERE membership.materialization_id = ${scope.materializationId}
+        ORDER BY membership.property_id, membership.fact_type,
+                 membership.natural_key
+      `;
+      type ProjectionFactRow = (typeof factRows)[number];
+      const factsByProperty = new Map<string, ProjectionFactRow[]>();
+      for (const fact of factRows) {
+        const facts = factsByProperty.get(fact.property_id) ?? [];
+        facts.push(fact);
+        factsByProperty.set(fact.property_id, facts);
+      }
+      const owners: ExportOwnerRow[] = [];
+      properties = coreRows.map((row) => {
+        const payload = row.payload as {
+          acres: number | null;
+          exactFolio: string;
+          heatedSquareFeet: number | null;
+          parcel: {
+            propertyUseCode: string | null;
+            propertyUseDescription: string | null;
+            totalSquareFeet: number | null;
+          };
+          siteAddress: {
+            city: string | null;
+            siteAddress: string;
+            zipCode: string | null;
+          } | null;
+          totalSquareFeet: number | null;
+          yearBuilt: number;
+        };
+        const facts = factsByProperty.get(row.property_id) ?? [];
+        const coordinate = facts.find(
+          (fact) => fact.fact_type === "coordinate",
+        );
+        const roof = facts.find((fact) => fact.fact_type === "roof_signal");
+        const building = facts.find((fact) => fact.fact_type === "building");
+        for (const fact of facts.filter(
+          (candidate) => candidate.fact_type === "ownership",
+        )) {
+          const owner = fact.payload as {
+            mailingAddress1: string | null;
+            mailingAddress2: string | null;
+            mailingCity: string | null;
+            mailingCountry: string | null;
+            mailingState: string | null;
+            mailingZip: string | null;
+            ownerName1: string | null;
+            ownerName2: string | null;
+          };
+          owners.push({
+            mailing_address_1: owner.mailingAddress1,
+            mailing_address_2: owner.mailingAddress2,
+            mailing_city: owner.mailingCity,
+            mailing_country: owner.mailingCountry,
+            mailing_state: owner.mailingState,
+            mailing_zip: owner.mailingZip,
+            owner_name_1: owner.ownerName1,
+            owner_name_2: owner.ownerName2,
+            property_id: row.property_id,
+          });
+        }
+        const coordinatePayload = coordinate?.payload as
+          | {
+              latitude: number;
+              longitude: number;
+              sourceLastUpdate: string | null;
+            }
+          | undefined;
+        const roofPayload = roof?.payload as
+          { ageYears: number; basis: string; basisQuality: string } | undefined;
+        const buildingPayload = building?.payload as
+          | {
+              actualYearBuilt: number | null;
+              roofCover: string | null;
+              roofStructure: string | null;
+            }
+          | undefined;
+        return {
+          acres: payload.acres,
+          actual_year_built: buildingPayload?.actualYearBuilt ?? null,
+          coordinate_hash: coordinate?.source_record_sha256 ?? null,
+          coordinate_source_last_update:
+            coordinatePayload?.sourceLastUpdate ?? null,
+          exact_folio: row.parcel_identifier,
+          heated_square_feet: payload.heatedSquareFeet,
+          latitude: coordinatePayload?.latitude ?? null,
+          longitude: coordinatePayload?.longitude ?? null,
+          parcel_id: parcelId(row.parcel_identifier),
+          property_id: row.property_id,
+          property_use_code: payload.parcel.propertyUseCode,
+          property_use_description: payload.parcel.propertyUseDescription,
+          roof_age_years: roofPayload?.ageYears ?? 0,
+          roof_basis: roofPayload?.basis ?? "year_built_proxy",
+          roof_basis_quality: roofPayload?.basisQuality ?? "proxy",
+          roof_cover: buildingPayload?.roofCover ?? null,
+          roof_structure: buildingPayload?.roofStructure ?? null,
+          site_address: payload.siteAddress?.siteAddress ?? "",
+          site_city: payload.siteAddress?.city ?? "",
+          site_zip: payload.siteAddress?.zipCode ?? null,
+          source_record_hash: row.source_record_sha256,
+          total_square_feet: payload.totalSquareFeet,
+          year_built: payload.yearBuilt,
+        };
+      });
+      projectionOwnerRows = owners;
+      projectionAvailabilityComplete = coreRows.every((row) => {
+        const unavailable = (factsByProperty.get(row.property_id) ?? [])
+          .filter((fact) => fact.fact_type === "availability")
+          .map((fact) => fact.natural_key);
+        return [
+          "bbb",
+          "contractors",
+          "emails",
+          "permits",
+          "phones",
+          "sunbiz",
+        ].every((feature) => unavailable.includes(feature));
+      });
+    } else {
+      properties = await sql<ExportPropertyRow[]>`
       SELECT
         p.property_id,
         p.parcel_id,
@@ -751,7 +1185,8 @@ export async function buildPublicationDryRun(
           )
         )
       ORDER BY p.property_id
-    `;
+      `;
+    }
     if (properties.length !== scope.activeProperties) {
       throw new Error(
         `Publication active scope contains ${properties.length} properties, expected ${scope.activeProperties}`,
@@ -767,7 +1202,9 @@ export async function buildPublicationDryRun(
       );
     }
     const propertyIds = properties.map((row) => row.property_id);
-    const ownerRows = await sql<ExportOwnerRow[]>`
+    const ownerRows =
+      projectionOwnerRows ??
+      (await sql<ExportOwnerRow[]>`
       SELECT property_id, owner_name_1, owner_name_2,
              mailing_address_1, mailing_address_2, mailing_city,
              mailing_state, mailing_zip, mailing_country
@@ -775,7 +1212,7 @@ export async function buildPublicationDryRun(
       WHERE property_id = ANY(${propertyIds})
         AND last_seen_run_id = ${run.run_id}
       ORDER BY property_id, ownership_id
-    `;
+    `);
     const ownersByProperty = new Map<string, ExportOwnerRow[]>();
     for (const owner of ownerRows) {
       const rows = ownersByProperty.get(owner.property_id) ?? [];
@@ -790,7 +1227,9 @@ export async function buildPublicationDryRun(
       WHERE run_id = ${options.runId}
       ORDER BY source_system, local_uri
     `;
-    const availabilityCounts = await sql<{ count: number; feature: string }[]>`
+    const availabilityCounts = scope.materializationId
+      ? []
+      : await sql<{ count: number; feature: string }[]>`
       SELECT feature, count(DISTINCT property_id)::int AS count
       FROM oracle_property_availability
       WHERE property_id = ANY(${propertyIds})
@@ -809,6 +1248,7 @@ export async function buildPublicationDryRun(
       availabilityCounts.map((row) => [row.feature, row.count]),
     );
     if (
+      !projectionAvailabilityComplete &&
       requiredUnavailableFeatures.some(
         (feature) => availabilityByFeature.get(feature) !== properties.length,
       )
@@ -817,9 +1257,9 @@ export async function buildPublicationDryRun(
         "Publication scope lacks current explicit source-availability facts",
       );
     }
-    const permitCoverage = await sql<
-      { contractors: number; permits: number }[]
-    >`
+    const permitCoverage = scope.materializationId
+      ? [{ contractors: 0, permits: 0 }]
+      : await sql<{ contractors: number; permits: number }[]>`
       SELECT
         count(DISTINCT permit.permit_id)::int AS permits,
         count(DISTINCT link.contractor_id)::int AS contractors
@@ -891,6 +1331,7 @@ export async function buildPublicationDryRun(
 
     const openDataRoot = path.join(outputRoot, "open-data");
     const entries: ManifestEntry[] = [];
+    const graphInputs: GraphPropertyInput[] = [];
     const queryRows: Record<string, unknown>[] = [];
     for (const property of properties) {
       const appraiserEvidenceId = deterministicId("evidence", [
@@ -1031,28 +1472,78 @@ export async function buildPublicationDryRun(
           `Canonical property validation failed at ${JSON.stringify(validateProperty.errors?.map((error: ErrorObject) => error.instancePath))}`,
         );
       }
-      const propertyBody = `${JSON.stringify(canonicalProperty)}\n`;
-      const objectKey = `properties/${property.property_id.slice(-2)}/${property.property_id}.json`;
+      const propertyBody = publicationCanonicalJson(canonicalProperty);
+      const objectKey = `properties/${property.property_id}.json`;
       const propertyPath = path.join(openDataRoot, objectKey);
       await atomicWrite(propertyPath, propertyBody);
       const propertyHash = sha256(propertyBody);
+      const propertyCid = await calculateIpfsCid(propertyBody);
       entries.push({
         bytes: Buffer.byteLength(propertyBody),
+        cid: propertyCid,
         objectKey,
+        parcelIdentifier: property.exact_folio,
         propertyId: property.property_id,
         sha256: propertyHash,
       });
+      graphInputs.push({
+        parcelIdentifier: property.exact_folio,
+        propertyId: property.property_id,
+        value: canonicalProperty,
+      });
       const primaryOwner = owners[0];
+      const ownerNames = owners
+        .flatMap((owner) => [owner.owner_name_1, owner.owner_name_2])
+        .filter(
+          (value): value is string =>
+            typeof value === "string" && value.trim().length > 0,
+        );
       queryRows.push({
         property_id: property.property_id,
+        property_cid: propertyCid,
+        request_identifier: property.exact_folio,
+        parcel_identifier: property.exact_folio,
+        source_system: "pasco_appraiser",
+        county_name: "Pasco",
+        state_code: "FL",
+        address_street: property.site_address || null,
+        address_city: property.site_city || null,
+        address_zip: property.site_zip,
+        latitude: property.latitude,
+        longitude: property.longitude,
+        lot_size_acre: property.acres,
+        lot_area_sqft: null,
+        exterior_wall_material: null,
+        roof_covering_material: property.roof_cover,
+        property_type: property.property_use_description,
+        property_usage_type:
+          property.property_use_description ?? property.property_use_code,
+        built_year: property.year_built,
+        livable_floor_area: property.heated_square_feet,
+        total_area: property.total_square_feet,
+        assessed_value: null,
+        market_value: null,
+        land_value: null,
+        avm_value: null,
+        owner_name: primaryOwner?.owner_name_1 ?? null,
+        owners_text: ownerNames.length > 0 ? ownerNames.join(" | ") : null,
+        owner_count: ownerNames.length > 0 ? owners.length : null,
+        owner_occupied: null,
+        last_sale_date: null,
+        last_sale_price: null,
+        subdivision: null,
+        has_permits: null,
+        permit_count: null,
+        has_sunbiz_tenant: null,
+        has_bbb_contractor: null,
+        hoa_flag: null,
+
         parcel_id: property.parcel_id,
         county: "pasco",
         exact_folio: property.exact_folio,
         site_address: property.site_address,
         site_city: property.site_city,
         site_zip: property.site_zip,
-        latitude: property.latitude,
-        longitude: property.longitude,
         property_use_code: property.property_use_code,
         property_use_description: property.property_use_description,
         acres: property.acres,
@@ -1073,7 +1564,6 @@ export async function buildPublicationDryRun(
         mailing_zip: primaryOwner?.mailing_zip ?? null,
         ...unavailablePublicationFields(),
         property_document_sha256: propertyHash,
-        property_cid: null,
         source_record_hash: property.source_record_hash,
         coverage_mode: run.coverage_mode,
         coverage_scope_id: scope.scopeId,
@@ -1086,24 +1576,42 @@ export async function buildPublicationDryRun(
       });
     }
 
-    const shardRecords = [];
-    for (let index = 0; index < entries.length; index += PROPERTY_SHARD_SIZE) {
-      const shardEntries = entries.slice(index, index + PROPERTY_SHARD_SIZE);
-      const shardKey = `shards/shard-${String(index / PROPERTY_SHARD_SIZE).padStart(4, "0")}.json`;
-      const shardBody = `${JSON.stringify({
-        county: "pasco",
-        entries: shardEntries,
-        propertyCount: shardEntries.length,
-        version: CONTRACT_VERSION,
-      })}\n`;
-      await atomicWrite(path.join(openDataRoot, shardKey), shardBody);
-      shardRecords.push({
-        bytes: Buffer.byteLength(shardBody),
-        objectKey: shardKey,
-        propertyCount: shardEntries.length,
-        sha256: sha256(shardBody),
-      });
+    const graph = await buildPublicationGraph({
+      completedAt: loadedAt,
+      exportedAt: asOf,
+      fixturePropertyIds,
+      properties: graphInputs,
+    });
+    for (const object of graph.objects) {
+      await atomicWrite(path.join(openDataRoot, object.key), object.bytes);
     }
+    for (const entry of entries) {
+      if (graph.propertyCids.get(entry.propertyId) !== entry.cid) {
+        throw new Error(
+          "Property CID changed between leaf and graph construction",
+        );
+      }
+    }
+    queryRows.sort((left, right) => {
+      const leftKey = `${String(left.exact_folio)}\u0000${String(left.property_id)}`;
+      const rightKey = `${String(right.exact_folio)}\u0000${String(right.property_id)}`;
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
+    const graphObjectByKey = new Map(
+      graph.objects.map((object) => [object.key, object]),
+    );
+    const shardRecords = graph.shards.map((shard) => {
+      const objectKey = `shards/shard-${String(shard.shardIndex).padStart(4, "0")}.json`;
+      const object = graphObjectByKey.get(objectKey);
+      if (!object) throw new Error(`Missing graph object ${objectKey}`);
+      return {
+        bytes: object.byteSize,
+        expectedCid: object.cid,
+        objectKey,
+        propertyCount: shard.count,
+        sha256: object.sha256,
+      };
+    });
 
     const provenanceFiles = (sourceSystem: string) =>
       scope.snapshot
@@ -1239,20 +1747,11 @@ export async function buildPublicationDryRun(
         workflowId: run.workflow_id,
       })}\n`,
     );
-    await atomicWrite(
-      path.join(openDataRoot, "index.json"),
-      `${JSON.stringify({
-        county: "pasco",
-        coverage: "coverage.json",
-        coverageMode: run.coverage_mode,
-        manifest: "manifest.json",
-        permitIndex: "permit-index.json",
-        propertyCount: entries.length,
-        provenance: "provenance.json",
-        shards: shardRecords,
-        version: CONTRACT_VERSION,
-      })}\n`,
-    );
+    entries.sort((left, right) => {
+      const leftKey = `${left.parcelIdentifier}\u0000${left.propertyId}`;
+      const rightKey = `${right.parcelIdentifier}\u0000${right.propertyId}`;
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
     const manifest = {
       contractVersion: CONTRACT_VERSION,
       county: "pasco",
@@ -1263,6 +1762,7 @@ export async function buildPublicationDryRun(
       representation: "canonical-property-json-v1",
       scopeId: scope.scopeId,
       selectionHash: scope.selectedRecordSha256,
+      rootCid: graph.rootCid,
       shards: shardRecords,
       sourceRunId: run.run_id,
       sourceSnapshotId: run.snapshot_id,
@@ -1281,7 +1781,11 @@ export async function buildPublicationDryRun(
     const parquetPath = path.join(queryDir, "query-table.parquet");
     await writeParquet(parquetPath, ndjsonPath);
     await rm(ndjsonPath, { force: true });
-    const parquetValidation = await validateParquet(parquetPath);
+    const parquetValidation = await validateParquet(
+      parquetPath,
+      graph.propertyCids,
+    );
+    await validateElephantQueryTableCompatibility(parquetPath);
     if (
       parquetValidation.rows !== entries.length ||
       parquetValidation.distinctIds !== entries.length ||
@@ -1340,6 +1844,7 @@ export async function buildPublicationDryRun(
       }
       return {
         byteSize: artifact.byteSize,
+        expectedCid: artifact.expectedCid,
         objectKey: artifact.objectKey,
         sha256: artifact.sha256,
       };
@@ -1347,8 +1852,28 @@ export async function buildPublicationDryRun(
     const targets = options.targets ?? localIncompletePascoTargets();
     const missingConfiguration = publicationConfigurationMissing(targets);
     const generatedAt = options.generatedAt ?? loadedAt;
+    const authoritativeBaseSnapshotId = scope.authoritativeBaseSnapshotId;
+    const coverageEligible =
+      run.coverage_mode === "authoritative_complete" ||
+      (run.coverage_mode === "partial" && authoritativeBaseSnapshotId !== null);
+    const materializationSha256 =
+      scope.materializationSha256 ??
+      canonicalJsonSha256({
+        coverageMode: run.coverage_mode,
+        runId: run.run_id,
+        scopeId: scope.scopeId,
+        selectedRecordSha256: scope.selectedRecordSha256,
+        snapshotId: run.snapshot_id,
+      });
+    const materializationId =
+      scope.materializationId ??
+      deterministicId("materialization", [
+        "1.0.0",
+        "publication-materialization",
+        materializationSha256,
+      ]);
     const plan: PublicationPlan = createPublicationPlan({
-      approvable: missingConfiguration.length === 0,
+      approvable: missingConfiguration.length === 0 && coverageEligible,
       artifacts: {
         coverage: binding("open_data", "coverage.json"),
         manifest: binding("open_data", "manifest.json"),
@@ -1363,6 +1888,7 @@ export async function buildPublicationDryRun(
         provenance: binding("open_data", "provenance.json"),
         shards: shardRecords.map((shard) => ({
           byteSize: shard.bytes,
+          expectedCid: shard.expectedCid,
           objectKey: shard.objectKey,
           propertyCount: shard.propertyCount,
           sha256: shard.sha256,
@@ -1416,7 +1942,7 @@ export async function buildPublicationDryRun(
         sourceSnapshotManifestSha256: scope.snapshot?.manifest_sha256 ?? null,
         workflowId: run.workflow_id,
       },
-      executable: missingConfiguration.length === 0,
+      executable: missingConfiguration.length === 0 && coverageEligible,
       exportMode: options.exportMode,
       fixtureExclusion: {
         fixturePropertyIdCount: fixturePropertyIds.size,
@@ -1429,6 +1955,29 @@ export async function buildPublicationDryRun(
         observedAt,
       },
       generatedAt,
+      graph: {
+        cidProfile: { ...IPFS_CID_PROFILE },
+        edges: graph.edges,
+        openDataRoot: {
+          expectedCid: graph.rootCid,
+          objectKey: "index.json",
+        },
+        parquetProfile: {
+          compression: "ZSTD",
+          duckdbVersion: "@duckdb/node-api@1.5.5-r.4",
+          rowGroupSize: 10_000,
+          schemaSha256,
+        },
+        propertyCidCount: graph.propertyCids.size,
+        queryTableRoot: {
+          expectedCid: binding(
+            "query_table",
+            "query-tables/pasco/query-table.parquet",
+          ).expectedCid,
+          objectKey: "query-tables/pasco/query-table.parquet",
+        },
+        traversalValidated: true,
+      },
       limitations: [
         run.coverage_mode === "sample"
           ? "Deterministic bounded appraisal/GIS sample; not complete Pasco coverage."
@@ -1440,7 +1989,9 @@ export async function buildPublicationDryRun(
               "Historical sample predates snapshot-bound ingestion; sourceSnapshotId remains explicitly null while exact run and selection identity are bound.",
             ]
           : []),
-        "Related fact tables are not temporally versioned; only current normalized facts last seen in the selected active run are exported.",
+        scope.materializationId
+          ? "Core and child facts are bound to one sealed immutable projection materialization."
+          : "Historical sample related facts predate immutable projection versioning; only current normalized facts last seen in the exact selected run are exported.",
         "Permit and contractor sources are unavailable; null aggregates do not mean zero real records.",
         "Sunbiz and BBB were not collected.",
         "No Filebase, IPFS, or IPNS effect was performed.",
@@ -1451,18 +2002,69 @@ export async function buildPublicationDryRun(
         queryTableIpnsMutationPerformed: false,
         queryTablePublishedCid: null,
       },
+      projection: {
+        authoritativeBaseSnapshotId,
+        materializationId,
+        materializationSha256,
+        snapshotContentSha256: scope.snapshotContentSha256,
+      },
       targets: {
         openData: targets.openData,
         queryTable: targets.queryTable,
       },
-      temporalFactLimitation:
-        "Related fact tables lack lifecycle history; current run-matched facts are exported only for active selected properties.",
-      version: "1.0.0",
+      temporalFactLimitation: scope.materializationId
+        ? "Every exported core and child fact is selected from one sealed projection materialization."
+        : "Historical sample facts predate lifecycle versioning; current run-matched facts are exported only for active selected properties.",
+      version: "1.1.0",
     });
     await atomicWrite(
       path.join(outputRoot, "publication-dry-run-plan.json"),
       `${canonicalJson(plan)}\n`,
     );
+
+    // Avoid promoting a contender that is already known to be ineligible.
+    // The insertion guard remains authoritative for any state change after
+    // this short locked preflight.
+    await preflightPublicationPlan(options.databaseUrl, plan);
+
+    const completedRoot = path.join(publishBase, "plans", plan.planId);
+    await mkdir(path.dirname(completedRoot), { recursive: true });
+    try {
+      await rename(outputRoot, completedRoot);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
+      const winnerPlan = await readFile(
+        path.join(completedRoot, "publication-dry-run-plan.json"),
+        "utf8",
+      );
+      if (winnerPlan !== `${canonicalJson(plan)}\n`) {
+        throw new Error(
+          "Concurrent publication finalization produced a different immutable plan",
+          { cause: error },
+        );
+      }
+      for (const artifact of plan.artifacts.objectInventory) {
+        const root =
+          artifact.domain === "open_data"
+            ? path.join(completedRoot, "open-data")
+            : path.join(completedRoot, "query");
+        const winner = path.join(root, artifact.objectKey);
+        const winnerBytes = await readFile(winner);
+        if (
+          winnerBytes.byteLength !== artifact.byteSize ||
+          sha256(winnerBytes) !== artifact.sha256 ||
+          (await calculateIpfsCid(winnerBytes)) !== artifact.expectedCid
+        ) {
+          throw new Error(
+            `Concurrent publication winner failed immutable verification (${artifact.domain}:${artifact.objectKey})`,
+            { cause: error },
+          );
+        }
+      }
+      await rm(outputRoot, { force: true, recursive: true });
+    }
+    outputRoot = completedRoot;
 
     const finalMetrics = await directoryMetrics(outputRoot);
     const dryRunId = deterministicId("dryrun", [
@@ -1473,10 +2075,13 @@ export async function buildPublicationDryRun(
       queryTableSha256,
       plan.planSha256,
     ]);
-    const publicationState = await recordPublicationPlan(
-      options.databaseUrl,
-      plan,
-    );
+    // A deterministic final directory is immutable and adoptable after its
+    // complete inventory verifies. A later database failure must never delete
+    // a directory another builder may already have adopted. Only the uniquely
+    // owned .build-* contender is eligible for cleanup in finally.
+    const publicationState = await (
+      options.publicationPlanRecorder ?? recordPublicationPlan
+    )(options.databaseUrl, plan);
     const summary: DryRunSummary = {
       activeProperties: scope.activeProperties,
       coverageMode: run.coverage_mode,
@@ -1526,6 +2131,9 @@ export async function buildPublicationDryRun(
     `;
     return summary;
   } finally {
+    if (path.basename(outputRoot).startsWith(".build-")) {
+      await rm(outputRoot, { force: true, recursive: true });
+    }
     await sql.end({ timeout: 5 });
   }
 }

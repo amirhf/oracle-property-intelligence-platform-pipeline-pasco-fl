@@ -3,14 +3,19 @@ import type postgres from "postgres";
 import type { PilotRunSummary } from "../domain/types.js";
 import { canonicalJsonSha256 } from "../lib/canonical-json.js";
 import { DurableConflictError } from "../lib/durability-errors.js";
-import { sha256 } from "../lib/hash.js";
 import type {
   PreparedInputManifest,
   PreparedInputReference,
   SourceSnapshotManifest,
 } from "../snapshot/model.js";
+import {
+  acquirePascoProjectionHeadFence,
+  pascoProjectionHeadFenceKey,
+} from "./projection-head-fence.js";
 
 export interface LoaderDurabilityContext {
+  /** Test-only coordination after the shared projection fence is acquired. */
+  afterProjectionFenceAcquired?: () => Promise<void>;
   idempotencyKey: string;
   preparedManifest: PreparedInputManifest;
   preparedReference: PreparedInputReference;
@@ -19,19 +24,10 @@ export interface LoaderDurabilityContext {
   snapshot: SourceSnapshotManifest;
 }
 
-// The two-key PostgreSQL advisory-lock namespace is versioned and stable:
-// signedInt32(SHA-256("prism-oracle-loader-v1")[0..4]),
-// signedInt32(SHA-256("pasco")[0..4]).
-// Current tuple: (-1827269144, -1784306027).
+// Backward-compatible export for callers/tests. Loader and publication now use
+// the same county projection-head fence.
 export function pascoLoaderAdvisoryLockKey(): readonly [number, number] {
-  const signedInt32 = (hex: string) => {
-    const value = Number.parseInt(hex.slice(0, 8), 16);
-    return value > 0x7fffffff ? value - 0x1_0000_0000 : value;
-  };
-  return [
-    signedInt32(sha256("prism-oracle-loader-v1")),
-    signedInt32(sha256("pasco")),
-  ] as const;
+  return pascoProjectionHeadFenceKey();
 }
 
 function conflict(label: string, id: string): never {
@@ -42,8 +38,8 @@ export async function beginLoaderEffect(
   transaction: postgres.TransactionSql,
   context: LoaderDurabilityContext,
 ): Promise<PilotRunSummary | null> {
-  const [namespaceKey, countyKey] = pascoLoaderAdvisoryLockKey();
-  await transaction`SELECT pg_advisory_xact_lock(${namespaceKey}, ${countyKey})`;
+  await acquirePascoProjectionHeadFence(transaction);
+  await context.afterProjectionFenceAcquired?.();
 
   const snapshot = context.snapshot;
   const prepared = context.preparedManifest;

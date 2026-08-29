@@ -8,7 +8,6 @@ import { DuckDBInstance } from "@duckdb/node-api";
 import postgres from "postgres";
 
 import { loadConfig } from "../services/lib/config.js";
-import { deterministicId } from "../src/lib/hash.js";
 import { validatePublicationPlan } from "../src/publication/plan.js";
 
 function sha256(bytes: Buffer): string {
@@ -27,18 +26,28 @@ function collectPropertyIds(value: unknown, result: Set<string>): void {
 }
 
 const config = loadConfig();
-const runId = deterministicId("run", [
-  "1.0.0",
-  "pipeline-run",
-  "pasco",
-  "pasco-scale-25000-v1-repeat",
-]);
+const stateSql = postgres(config.databaseUrl, { max: 1 });
+let currentPlanId: string | undefined;
+try {
+  const currentStates = await stateSql<{ plan_id: string }[]>`
+    SELECT plan_id
+    FROM oracle_publication_state
+    WHERE county = 'pasco'
+  `;
+  currentPlanId = currentStates[0]?.plan_id;
+} finally {
+  await stateSql.end({ timeout: 5 });
+}
+if (!currentPlanId) {
+  throw new Error("Pasco has no current publication plan");
+}
 const root = path.join(
   config.dataDir,
   "artifacts",
   "publish",
   "pasco",
-  `dry-run-${runId}`,
+  "plans",
+  currentPlanId,
 );
 const manifestPath = path.join(root, "open-data", "manifest.json");
 const parquetPath = path.join(

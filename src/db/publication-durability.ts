@@ -1,5 +1,5 @@
 import { createReadStream } from "node:fs";
-import { realpath, stat } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
 import postgres from "postgres";
@@ -16,6 +16,8 @@ import {
   type PublicationArtifact,
   type PublicationPlan,
 } from "../publication/plan.js";
+import { calculateIpfsCid } from "../publication/ipfs-cid.js";
+import { acquirePascoProjectionHeadFence } from "./projection-head-fence.js";
 
 export const PUBLICATION_STATES = [
   "prepared",
@@ -25,6 +27,7 @@ export const PUBLICATION_STATES = [
   "approved",
   "executing",
   "completed",
+  "manual_intervention_required",
   "failed_terminal",
 ] as const;
 
@@ -62,6 +65,19 @@ interface PublicationStateRow {
   plan_sha256: string;
   revision: number;
   state: PublicationState;
+}
+
+interface ProjectionApprovalBinding {
+  authoritativeBaseSnapshotId: string;
+  headRevision: number;
+  materializationId: string;
+  materializationSha256: string;
+  scopeId: string;
+  snapshotId: string;
+}
+
+interface ProjectionFenceHooks {
+  afterProjectionFenceAcquired?: () => Promise<void>;
 }
 
 function terminalConflict(message: string): never {
@@ -188,6 +204,109 @@ async function loadStoredPlan(
   return plan;
 }
 
+async function assertPublicationProjectionFresh(
+  transaction: postgres.TransactionSql,
+  planId: string,
+  planSha256: string,
+): Promise<void> {
+  await transaction`
+    SELECT oracle_assert_publication_projection_fresh(${planId}, ${planSha256})
+  `;
+}
+
+async function validatedProjectionBinding(
+  transaction: postgres.TransactionSql,
+  plan: PublicationPlan,
+): Promise<ProjectionApprovalBinding> {
+  await assertPublicationProjectionFresh(
+    transaction,
+    plan.planId,
+    plan.planSha256,
+  );
+  const rows = await transaction<
+    {
+      authoritative_base_snapshot_id: string;
+      current_snapshot_id: string;
+      materialization_id: string;
+      materialization_sha256: string;
+      revision: number;
+      scope_id: string;
+    }[]
+  >`
+    SELECT head.scope_id, head.current_snapshot_id,
+           head.authoritative_base_snapshot_id, head.revision,
+           materialization.materialization_id,
+           materialization.materialization_sha256
+    FROM oracle_projection_heads head
+    JOIN oracle_projection_materializations materialization
+      ON materialization.snapshot_id = head.current_snapshot_id
+    WHERE head.scope_id = ${plan.coverage.scopeId}
+      AND head.current_snapshot_id = ${plan.coverage.sourceSnapshotId}
+      AND head.authoritative_base_snapshot_id =
+          ${plan.projection.authoritativeBaseSnapshotId}
+      AND materialization.materialization_id =
+          ${plan.projection.materializationId}
+      AND materialization.materialization_sha256 =
+          ${plan.projection.materializationSha256}
+      AND materialization.sealed
+  `;
+  const row = rows[0];
+  if (
+    !row ||
+    row.authoritative_base_snapshot_id === null ||
+    plan.coverage.sourceSnapshotId === null
+  ) {
+    terminalConflict("publication projection binding is stale");
+  }
+  return {
+    authoritativeBaseSnapshotId: row.authoritative_base_snapshot_id,
+    headRevision: row.revision,
+    materializationId: row.materialization_id,
+    materializationSha256: row.materialization_sha256,
+    scopeId: row.scope_id,
+    snapshotId: row.current_snapshot_id,
+  };
+}
+
+async function assertApprovalBindingCurrent(
+  transaction: postgres.TransactionSql,
+  plan: PublicationPlan,
+): Promise<ProjectionApprovalBinding> {
+  const binding = await validatedProjectionBinding(transaction, plan);
+  const approvals = await transaction<
+    {
+      validated_authoritative_base_snapshot_id: string;
+      validated_head_revision: number;
+      validated_materialization_id: string;
+      validated_materialization_sha256: string;
+      validated_scope_id: string;
+      validated_snapshot_id: string;
+    }[]
+  >`
+    SELECT validated_scope_id, validated_snapshot_id,
+           validated_authoritative_base_snapshot_id,
+           validated_materialization_id, validated_materialization_sha256,
+           validated_head_revision
+    FROM oracle_publication_approvals
+    WHERE plan_id = ${plan.planId} AND plan_sha256 = ${plan.planSha256}
+  `;
+  const approval = approvals[0];
+  if (
+    !approval ||
+    approval.validated_scope_id !== binding.scopeId ||
+    approval.validated_snapshot_id !== binding.snapshotId ||
+    approval.validated_authoritative_base_snapshot_id !==
+      binding.authoritativeBaseSnapshotId ||
+    approval.validated_materialization_id !== binding.materializationId ||
+    approval.validated_materialization_sha256 !==
+      binding.materializationSha256 ||
+    approval.validated_head_revision !== binding.headRevision
+  ) {
+    terminalConflict("approval projection binding is stale");
+  }
+  return binding;
+}
+
 export async function recordPublicationPlan(
   databaseUrl: string,
   value: unknown,
@@ -224,12 +343,50 @@ export async function recordPublicationPlan(
 
       for (const artifact of plan.artifacts.objectInventory) {
         await transaction`
-          INSERT INTO oracle_publication_object_effects (
-            plan_id, domain, object_key, expected_sha256,
-            expected_byte_size, status
+          INSERT INTO oracle_publication_graph_objects (
+            plan_id, domain, object_key, object_role, expected_sha256,
+            expected_byte_size, expected_cid
           ) VALUES (
             ${plan.planId}, ${artifact.domain}, ${artifact.objectKey},
-            ${artifact.sha256}, ${artifact.byteSize}, 'pending'
+            ${artifact.role}, ${artifact.sha256}, ${artifact.byteSize},
+            ${artifact.expectedCid}
+          ) ON CONFLICT (plan_id, domain, object_key) DO NOTHING
+        `;
+      }
+      for (const edge of plan.graph.edges) {
+        await transaction`
+          INSERT INTO oracle_publication_graph_edges (
+            plan_id, parent_domain, parent_key, child_domain, child_key,
+            child_cid, json_pointer
+          ) VALUES (
+            ${plan.planId}, 'open_data', ${edge.parentKey}, 'open_data',
+            ${edge.childKey}, ${edge.childCid}, ${edge.jsonPointer}
+          ) ON CONFLICT (plan_id, parent_key, json_pointer) DO NOTHING
+        `;
+      }
+      for (const root of [
+        { domain: "open_data", ...plan.graph.openDataRoot },
+        { domain: "query_table", ...plan.graph.queryTableRoot },
+      ] as const) {
+        await transaction`
+          INSERT INTO oracle_publication_graph_roots (
+            plan_id, domain, object_key, expected_cid
+          ) VALUES (
+            ${plan.planId}, ${root.domain}, ${root.objectKey},
+            ${root.expectedCid}
+          ) ON CONFLICT (plan_id, domain) DO NOTHING
+        `;
+      }
+
+      for (const artifact of plan.artifacts.objectInventory) {
+        await transaction`
+          INSERT INTO oracle_publication_object_effects (
+            plan_id, domain, object_key, expected_sha256,
+            expected_byte_size, expected_cid, graph_object_key, status
+          ) VALUES (
+            ${plan.planId}, ${artifact.domain}, ${artifact.objectKey},
+            ${artifact.sha256}, ${artifact.byteSize}, ${artifact.expectedCid},
+            ${artifact.objectKey}, 'pending'
           )
           ON CONFLICT (plan_id, domain, object_key) DO NOTHING
         `;
@@ -238,11 +395,13 @@ export async function recordPublicationPlan(
         {
           domain: PublicationDomain;
           expected_byte_size: string | number;
+          expected_cid: string | null;
           expected_sha256: string;
           object_key: string;
         }[]
       >`
-        SELECT domain, object_key, expected_sha256, expected_byte_size
+        SELECT domain, object_key, expected_sha256, expected_byte_size,
+               expected_cid
         FROM oracle_publication_object_effects
         WHERE plan_id = ${plan.planId}
         ORDER BY domain, object_key
@@ -258,12 +417,14 @@ export async function recordPublicationPlan(
           domain: artifact.domain,
           objectKey: artifact.objectKey,
           sha256: artifact.sha256,
+          expectedCid: artifact.expectedCid,
         }));
       const actualObjects = storedObjects.map((artifact) => ({
         byteSize: Number(artifact.expected_byte_size),
         domain: artifact.domain,
         objectKey: artifact.object_key,
         sha256: artifact.expected_sha256,
+        expectedCid: artifact.expected_cid,
       }));
       if (canonicalJson(actualObjects) !== canonicalJson(expectedObjects)) {
         terminalConflict(`object inventory ${plan.planId}`);
@@ -327,6 +488,62 @@ export async function recordPublicationPlan(
   }
 }
 
+export async function preflightPublicationPlan(
+  databaseUrl: string,
+  value: unknown,
+): Promise<void> {
+  const plan = validatePublicationPlan(value);
+  const sql = postgres(databaseUrl, { max: 2 });
+  try {
+    await sql.begin(async (transaction) => {
+      await lockPublish(transaction);
+      const current = await transaction<
+        { plan_id: string; state: PublicationState }[]
+      >`
+        SELECT plan_id, state FROM oracle_publication_state
+        WHERE county = 'pasco' FOR UPDATE
+      `;
+      const state = current[0];
+      if (!state || state.plan_id === plan.planId) return;
+      if (
+        ["approved", "executing", "manual_intervention_required"].includes(
+          state.state,
+        )
+      ) {
+        terminalConflict(`replacement blocked while ${state.state}`);
+      }
+      const unresolved = await transaction<
+        { object_effects: number; unresolved_intents: number }[]
+      >`
+        SELECT
+          (SELECT count(*)::int
+           FROM oracle_publication_ipns_intents intent
+           JOIN oracle_publication_ipns_intent_state intent_state
+             USING (intent_id)
+           WHERE intent.publication_plan_id = ${state.plan_id}
+             AND intent_state.state NOT IN (
+               'verified', 'rollback_verified', 'cancelled_terminal',
+               'failed_terminal'
+             )) AS unresolved_intents,
+          (SELECT count(*)::int
+           FROM oracle_publication_object_effects
+           WHERE plan_id = ${state.plan_id} AND status != 'pending') AS object_effects
+      `;
+      if ((unresolved[0]?.unresolved_intents ?? 0) > 0) {
+        terminalConflict("replacement blocked by unresolved IPNS intent");
+      }
+      if (
+        (unresolved[0]?.object_effects ?? 0) > 0 &&
+        !["completed", "failed_terminal"].includes(state.state)
+      ) {
+        terminalConflict("replacement blocked by remote object effects");
+      }
+    });
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
+}
+
 export async function getPublicationState(
   databaseUrl: string,
 ): Promise<PublicationStateView | null> {
@@ -342,6 +559,7 @@ export async function getPublicationState(
 export async function approvePublicationPlan(
   databaseUrl: string,
   value: unknown,
+  hooks: ProjectionFenceHooks = {},
 ): Promise<PublicationStateView> {
   const request = parse(
     publicationApprovalRequestSchema,
@@ -360,6 +578,8 @@ export async function approvePublicationPlan(
   try {
     return await sql.begin(async (transaction) => {
       await lockPublish(transaction);
+      await acquirePascoProjectionHeadFence(transaction);
+      await hooks.afterProjectionFenceAcquired?.();
       const plan = await loadStoredPlan(
         transaction,
         request.planId,
@@ -370,6 +590,7 @@ export async function approvePublicationPlan(
           "Publication plan cannot be approved while configuration is incomplete",
         );
       }
+      const binding = await validatedProjectionBinding(transaction, plan);
       const current = (await stateRows(transaction))[0];
       if (
         !current ||
@@ -404,10 +625,16 @@ export async function approvePublicationPlan(
       await transaction`
         INSERT INTO oracle_publication_approvals (
           plan_id, approval_id, plan_sha256, request_sha256,
-          approver_reference
+          approver_reference, validated_scope_id, validated_snapshot_id,
+          validated_authoritative_base_snapshot_id,
+          validated_materialization_id, validated_materialization_sha256,
+          validated_head_revision
         ) VALUES (
           ${request.planId}, ${approvalId}, ${request.planSha256},
-          ${requestSha256}, ${request.approverReference}
+          ${requestSha256}, ${request.approverReference}, ${binding.scopeId},
+          ${binding.snapshotId}, ${binding.authoritativeBaseSnapshotId},
+          ${binding.materializationId}, ${binding.materializationSha256},
+          ${binding.headRevision}
         )
       `;
       await recordStateEvent(
@@ -480,11 +707,14 @@ export async function verifyPublicationPlanArtifacts(options: {
       );
     }
     const metadata = await stat(resolved);
+    const bytes = await readFile(resolved);
     const actualSha256 = await fileSha256(resolved);
+    const actualCid = await calculateIpfsCid(bytes);
     if (
       !metadata.isFile() ||
       metadata.size !== artifact.byteSize ||
-      actualSha256 !== artifact.sha256
+      actualSha256 !== artifact.sha256 ||
+      actualCid !== artifact.expectedCid
     ) {
       throw new DurableInputError(
         `Publication artifact binding changed (${artifact.domain}:${artifact.objectKey})`,
@@ -502,6 +732,7 @@ export async function beginPublicationExecution(options: {
   databaseUrl: string;
   publicationRootRelative: string;
   request: unknown;
+  testHooks?: ProjectionFenceHooks;
 }): Promise<PublicationStateView> {
   const request = parse(
     publicationExecutionRequestSchema,
@@ -529,6 +760,8 @@ export async function beginPublicationExecution(options: {
   try {
     return await sql.begin(async (transaction) => {
       await lockPublish(transaction);
+      await acquirePascoProjectionHeadFence(transaction);
+      await options.testHooks?.afterProjectionFenceAcquired?.();
       const lockedPlan = await loadStoredPlan(
         transaction,
         request.planId,
@@ -554,6 +787,7 @@ export async function beginPublicationExecution(options: {
           "Publication execution requires exact current-plan approval",
         );
       }
+      await assertApprovalBindingCurrent(transaction, lockedPlan);
       if (current.state === "executing") return stateView(current);
       if (current.state !== "approved") {
         throw new DurableInputError(
@@ -576,7 +810,7 @@ export async function beginPublicationExecution(options: {
 }
 
 const objectCheckpointSchema = publicationIdentitySchema.extend({
-  cid: z.string().min(8).max(500),
+  cid: z.string().regex(/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/),
   domain: z.enum(["open_data", "query_table"]),
   objectKey: z.string().min(1).max(2_048),
   sha256: sha256Schema,
@@ -596,6 +830,7 @@ async function checkpointObject(
   try {
     await sql.begin(async (transaction) => {
       await lockPublish(transaction);
+      await acquirePascoProjectionHeadFence(transaction);
       const current = (await stateRows(transaction))[0];
       if (
         !current ||
@@ -605,22 +840,34 @@ async function checkpointObject(
       ) {
         terminalConflict(`object checkpoint is not for the executing plan`);
       }
+      const plan = await loadStoredPlan(
+        transaction,
+        request.planId,
+        request.planSha256,
+      );
+      await assertApprovalBindingCurrent(transaction, plan);
       const rows = await transaction<
         {
           expected_sha256: string;
+          expected_cid: string | null;
           status: "pending" | "uploaded" | "verified";
           uploaded_cid: string | null;
           verified_cid: string | null;
         }[]
       >`
-        SELECT expected_sha256, status, uploaded_cid, verified_cid
+        SELECT expected_sha256, expected_cid, status, uploaded_cid,
+               verified_cid
         FROM oracle_publication_object_effects
         WHERE plan_id = ${request.planId} AND domain = ${request.domain}
           AND object_key = ${request.objectKey}
         FOR UPDATE
       `;
       const object = rows[0];
-      if (!object || object.expected_sha256 !== request.sha256) {
+      if (
+        !object ||
+        object.expected_sha256 !== request.sha256 ||
+        object.expected_cid !== request.cid
+      ) {
         terminalConflict(
           `object binding ${request.domain}:${request.objectKey}`,
         );
@@ -669,13 +916,6 @@ export const checkpointPublicationObjectVerified = (
   value: unknown,
 ) => checkpointObject(databaseUrl, value, "verified");
 
-const ipnsCheckpointSchema = publicationIdentitySchema.extend({
-  domain: z.enum(["open_data", "query_table"]),
-  networkKey: z.string().min(1).max(500),
-  priorCid: z.string().min(8).max(500).nullable(),
-  targetCid: z.string().min(8).max(500),
-});
-
 function rootObjectKey(domain: PublicationDomain): string {
   return domain === "open_data"
     ? "index.json"
@@ -693,161 +933,103 @@ export async function publicationIpnsUpdateReady(
     value,
     "Publish/pasco IPNS readiness request",
   );
-  const sql = postgres(databaseUrl, { max: 1 });
+  const sql = postgres(databaseUrl, { max: 2 });
   try {
-    const states = await sql<
-      { plan_id: string; plan_sha256: string; state: PublicationState }[]
-    >`
-      SELECT plan_id, plan_sha256, state FROM oracle_publication_state
-      WHERE county = 'pasco'
-    `;
-    if (
-      states[0]?.plan_id !== request.planId ||
-      states[0]?.plan_sha256 !== request.planSha256 ||
-      states[0]?.state !== "executing"
-    ) {
-      throw new DurableInputError(
-        "IPNS readiness requires the exact executing publication plan",
+    return await sql.begin(async (transaction) => {
+      await lockPublish(transaction);
+      await acquirePascoProjectionHeadFence(transaction);
+      const states = await transaction<
+        { plan_id: string; plan_sha256: string; state: PublicationState }[]
+      >`
+        SELECT plan_id, plan_sha256, state FROM oracle_publication_state
+        WHERE county = 'pasco'
+      `;
+      if (
+        states[0]?.plan_id !== request.planId ||
+        states[0]?.plan_sha256 !== request.planSha256 ||
+        states[0]?.state !== "executing"
+      ) {
+        throw new DurableInputError(
+          "IPNS readiness requires the exact executing publication plan",
+        );
+      }
+      const plan = await loadStoredPlan(
+        transaction,
+        request.planId,
+        request.planSha256,
       );
-    }
-    const rows = await sql<
-      { pending: number; root_cid: string | null; total: number }[]
-    >`
+      await assertApprovalBindingCurrent(transaction, plan);
+      const rows = await transaction<
+        {
+          intent_count: number;
+          pending: number;
+          root_cid: string | null;
+          total: number;
+        }[]
+      >`
       SELECT
         count(*)::int AS total,
         count(*) FILTER (WHERE status != 'verified')::int AS pending,
         max(verified_cid) FILTER (
           WHERE object_key = ${rootObjectKey(request.domain)}
-        ) AS root_cid
+            AND verified_cid = expected_cid
+        ) AS root_cid,
+        (
+          SELECT count(*)::int
+          FROM oracle_publication_ipns_intents intent
+          JOIN oracle_publication_ipns_intent_state intent_state
+            USING (intent_id)
+          WHERE intent.publication_plan_id = ${request.planId}
+            AND intent.publication_plan_sha256 = ${request.planSha256}
+            AND intent.domain = ${request.domain}
+            AND intent.approved_target_cid = (
+              SELECT expected_cid FROM oracle_publication_graph_roots
+              WHERE plan_id = ${request.planId} AND domain = ${request.domain}
+            )
+            AND intent_state.state NOT IN (
+              'manual_intervention_required', 'cancelled_terminal',
+              'failed_terminal', 'rollback_requested', 'rollback_in_flight',
+              'rollback_ambiguous', 'rollback_verified'
+            )
+        ) AS intent_count
       FROM oracle_publication_object_effects
       WHERE plan_id = ${request.planId} AND domain = ${request.domain}
-    `;
-    const row = rows[0];
-    if (!row || row.total === 0 || row.pending !== 0 || row.root_cid === null) {
-      throw new DurableInputError(
-        `IPNS ${request.domain} effect requires every object and root CID to be verified`,
-      );
-    }
-    return { objectCount: row.total, targetCid: row.root_cid };
+      `;
+      const row = rows[0];
+      if (
+        !row ||
+        row.total === 0 ||
+        row.pending !== 0 ||
+        row.root_cid === null ||
+        row.intent_count !== 1
+      ) {
+        throw new DurableInputError(
+          `IPNS ${request.domain} effect requires every object, root CID, and exact intent to be verified`,
+        );
+      }
+      return { objectCount: row.total, targetCid: row.root_cid };
+    });
   } finally {
     await sql.end({ timeout: 5 });
   }
 }
 
 export async function checkpointPublicationIpnsUpdated(
-  databaseUrl: string,
-  value: unknown,
+  _databaseUrl: string,
+  _value: unknown,
 ): Promise<void> {
-  const request = parse(
-    ipnsCheckpointSchema,
-    value,
-    "Publish/pasco IPNS update checkpoint",
+  throw new DurableInputError(
+    "Legacy IPNS checkpoints are disabled; use the authoritative pre-mutation intent ledger",
   );
-  const ready = await publicationIpnsUpdateReady(databaseUrl, {
-    county: request.county,
-    domain: request.domain,
-    planId: request.planId,
-    planSha256: request.planSha256,
-  });
-  if (ready.targetCid !== request.targetCid) {
-    terminalConflict(`IPNS target CID ${request.domain}`);
-  }
-  const sql = postgres(databaseUrl, { max: 2 });
-  try {
-    await sql.begin(async (transaction) => {
-      await lockPublish(transaction);
-      const effects = await transaction<
-        {
-          ipns_network_key: string | null;
-          prior_cid: string | null;
-          status: "pending" | "updated" | "verified";
-          target_cid: string | null;
-        }[]
-      >`
-        SELECT status, ipns_network_key, prior_cid, target_cid
-        FROM oracle_publication_ipns_effects
-        WHERE plan_id = ${request.planId} AND domain = ${request.domain}
-        FOR UPDATE
-      `;
-      const effect = effects[0];
-      if (!effect) terminalConflict(`missing IPNS effect ${request.domain}`);
-      if (effect.status !== "pending") {
-        if (
-          effect.target_cid === request.targetCid &&
-          effect.prior_cid === request.priorCid &&
-          effect.ipns_network_key === request.networkKey
-        ) {
-          return;
-        }
-        terminalConflict(`IPNS update replay ${request.domain}`);
-      }
-      if (
-        effect.ipns_network_key !== null &&
-        effect.ipns_network_key !== request.networkKey
-      ) {
-        terminalConflict(`IPNS network key ${request.domain}`);
-      }
-      await transaction`
-        UPDATE oracle_publication_ipns_effects SET
-          ipns_network_key = ${request.networkKey},
-          prior_cid = ${request.priorCid}, target_cid = ${request.targetCid},
-          status = 'updated', mutation_performed = true, updated_at = now()
-        WHERE plan_id = ${request.planId} AND domain = ${request.domain}
-          AND status = 'pending'
-      `;
-    });
-  } finally {
-    await sql.end({ timeout: 5 });
-  }
 }
 
 export async function verifyPublicationIpnsResolution(
-  databaseUrl: string,
-  value: unknown,
+  _databaseUrl: string,
+  _value: unknown,
 ): Promise<void> {
-  const request = parse(
-    publicationIdentitySchema.extend({
-      domain: z.enum(["open_data", "query_table"]),
-      resolvedCid: z.string().min(8).max(500),
-    }),
-    value,
-    "Publish/pasco IPNS resolution verification",
+  throw new DurableInputError(
+    "Legacy IPNS resolution checkpoints are disabled; verify through the authoritative intent ledger",
   );
-  const sql = postgres(databaseUrl, { max: 2 });
-  try {
-    await sql.begin(async (transaction) => {
-      await lockPublish(transaction);
-      const effects = await transaction<
-        {
-          status: "pending" | "updated" | "verified";
-          target_cid: string | null;
-        }[]
-      >`
-        SELECT status, target_cid FROM oracle_publication_ipns_effects
-        WHERE plan_id = ${request.planId} AND domain = ${request.domain}
-        FOR UPDATE
-      `;
-      const effect = effects[0];
-      if (!effect || effect.target_cid !== request.resolvedCid) {
-        terminalConflict(`IPNS public resolution ${request.domain}`);
-      }
-      if (effect.status === "verified") return;
-      if (effect.status !== "updated") {
-        throw new DurableInputError(
-          `IPNS ${request.domain} cannot verify before mutation`,
-        );
-      }
-      await transaction`
-        UPDATE oracle_publication_ipns_effects SET
-          status = 'verified', public_resolution_verified = true,
-          updated_at = now()
-        WHERE plan_id = ${request.planId} AND domain = ${request.domain}
-          AND status = 'updated'
-      `;
-    });
-  } finally {
-    await sql.end({ timeout: 5 });
-  }
 }
 
 export async function completePublicationPlan(
@@ -863,27 +1045,53 @@ export async function completePublicationPlan(
   try {
     return await sql.begin(async (transaction) => {
       await lockPublish(transaction);
+      await acquirePascoProjectionHeadFence(transaction);
       const plan = await loadStoredPlan(
         transaction,
         request.planId,
         request.planSha256,
       );
+      await assertApprovalBindingCurrent(transaction, plan);
       const current = (await stateRows(transaction))[0];
-      const effects = await transaction<{ verified: number }[]>`
-        SELECT count(*) FILTER (
-          WHERE status = 'verified' AND public_resolution_verified
-        )::int AS verified
-        FROM oracle_publication_ipns_effects
-        WHERE plan_id = ${request.planId}
+      const effects = await transaction<
+        {
+          exact_intents: number;
+          verified_effects: number;
+          verified_intents: number;
+        }[]
+      >`
+        SELECT
+          count(DISTINCT intent.intent_id)::int AS exact_intents,
+          count(DISTINCT intent.intent_id) FILTER (
+            WHERE intent_state.state = 'verified'
+          )::int AS verified_intents,
+          count(DISTINCT effect.domain) FILTER (
+            WHERE effect.status = 'verified'
+              AND effect.public_resolution_verified
+              AND effect.mutation_performed
+              AND effect.target_cid = intent.approved_target_cid
+              AND intent_state.state = 'verified'
+          )::int AS verified_effects
+        FROM oracle_publication_ipns_intents intent
+        JOIN oracle_publication_ipns_intent_state intent_state USING (intent_id)
+        LEFT JOIN oracle_publication_ipns_effects effect
+          ON effect.intent_id = intent.intent_id
+         AND effect.plan_id = intent.publication_plan_id
+         AND effect.domain = intent.domain
+        WHERE intent.publication_plan_id = ${request.planId}
+          AND intent.publication_plan_sha256 = ${request.planSha256}
       `;
       if (
         !current ||
         current.plan_id !== request.planId ||
         current.state !== "executing" ||
-        effects[0]?.verified !== 2
+        current.plan_sha256 !== request.planSha256 ||
+        effects[0]?.exact_intents !== 2 ||
+        effects[0]?.verified_intents !== 2 ||
+        effects[0]?.verified_effects !== 2
       ) {
         throw new DurableInputError(
-          "Publication completion requires both public IPNS resolutions",
+          "Publication completion requires exactly two verified intent-ledger resolutions",
         );
       }
       await recordStateEvent(transaction, plan, "executing", "completed");
