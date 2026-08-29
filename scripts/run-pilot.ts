@@ -17,6 +17,7 @@ const runId = deterministicId("run", [
 ]);
 const request = {
   asOf: "2026-08-28T00:00:00.000Z",
+  county: "pasco",
   runId,
   sampleAlgorithm: "pasco-pilot-stratified-v1",
   sampleSeed,

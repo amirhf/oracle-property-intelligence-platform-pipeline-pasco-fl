@@ -1,142 +1,234 @@
 import * as restate from "@restatedev/restate-sdk";
-import { readFile } from "node:fs/promises";
 
-import type { PilotRunRequest, PreparedPilot } from "../src/domain/types.js";
 import {
   loadPreparedPilot,
   markRunFailed,
   recordRunStarted,
 } from "../src/db/pilot-repository.js";
 import { loadPreparedScale } from "../src/db/scale-repository.js";
-import { preparePilot } from "../src/pilot/prepare.js";
 import { SourceAccessStopError } from "../src/lib/access-stop.js";
 import {
-  prepareScaleDataset,
-  scalePreparedPath,
-} from "../src/scale/prepare.js";
+  isDurabilityTerminalError,
+  DurableInputError,
+} from "../src/lib/durability-errors.js";
+import { deterministicId } from "../src/lib/hash.js";
+import { preparePilot } from "../src/pilot/prepare.js";
+import { prepareScaleDataset } from "../src/scale/prepare.js";
+import { verifyPreparedInput } from "../src/snapshot/model.js";
+import {
+  countyIngestRequestSha256,
+  parseCountyIngestRequest,
+  parseIngestChunkRequest,
+  parseLoaderRequest,
+  parsePreparedPilot,
+} from "../src/workflow/schemas.js";
 
 interface PipelineDependencies {
   dataDir: string;
   databaseUrl: string;
 }
 
-type PreparedInput =
-  | { kind: "inline"; prepared: PreparedPilot }
-  | { kind: "scale-file"; preparedPath: string };
+function terminalError(error: unknown): restate.TerminalError | undefined {
+  if (isDurabilityTerminalError(error)) {
+    return new restate.TerminalError(error.message, {
+      errorCode: error.errorCode,
+    });
+  }
+  if (error instanceof SourceAccessStopError) {
+    return new restate.TerminalError(error.message, { errorCode: 503 });
+  }
+  return undefined;
+}
 
 export function createPipelineServices(dependencies: PipelineDependencies) {
   const ingestChunk = restate.workflow({
     name: "IngestChunk",
     handlers: {
-      run: async (
-        ctx: restate.WorkflowContext,
-        request: PilotRunRequest,
-      ): Promise<PreparedInput> => {
-        const selectionSize = request.selectionSize ?? 25;
-        if (selectionSize === 25) {
-          return ctx.run("raw-first-pilot-preparation", async () => ({
-            kind: "inline" as const,
-            prepared: await preparePilot({
-              asOf: request.asOf,
-              dataDir: dependencies.dataDir,
-              runId: request.runId,
-              sampleSeed: request.sampleSeed,
-            }),
-          }));
-        }
-        if (selectionSize !== 5_000 && selectionSize !== 25_000) {
-          throw new restate.TerminalError(
-            "selectionSize must be 25, 5000, or 25000",
-            { errorCode: 400 },
+      run: async (ctx: restate.WorkflowContext, input: unknown) => {
+        const request = parseIngestChunkRequest(input);
+        if (ctx.key !== `${request.workflowId}-chunk-0001`) {
+          throw new DurableInputError(
+            "IngestChunk workflow key does not match the parent workflow",
           );
         }
-        return ctx.run("raw-first-scale-preparation", async () => {
-          await prepareScaleDataset({
-            asOf: request.asOf,
-            dataDir: dependencies.dataDir,
-            runId: request.runId,
-            sampleSeed: request.sampleSeed,
-            selectionSize,
-          });
-          return {
-            kind: "scale-file" as const,
-            preparedPath: scalePreparedPath(
-              dependencies.dataDir,
-              request.runId,
-            ),
-          };
-        });
+        const {
+          chunkCount: _chunkCount,
+          chunkIndex: _chunkIndex,
+          endExclusive: _endExclusive,
+          parentRequestSha256,
+          startIndex: _startIndex,
+          ...countyRequestValue
+        } = request;
+        const countyRequest = parseCountyIngestRequest(countyRequestValue);
+        if (countyIngestRequestSha256(countyRequest) !== parentRequestSha256) {
+          throw new DurableInputError(
+            "IngestChunk parent request hash does not match its payload",
+          );
+        }
+        const prepared = await ctx.run(
+          request.selectionSize === 25
+            ? "hash-bound-pilot-preparation"
+            : "hash-bound-scale-preparation",
+          async () =>
+            request.selectionSize === 25
+              ? preparePilot({
+                  asOf: request.asOf,
+                  dataDir: dependencies.dataDir,
+                  runId: request.runId,
+                  sampleSeed: request.sampleSeed,
+                })
+              : prepareScaleDataset({
+                  asOf: request.asOf,
+                  dataDir: dependencies.dataDir,
+                  runId: request.runId,
+                  sampleSeed: request.sampleSeed,
+                  selectionSize: request.selectionSize,
+                }),
+        );
+        if (
+          request.expectedSnapshotId !== undefined &&
+          prepared.snapshotId !== request.expectedSnapshotId
+        ) {
+          throw new DurableInputError(
+            `Prepared snapshot does not match expected identity (expected=${request.expectedSnapshotId}, actual=${prepared.snapshotId})`,
+          );
+        }
+        return prepared;
       },
     },
-    options: {
-      asTerminalError: (error) =>
-        error instanceof SourceAccessStopError
-          ? new restate.TerminalError(error.message, { errorCode: 503 })
-          : undefined,
-    },
+    options: { asTerminalError: terminalError },
   });
 
   const loader = restate.object({
     name: "Loader",
     handlers: {
-      load: async (
-        ctx: restate.ObjectContext,
-        input: { prepared: PreparedInput; request: PilotRunRequest },
-      ) =>
-        ctx.run("postgres-single-writer-load", async () => {
-          if (input.prepared.kind === "inline") {
-            return loadPreparedPilot(
-              dependencies.databaseUrl,
-              input.request,
-              input.prepared.prepared,
+      load: async (ctx: restate.ObjectContext, input: unknown) => {
+        const request = parseLoaderRequest(input);
+        if (ctx.key !== "pasco") {
+          throw new DurableInputError(
+            "Loader must be invoked with the Pasco county key",
+          );
+        }
+        const requestSha256 = countyIngestRequestSha256(request.request);
+        if (requestSha256 !== request.parentRequestSha256) {
+          throw new DurableInputError(
+            "Loader parent request hash does not match its payload",
+          );
+        }
+        if (
+          request.request.expectedSnapshotId !== undefined &&
+          request.prepared.snapshotId !== request.request.expectedSnapshotId
+        ) {
+          throw new DurableInputError(
+            "Loader prepared snapshot does not match the requested snapshot",
+          );
+        }
+        return ctx.run("verify-and-apply-hash-bound-input", async () => {
+          const verified = await verifyPreparedInput(
+            dependencies.dataDir,
+            request.prepared,
+            parsePreparedPilot,
+            request.prepared.snapshotId,
+          );
+          if (
+            verified.prepared.sampleAlgorithm !==
+              request.request.sampleAlgorithm ||
+            verified.prepared.sampleSeed !== request.request.sampleSeed ||
+            verified.prepared.selectionSize !== request.request.selectionSize
+          ) {
+            throw new DurableInputError(
+              "Prepared sampling metadata does not match the Loader request",
             );
           }
-          const prepared = JSON.parse(
-            await readFile(input.prepared.preparedPath, "utf8"),
-          ) as PreparedPilot;
-          return loadPreparedScale(
-            dependencies.databaseUrl,
-            input.request,
-            prepared,
-          );
-        }),
+          const durability = {
+            idempotencyKey: request.idempotencyKey,
+            preparedManifest: verified.manifest,
+            preparedReference: verified.reference,
+            requestSha256,
+            runId: request.request.runId,
+            snapshot: verified.snapshot,
+          };
+          return verified.reference.kind === "pilot"
+            ? loadPreparedPilot(
+                dependencies.databaseUrl,
+                request.request,
+                verified.prepared,
+                durability,
+              )
+            : loadPreparedScale(
+                dependencies.databaseUrl,
+                request.request,
+                verified.prepared,
+                durability,
+              );
+        });
+      },
     },
+    options: { asTerminalError: terminalError },
   });
 
   const countyIngest = restate.workflow({
     name: "CountyIngest",
     handlers: {
-      run: async (ctx: restate.WorkflowContext, request: PilotRunRequest) => {
+      run: async (ctx: restate.WorkflowContext, input: unknown) => {
+        const request = parseCountyIngestRequest(input);
         if (request.workflowId !== ctx.key) {
-          throw new restate.TerminalError(
+          throw new DurableInputError(
             "workflowId must equal the Restate workflow key",
-            { errorCode: 400 },
           );
         }
-        await ctx.run("record-pilot-run-start", () =>
+        await ctx.run("record-pipeline-run-start", () =>
           recordRunStarted(dependencies.databaseUrl, request),
         );
         try {
+          const parentRequestSha256 = countyIngestRequestSha256(request);
           const prepared = await ctx
             .workflowClient(ingestChunk, `${ctx.key}-chunk-0001`)
-            .run(request);
-          return await ctx
-            .objectClient(loader, "pasco")
-            .load({ prepared, request });
+            .run({
+              ...request,
+              chunkCount: 1,
+              chunkIndex: 0,
+              endExclusive: request.selectionSize,
+              parentRequestSha256,
+              startIndex: 0,
+            });
+          const idempotencyKey = deterministicId("load", [
+            "1.0.0",
+            "Loader/pasco",
+            request.workflowId,
+            prepared.preparedInputId,
+          ]);
+          return await ctx.objectClient(loader, "pasco").load({
+            county: "pasco",
+            idempotencyKey,
+            parentRequestSha256,
+            prepared,
+            request,
+          });
         } catch (error) {
-          const message =
-            error instanceof Error ? error.message : "unknown pipeline failure";
-          await ctx.run("record-pilot-run-failure", () =>
+          if (
+            !isDurabilityTerminalError(error) &&
+            !(error instanceof SourceAccessStopError) &&
+            !(error instanceof restate.TerminalError)
+          ) {
+            throw error;
+          }
+          const message = error.message;
+          await ctx.run("record-pipeline-run-failure", () =>
             markRunFailed(
               dependencies.databaseUrl,
               request.runId,
               message.slice(0, 160),
             ),
           );
-          throw new restate.TerminalError(message, { errorCode: 503 });
+          if (error instanceof restate.TerminalError) throw error;
+          const converted = terminalError(error);
+          if (!converted) throw error;
+          throw converted;
         }
       },
     },
+    options: { asTerminalError: terminalError },
   });
 
   const permitFeedChunk = restate.workflow({

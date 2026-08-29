@@ -11,6 +11,20 @@ import type { PreparedPilot } from "../domain/types.js";
 import { fetchPascoCoordinateBatches } from "../gis/pasco.js";
 import { sha256 } from "../lib/hash.js";
 import {
+  createSourceObject,
+  sourceObjectFromArtifact,
+  verifySourceObjectBindings,
+  writePreparedInput,
+  writeSourceSnapshot,
+  type PreparedInputReference,
+} from "../snapshot/model.js";
+
+// Historical, run-scoped prepared artifacts are retained for read-only
+// reconciliation checks. New workflows use content-addressed snapshot paths.
+export function scalePreparedPath(dataDir: string, runId: string): string {
+  return path.join(dataDir, "pasco", "prepared", runId, "dataset.json");
+}
+import {
   COUNTYWIDE_SAMPLE_ALGORITHM,
   countywideStratum,
   selectCountywideSample,
@@ -22,22 +36,40 @@ async function atomicWrite(filePath: string, body: string): Promise<void> {
   await rename(`${filePath}.part`, filePath);
 }
 
-export function scalePreparedPath(dataDir: string, runId: string): string {
-  return path.join(dataDir, "pasco", "prepared", runId, "dataset.json");
-}
-
 export async function prepareScaleDataset(options: {
   asOf: string;
   dataDir: string;
   runId: string;
   sampleSeed: string;
   selectionSize: number;
-}): Promise<PreparedPilot> {
+}): Promise<PreparedInputReference> {
   if (options.selectionSize !== 5_000 && options.selectionSize !== 25_000) {
     throw new Error("Scale dataset size must be exactly 5,000 or 25,000");
   }
   const startedAt = performance.now();
   const appraiser = await ensureAppraiserInputs(options.dataDir);
+  const appraiserObservedAt = "2026-08-23T00:00:00.000Z";
+  const downloadedSourceObjects = await Promise.all(
+    appraiser.artifacts.map((artifact) =>
+      sourceObjectFromArtifact({
+        artifact,
+        dataDir: options.dataDir,
+        observedAt: appraiserObservedAt,
+      }),
+    ),
+  );
+  const extractedSourceObjects = await Promise.all(
+    Object.entries(appraiser.paths).map(([name, filePath]) =>
+      createSourceObject({
+        dataDir: options.dataDir,
+        filePath,
+        observedAt: appraiserObservedAt,
+        sourceIdentifier: `pasco_appraiser:extracted:${name}`,
+        sourceSystem: "pasco_appraiser",
+        stage: "extracted_source",
+      }),
+    ),
+  );
   const loaded = await loadPilotCandidateData(appraiser.paths);
   const selection = selectCountywideSample(
     loaded.candidates,
@@ -96,6 +128,10 @@ export async function prepareScaleDataset(options: {
     selectedFolios,
   );
   loaded.counts.owners = ownerResult.count;
+  await verifySourceObjectBindings(options.dataDir, [
+    ...downloadedSourceObjects,
+    ...extractedSourceObjects,
+  ]);
   const gis = await fetchPascoCoordinateBatches({
     batchSize: 500,
     concurrency: 2,
@@ -111,6 +147,37 @@ export async function prepareScaleDataset(options: {
     permits: [],
   }));
   const filesystem = await statfs(options.dataDir);
+  const gisObservedAt =
+    properties
+      .flatMap((entry) => entry.coordinates?.sourceLastUpdate ?? [])
+      .filter((value) => Number.isFinite(Date.parse(value)))
+      .sort()
+      .at(-1) ?? options.asOf;
+  const gisSourceObjects = await Promise.all(
+    gis.artifacts.map((artifact) =>
+      sourceObjectFromArtifact({
+        artifact,
+        dataDir: options.dataDir,
+        observedAt: gisObservedAt,
+      }),
+    ),
+  );
+  const sampling = {
+    algorithm: COUNTYWIDE_SAMPLE_ALGORITHM,
+    seed: options.sampleSeed,
+    selectedRecordSha256: selectionHash,
+    selectionSize: options.selectionSize,
+  };
+  const snapshot = await writeSourceSnapshot({
+    asOf: options.asOf,
+    dataDir: options.dataDir,
+    sampling,
+    sourceObjects: [
+      ...downloadedSourceObjects,
+      ...extractedSourceObjects,
+      ...gisSourceObjects,
+    ],
+  });
   const prepared: PreparedPilot = {
     artifacts: [...appraiser.artifacts, ...gis.artifacts],
     gisMetrics: gis.metrics,
@@ -123,24 +190,25 @@ export async function prepareScaleDataset(options: {
     },
     sampleAlgorithm: COUNTYWIDE_SAMPLE_ALGORITHM,
     sampleSeed: options.sampleSeed,
+    selectedRecordSha256: selectionHash,
     selectionSize: options.selectionSize,
+    snapshotId: snapshot.manifest.snapshotId,
+    snapshotManifestSha256: snapshot.reference.sha256,
     sourceCounts: loaded.counts,
     sourceLimitations: [
       "Appraisal/GIS-only bounded scale dataset; it is not complete Pasco coverage.",
       "Permit source is unavailable after the Accela challenge stop; missing permits must not be interpreted as none existing.",
       "Contractor source is unavailable because no compliant permit source was established.",
       "Sunbiz and BBB were not collected and remain explicitly unavailable.",
+      "Temporal deletion and current-state reconciliation are not implemented in this checkpoint.",
     ],
   };
-  const preparedPath = scalePreparedPath(options.dataDir, options.runId);
-  await atomicWrite(preparedPath, JSON.stringify(prepared));
-  await atomicWrite(
-    `${preparedPath}.ready.json`,
-    `${JSON.stringify({
-      properties: prepared.properties.length,
-      ready: true,
-      selectionHash,
-    })}\n`,
-  );
-  return prepared;
+  return writePreparedInput({
+    dataDir: options.dataDir,
+    kind: "scale",
+    prepared,
+    sampling,
+    snapshot: snapshot.manifest,
+    snapshotReference: snapshot.reference,
+  });
 }

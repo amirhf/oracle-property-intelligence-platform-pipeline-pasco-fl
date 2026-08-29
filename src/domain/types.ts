@@ -112,7 +112,10 @@ export interface PreparedPilot {
   };
   sampleAlgorithm: string;
   sampleSeed: string;
+  selectedRecordSha256: string;
   selectionSize: number;
+  snapshotId: string;
+  snapshotManifestSha256: string;
   sourceCounts: SourceParseCounts;
   sourceLimitations: string[];
 }
@@ -129,10 +132,12 @@ export interface GisAcquisitionMetrics {
 
 export interface PilotRunRequest {
   asOf: string;
+  county: "pasco";
+  expectedSnapshotId?: string;
   runId: string;
-  sampleAlgorithm?: string;
+  sampleAlgorithm: string;
   sampleSeed: string;
-  selectionSize?: number;
+  selectionSize: 25 | 5_000 | 25_000;
   workflowId: string;
 }
 

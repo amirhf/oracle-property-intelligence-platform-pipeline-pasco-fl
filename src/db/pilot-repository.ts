@@ -9,6 +9,10 @@ import type {
   PreparedPilot,
 } from "../domain/types.js";
 import {
+  DurableConflictError,
+  DurableInputError,
+} from "../lib/durability-errors.js";
+import {
   normalizePermitStatus,
   wholeUtcDays,
   yearBuiltRoofProxy,
@@ -20,6 +24,12 @@ import {
   permitId,
   sourceRecordHash,
 } from "../lib/hash.js";
+import {
+  beginLoaderEffect,
+  completeLoaderEffect,
+  type LoaderDurabilityContext,
+} from "./loader-durability.js";
+import { countyIngestRequestSha256 } from "../workflow/schemas.js";
 
 function pipelineLimitations(selectionSize: number): string[] {
   return [
@@ -27,6 +37,7 @@ function pipelineLimitations(selectionSize: number): string[] {
     "Pasco Accela coverage can exclude incorporated-city permit systems.",
     "Pasco Accela collection stopped after challenge/CAPTCHA content was detected; permit search results and contractor identity are unavailable.",
     "Sunbiz and BBB are intentionally not collected in this checkpoint.",
+    "Temporal deletion and current-state reconciliation are not implemented in this checkpoint.",
   ];
 }
 
@@ -46,40 +57,100 @@ export async function recordRunStarted(
 ): Promise<void> {
   const sql = postgres(databaseUrl, { max: 1 });
   try {
-    const selectionSize = request.selectionSize ?? 25;
-    const sampleAlgorithm =
-      request.sampleAlgorithm ?? "pasco-pilot-stratified-v1";
-    const databaseSize = await sql<{ bytes: number }[]>`
-      SELECT pg_database_size(current_database())::bigint AS bytes
-    `;
-    await sql`
-      INSERT INTO oracle_pipeline_runs (
-        run_id, workflow_id, county, sample_algorithm, sample_seed,
-        window_start, window_end, as_of, status, limitations,
-        selection_size, database_size_before_bytes
-      ) VALUES (
-        ${request.runId}, ${request.workflowId}, 'pasco',
-        ${sampleAlgorithm}, ${request.sampleSeed},
-        '2026-08-23T00:00:00.000Z', '2026-08-23T23:59:59.999Z',
-        ${request.asOf}, 'running', ${sql.json(pipelineLimitations(selectionSize))},
-        ${selectionSize}, ${databaseSize[0]?.bytes ?? 0}
-      )
-      ON CONFLICT (run_id) DO NOTHING
-    `;
-    const attemptId = deterministicId("attempt", [
-      "1.0.0",
-      "attempt",
-      request.runId,
-      "CountyIngest",
-      "run",
-      "1",
-    ]);
-    await sql`
-      INSERT INTO oracle_pipeline_attempts (
-        attempt_id, run_id, service_name, handler_name, attempt_number, status
-      ) VALUES (${attemptId}, ${request.runId}, 'CountyIngest', 'run', 1, 'running')
-      ON CONFLICT (attempt_id) DO NOTHING
-    `;
+    await sql.begin(async (transaction) => {
+      const requestSha256 = countyIngestRequestSha256(request);
+      const idempotencyKey = `CountyIngest/${request.workflowId}`;
+      const workflowRows = await transaction<{ request_sha256: string }[]>`
+        SELECT request_sha256 FROM oracle_workflow_requests
+        WHERE idempotency_key = ${idempotencyKey} FOR UPDATE
+      `;
+      if (workflowRows[0] && workflowRows[0].request_sha256 !== requestSha256) {
+        throw new DurableConflictError(
+          `CountyIngest idempotency conflict (${request.workflowId})`,
+        );
+      }
+      await transaction`
+        INSERT INTO oracle_workflow_requests (
+          idempotency_key, service_name, handler_name,
+          request_sha256, request_payload
+        ) VALUES (
+          ${idempotencyKey}, 'CountyIngest', 'run', ${requestSha256},
+          ${transaction.json(request as unknown as postgres.JSONValue)}
+        ) ON CONFLICT (idempotency_key) DO NOTHING
+      `;
+      const existingRuns = await transaction<
+        {
+          as_of_matches: boolean;
+          county: string;
+          request_sha256: string | null;
+          sample_algorithm: string;
+          sample_seed: string;
+          selection_size: number | null;
+          workflow_id: string;
+        }[]
+      >`
+        SELECT workflow_id, county, sample_algorithm, sample_seed,
+               selection_size, request_sha256,
+               as_of = ${request.asOf}::timestamptz AS as_of_matches
+        FROM oracle_pipeline_runs
+        WHERE run_id = ${request.runId} FOR UPDATE
+      `;
+      if (
+        existingRuns[0] &&
+        (existingRuns[0].workflow_id !== request.workflowId ||
+          existingRuns[0].county !== request.county ||
+          existingRuns[0].sample_algorithm !== request.sampleAlgorithm ||
+          existingRuns[0].sample_seed !== request.sampleSeed ||
+          !existingRuns[0].as_of_matches ||
+          (existingRuns[0].selection_size !== null &&
+            existingRuns[0].selection_size !== request.selectionSize) ||
+          (existingRuns[0].request_sha256 !== null &&
+            existingRuns[0].request_sha256 !== requestSha256))
+      ) {
+        throw new DurableConflictError(
+          `Pipeline run identity conflict (${request.runId})`,
+        );
+      }
+      const databaseSize = await transaction<{ bytes: number }[]>`
+        SELECT pg_database_size(current_database())::bigint AS bytes
+      `;
+      await transaction`
+        INSERT INTO oracle_pipeline_runs (
+          run_id, workflow_id, county, sample_algorithm, sample_seed,
+          window_start, window_end, as_of, status, limitations,
+          selection_size, database_size_before_bytes, request_sha256
+        ) VALUES (
+          ${request.runId}, ${request.workflowId}, ${request.county},
+          ${request.sampleAlgorithm}, ${request.sampleSeed},
+          ${request.asOf}, ${request.asOf}, ${request.asOf}, 'running',
+          ${transaction.json(pipelineLimitations(request.selectionSize))},
+          ${request.selectionSize}, ${databaseSize[0]?.bytes ?? 0},
+          ${requestSha256}
+        ) ON CONFLICT (run_id) DO NOTHING
+      `;
+      await transaction`
+        UPDATE oracle_pipeline_runs
+        SET request_sha256 = COALESCE(request_sha256, ${requestSha256}),
+            selection_size = COALESCE(selection_size, ${request.selectionSize})
+        WHERE run_id = ${request.runId}
+      `;
+      const attemptId = deterministicId("attempt", [
+        "1.0.0",
+        "attempt",
+        request.runId,
+        "CountyIngest",
+        "run",
+        "1",
+      ]);
+      await transaction`
+        INSERT INTO oracle_pipeline_attempts (
+          attempt_id, run_id, service_name, handler_name,
+          attempt_number, status
+        ) VALUES (
+          ${attemptId}, ${request.runId}, 'CountyIngest', 'run', 1, 'running'
+        ) ON CONFLICT (attempt_id) DO NOTHING
+      `;
+    });
   } finally {
     await sql.end({ timeout: 5 });
   }
@@ -111,15 +182,18 @@ export async function loadPreparedPilot(
   databaseUrl: string,
   request: PilotRunRequest,
   prepared: PreparedPilot,
+  durability: LoaderDurabilityContext,
 ): Promise<PilotRunSummary> {
   if (prepared.properties.length !== prepared.selectionSize) {
-    throw new Error(
+    throw new DurableInputError(
       `Prepared property count does not match its selection size`,
     );
   }
   const sql = postgres(databaseUrl, { max: 1 });
   try {
     return await sql.begin(async (transaction) => {
+      const replay = await beginLoaderEffect(transaction, durability);
+      if (replay) return replay;
       const attemptId = deterministicId("attempt", [
         "1.0.0",
         "attempt",
@@ -148,12 +222,15 @@ export async function loadPreparedPilot(
         await transaction`
           INSERT INTO oracle_source_artifacts (
             artifact_id, run_id, source_system, source_url, local_uri,
-            ready_marker_uri, byte_size, sha256, retrieved_at
+            ready_marker_uri, byte_size, sha256, retrieved_at,
+            snapshot_id, prepared_input_id
           ) VALUES (
             ${artifactId}, ${request.runId}, ${artifact.sourceSystem},
             ${artifact.sourceUrl}, ${pathToFileURL(artifact.localPath).toString()},
             ${pathToFileURL(artifact.readyMarkerPath).toString()},
-            ${artifact.bytes}, ${artifact.sha256}, ${request.asOf}
+            ${artifact.bytes}, ${artifact.sha256}, ${request.asOf},
+            ${durability.snapshot.snapshotId},
+            ${durability.preparedManifest.preparedInputId}
           )
           ON CONFLICT (artifact_id) DO NOTHING
         `;
@@ -563,7 +640,7 @@ export async function loadPreparedPilot(
         SET status = 'completed', completed_at = now()
         WHERE run_id = ${request.runId} AND status = 'running'
       `;
-      return summary;
+      return completeLoaderEffect(transaction, durability, summary);
     });
   } finally {
     await sql.end({ timeout: 5 });

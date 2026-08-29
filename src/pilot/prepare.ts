@@ -9,6 +9,15 @@ import {
 } from "../appraiser/parser.js";
 import type { PreparedPilot } from "../domain/types.js";
 import { fetchPascoCoordinates } from "../gis/pasco.js";
+import { sha256 } from "../lib/hash.js";
+import {
+  createSourceObject,
+  sourceObjectFromArtifact,
+  verifySourceObjectBindings,
+  writePreparedInput,
+  writeSourceSnapshot,
+  type PreparedInputReference,
+} from "../snapshot/model.js";
 import { PILOT_SAMPLE_ALGORITHM, selectPilot } from "./sample.js";
 
 export async function preparePilot(options: {
@@ -16,9 +25,31 @@ export async function preparePilot(options: {
   dataDir: string;
   runId: string;
   sampleSeed: string;
-}): Promise<PreparedPilot> {
+}): Promise<PreparedInputReference> {
   const startedAt = performance.now();
   const appraiser = await ensureAppraiserInputs(options.dataDir);
+  const appraiserObservedAt = "2026-08-23T00:00:00.000Z";
+  const downloadedSourceObjects = await Promise.all(
+    appraiser.artifacts.map((artifact) =>
+      sourceObjectFromArtifact({
+        artifact,
+        dataDir: options.dataDir,
+        observedAt: appraiserObservedAt,
+      }),
+    ),
+  );
+  const extractedSourceObjects = await Promise.all(
+    Object.entries(appraiser.paths).map(([name, filePath]) =>
+      createSourceObject({
+        dataDir: options.dataDir,
+        filePath,
+        observedAt: appraiserObservedAt,
+        sourceIdentifier: `pasco_appraiser:extracted:${name}`,
+        sourceSystem: "pasco_appraiser",
+        stage: "extracted_source",
+      }),
+    ),
+  );
   const loaded = await loadPilotCandidateData(appraiser.paths);
   const selection = selectPilot(loaded.candidates, options.sampleSeed);
   const selectedFolios = new Set(
@@ -69,6 +100,10 @@ export async function preparePilot(options: {
     selectedFolios,
   );
   loaded.counts.owners = ownerResult.count;
+  await verifySourceObjectBindings(options.dataDir, [
+    ...downloadedSourceObjects,
+    ...extractedSourceObjects,
+  ]);
 
   const gis = await fetchPascoCoordinates({
     dataDir: options.dataDir,
@@ -84,6 +119,35 @@ export async function preparePilot(options: {
     permits: [],
   }));
   const filesystem = await statfs(options.dataDir);
+  const selectedRecordSha256 = sha256(
+    JSON.stringify(selection.map((entry) => entry.parcel.exactFolio).sort()),
+  );
+  const gisSourceObject = await sourceObjectFromArtifact({
+    artifact: gis.artifact,
+    dataDir: options.dataDir,
+    observedAt:
+      properties
+        .flatMap((entry) => entry.coordinates?.sourceLastUpdate ?? [])
+        .filter((value) => Number.isFinite(Date.parse(value)))
+        .sort()
+        .at(-1) ?? options.asOf,
+  });
+  const sampling = {
+    algorithm: PILOT_SAMPLE_ALGORITHM,
+    seed: options.sampleSeed,
+    selectedRecordSha256,
+    selectionSize: properties.length,
+  };
+  const snapshot = await writeSourceSnapshot({
+    asOf: options.asOf,
+    dataDir: options.dataDir,
+    sampling,
+    sourceObjects: [
+      ...downloadedSourceObjects,
+      ...extractedSourceObjects,
+      gisSourceObject,
+    ],
+  });
 
   const prepared: PreparedPilot = {
     artifacts: [...appraiser.artifacts, gis.artifact],
@@ -97,30 +161,22 @@ export async function preparePilot(options: {
     },
     sampleAlgorithm: PILOT_SAMPLE_ALGORITHM,
     sampleSeed: options.sampleSeed,
+    selectedRecordSha256,
     selectionSize: properties.length,
+    snapshotId: snapshot.manifest.snapshotId,
+    snapshotManifestSha256: snapshot.reference.sha256,
     sourceCounts: loaded.counts,
     sourceLimitations: [
       "Pasco Accela collection stopped after challenge/CAPTCHA content was detected on the anonymous form GET; no permit search POST was sent, and permits and contractors are unavailable for this pilot.",
+      "Temporal deletion and current-state reconciliation are not implemented in this checkpoint.",
     ],
   };
-  const preparedDir = path.join(
-    options.dataDir,
-    "pasco",
-    "prepared",
-    options.runId,
-  );
-  await mkdir(preparedDir, { recursive: true });
-  const preparedPath = path.join(preparedDir, "pilot.json");
-  await writeFile(`${preparedPath}.part`, JSON.stringify(prepared), {
-    encoding: "utf8",
-    mode: 0o600,
+  return writePreparedInput({
+    dataDir: options.dataDir,
+    kind: "pilot",
+    prepared,
+    sampling,
+    snapshot: snapshot.manifest,
+    snapshotReference: snapshot.reference,
   });
-  await rename(`${preparedPath}.part`, preparedPath);
-  await writeFile(
-    `${preparedPath}.ready.json.part`,
-    `${JSON.stringify({ properties: prepared.properties.length, ready: true })}\n`,
-    { encoding: "utf8", mode: 0o600 },
-  );
-  await rename(`${preparedPath}.ready.json.part`, `${preparedPath}.ready.json`);
-  return prepared;
 }

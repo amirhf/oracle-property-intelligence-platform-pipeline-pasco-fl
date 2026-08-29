@@ -19,6 +19,7 @@
     "test": "vitest run tests/unit && vitest run tests/contracts",
     "test:unit": "vitest run tests/unit",
     "test:contracts": "vitest run tests/contracts",
+    "test:durability": "vitest run tests/integration/loader-durability.test.ts",
     "contracts:validate": "node --import tsx scripts/validate-contracts.ts",
     "health:check": "node --import tsx scripts/check-health.ts",
     "db:migrate": "node --import tsx scripts/migrate.ts",

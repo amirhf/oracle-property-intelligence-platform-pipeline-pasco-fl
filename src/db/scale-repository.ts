@@ -10,7 +10,13 @@ import type {
 } from "../domain/types.js";
 import { classifyHashDelta } from "../domain/reconciliation.js";
 import { yearBuiltRoofProxy } from "../domain/signals.js";
+import { DurableInputError } from "../lib/durability-errors.js";
 import { deterministicId, parcelId, sourceRecordHash } from "../lib/hash.js";
+import {
+  beginLoaderEffect,
+  completeLoaderEffect,
+  type LoaderDurabilityContext,
+} from "./loader-durability.js";
 
 const UNAVAILABLE_FEATURES = [
   ["permits", "source_unavailable"],
@@ -39,6 +45,7 @@ function limitations(selectionSize: number): string[] {
     "Permit source unavailable after the Accela challenge stop; missing permits do not mean none exist.",
     "Contractor source unavailable because no compliant permit source was established.",
     "Sunbiz and BBB were not collected and remain explicitly unavailable.",
+    "Temporal deletion and current-state reconciliation are not implemented in this checkpoint.",
   ];
 }
 
@@ -46,17 +53,20 @@ export async function loadPreparedScale(
   databaseUrl: string,
   request: PilotRunRequest,
   prepared: PreparedPilot,
+  durability: LoaderDurabilityContext,
 ): Promise<PilotRunSummary> {
   if (prepared.selectionSize !== 5_000 && prepared.selectionSize !== 25_000) {
-    throw new Error("Scaled load requires exactly 5,000 or 25,000 properties");
+    throw new DurableInputError(
+      "Scaled load requires exactly 5,000 or 25,000 properties",
+    );
   }
   if (prepared.properties.length !== prepared.selectionSize) {
-    throw new Error(
+    throw new DurableInputError(
       "Prepared property count does not match scale selection size",
     );
   }
   if (prepared.properties.some((entry) => entry.permits.length > 0)) {
-    throw new Error(
+    throw new DurableInputError(
       "Scaled appraisal/GIS load must not contain permit records",
     );
   }
@@ -64,6 +74,8 @@ export async function loadPreparedScale(
   const sql = postgres(databaseUrl, { max: 1 });
   try {
     return await sql.begin(async (transaction) => {
+      const replay = await beginLoaderEffect(transaction, durability);
+      if (replay) return replay;
       const attemptId = deterministicId("attempt", [
         "1.0.0",
         "attempt",
@@ -92,12 +104,15 @@ export async function loadPreparedScale(
         await transaction`
           INSERT INTO oracle_source_artifacts (
             artifact_id, run_id, source_system, source_url, local_uri,
-            ready_marker_uri, byte_size, sha256, retrieved_at
+            ready_marker_uri, byte_size, sha256, retrieved_at,
+            snapshot_id, prepared_input_id
           ) VALUES (
             ${artifactId}, ${request.runId}, ${artifact.sourceSystem},
             ${artifact.sourceUrl}, ${pathToFileURL(artifact.localPath).toString()},
             ${pathToFileURL(artifact.readyMarkerPath).toString()},
-            ${artifact.bytes}, ${artifact.sha256}, ${request.asOf}
+            ${artifact.bytes}, ${artifact.sha256}, ${request.asOf},
+            ${durability.snapshot.snapshotId},
+            ${durability.preparedManifest.preparedInputId}
           )
           ON CONFLICT (artifact_id) DO NOTHING
         `;
@@ -504,7 +519,7 @@ export async function loadPreparedScale(
         SET status = 'completed', completed_at = now()
         WHERE run_id = ${request.runId} AND status = 'running'
       `;
-      return summary;
+      return completeLoaderEffect(transaction, durability, summary);
     });
   } finally {
     await sql.end({ timeout: 5 });
