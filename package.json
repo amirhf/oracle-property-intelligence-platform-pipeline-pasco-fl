@@ -42,6 +42,8 @@
     "cheerio": "1.2.0",
     "csv-parse": "7.0.2",
     "dotenv": "17.4.2",
+    "hyparquet": "1.29.2",
+    "hyparquet-compressors": "1.1.1",
     "ipfs-only-hash": "4.0.0",
     "ipfs-unixfs-importer": "7.0.3",
     "postgres": "3.4.9",

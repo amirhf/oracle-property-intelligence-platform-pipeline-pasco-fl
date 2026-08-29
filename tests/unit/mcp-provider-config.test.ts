@@ -5,9 +5,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { loadMcpConfig } from "../../src/mcp/config.js";
-import { McpContractRegistry } from "../../src/mcp/contracts.js";
 import {
-  createMcpProvider,
   resolveArtifactPath,
   verifyParquetMagic,
 } from "../../src/mcp/provider.js";
@@ -32,23 +30,21 @@ describe("Oracle MCP provider isolation", () => {
     ).toThrow("Production rejects the local-artifact MCP provider");
   });
 
-  it("requires both public publication names and does not contact IPNS", async () => {
+  it("requires complete hash-bound public publication configuration", () => {
     expect(() =>
       loadMcpConfig({
         NODE_ENV: "production",
         ORACLE_MCP_PROVIDER: "public-ipns",
       }),
     ).toThrow("MCP_OPEN_DATA_IPNS is required");
-    const config = loadMcpConfig({
-      NODE_ENV: "production",
-      ORACLE_MCP_PROVIDER: "public-ipns",
-      MCP_OPEN_DATA_IPNS: "k51-public-open-data",
-      MCP_QUERY_TABLE_IPNS: "k51-public-query-table",
-    });
-    const contracts = await McpContractRegistry.create();
-    await expect(createMcpProvider(config.provider, contracts)).rejects.toThrow(
-      "not configured for this local checkpoint",
-    );
+    expect(() =>
+      loadMcpConfig({
+        NODE_ENV: "production",
+        ORACLE_MCP_PROVIDER: "public-ipns",
+        MCP_OPEN_DATA_IPNS: `k51${"a".repeat(50)}`,
+        MCP_QUERY_TABLE_IPNS: `k51${"b".repeat(50)}`,
+      }),
+    ).toThrow("MCP_PUBLIC_MANIFEST_CID is required");
   });
 
   it("rejects arbitrary, missing, and fixture paths", async () => {

@@ -25,6 +25,20 @@ export interface LocalArtifactProviderConfig {
 
 export interface PublicIpnsProviderConfig {
   environment: RuntimeEnvironment;
+  expectedManifestCid: string;
+  expectedManifestSha256: string;
+  expectedOpenDataRootCid: string;
+  expectedPlanCid: string;
+  expectedPlanSha256: string;
+  expectedQueryTableRootCid: string;
+  limits: {
+    maxCacheAgeSeconds: number;
+    maxJsonObjectBytes: number;
+    maxParquetBytes: number;
+    maxRedirects: number;
+    retries: number;
+    transportTimeoutMs: number;
+  };
   mode: "public-ipns";
   openDataIpns: string;
   queryTableIpns: string;
@@ -96,11 +110,60 @@ function publicProvider(
   environment: NodeJS.ProcessEnv,
   nodeEnvironment: RuntimeEnvironment,
 ): PublicIpnsProviderConfig {
+  const openDataIpns = requireValue(environment, "MCP_OPEN_DATA_IPNS");
+  const queryTableIpns = requireValue(environment, "MCP_QUERY_TABLE_IPNS");
   return {
     environment: nodeEnvironment,
+    expectedManifestCid: requireValue(environment, "MCP_PUBLIC_MANIFEST_CID"),
+    expectedManifestSha256: requireValue(
+      environment,
+      "MCP_PUBLIC_MANIFEST_SHA256",
+    ),
+    expectedOpenDataRootCid: requireValue(
+      environment,
+      "MCP_PUBLIC_OPEN_DATA_ROOT_CID",
+    ),
+    expectedPlanCid: requireValue(environment, "MCP_PUBLIC_PLAN_CID"),
+    expectedPlanSha256: requireValue(environment, "MCP_PUBLIC_PLAN_SHA256"),
+    expectedQueryTableRootCid: requireValue(
+      environment,
+      "MCP_PUBLIC_QUERY_TABLE_ROOT_CID",
+    ),
+    limits: {
+      maxCacheAgeSeconds: integer(
+        environment,
+        "MCP_PUBLIC_MAX_CACHE_AGE_SECONDS",
+        300,
+        0,
+        86_400,
+      ),
+      maxJsonObjectBytes: integer(
+        environment,
+        "MCP_PUBLIC_MAX_JSON_OBJECT_BYTES",
+        8 * 1024 * 1024,
+        16_384,
+        32 * 1024 * 1024,
+      ),
+      maxParquetBytes: integer(
+        environment,
+        "MCP_PUBLIC_MAX_PARQUET_BYTES",
+        128 * 1024 * 1024,
+        1024 * 1024,
+        512 * 1024 * 1024,
+      ),
+      maxRedirects: integer(environment, "MCP_PUBLIC_MAX_REDIRECTS", 2, 0, 4),
+      retries: integer(environment, "MCP_PUBLIC_RETRIES", 1, 0, 2),
+      transportTimeoutMs: integer(
+        environment,
+        "MCP_PUBLIC_TRANSPORT_TIMEOUT_MS",
+        5_000,
+        100,
+        15_000,
+      ),
+    },
     mode: "public-ipns",
-    openDataIpns: requireValue(environment, "MCP_OPEN_DATA_IPNS"),
-    queryTableIpns: requireValue(environment, "MCP_QUERY_TABLE_IPNS"),
+    openDataIpns,
+    queryTableIpns,
   };
 }
 

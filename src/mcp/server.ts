@@ -25,6 +25,12 @@ import {
   type McpToolName,
 } from "./constants.js";
 import type { McpContractRegistry } from "./contracts.js";
+import {
+  explorerBootstrap,
+  explorerProperty,
+  explorerSearch,
+  ORACLE_EXPLORER_HTML,
+} from "./explorer.js";
 import type { OracleMcpRuntime } from "./runtime.js";
 
 function isToolName(value: string): value is McpToolName {
@@ -120,6 +126,41 @@ function jsonResponse(
   response.end(JSON.stringify(value));
 }
 
+function explorerJsonResponse(
+  response: ServerResponse,
+  value: Record<string, unknown>,
+  maximumBytes: number,
+): void {
+  const body = JSON.stringify(value);
+  if (Buffer.byteLength(body) > maximumBytes) {
+    jsonResponse(response, 507, {
+      error: "Explorer response exceeds the limit",
+    });
+    return;
+  }
+  response.writeHead(200, {
+    "Cache-Control": "public, max-age=60",
+    "Content-Security-Policy":
+      "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; frame-ancestors 'none'",
+    "Content-Type": "application/json; charset=utf-8",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+  });
+  response.end(body);
+}
+
+function explorerHtmlResponse(response: ServerResponse): void {
+  response.writeHead(200, {
+    "Cache-Control": "public, max-age=300",
+    "Content-Security-Policy":
+      "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; frame-ancestors 'none'",
+    "Content-Type": "text/html; charset=utf-8",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+  });
+  response.end(ORACLE_EXPLORER_HTML);
+}
+
 async function handleMcpRequest(
   request: IncomingMessage,
   response: ServerResponse,
@@ -162,6 +203,10 @@ export function createOracleMcpHttpServer(options: {
 }): HttpServer {
   return createNodeServer((request, response) => {
     void (async () => {
+      if (request.method === "GET" && request.url === "/") {
+        explorerHtmlResponse(response);
+        return;
+      }
       if (request.method === "GET" && request.url === "/health") {
         jsonResponse(response, 200, {
           status: "ok",
@@ -171,6 +216,48 @@ export function createOracleMcpHttpServer(options: {
           schemaHash: MCP_SCHEMA_SHA256,
           providerMode: options.providerMode,
         });
+        return;
+      }
+      if (
+        request.method === "GET" &&
+        request.url === "/explorer/api/bootstrap"
+      ) {
+        try {
+          explorerJsonResponse(
+            response,
+            await explorerBootstrap(options.runtime),
+            options.limits.maxResponseBytes,
+          );
+        } catch {
+          jsonResponse(response, 503, {
+            error: "Validated explorer metadata is unavailable",
+          });
+        }
+        return;
+      }
+      if (
+        request.method === "POST" &&
+        (request.url === "/explorer/api/search" ||
+          request.url === "/explorer/api/property")
+      ) {
+        let body: unknown;
+        try {
+          body = await readBoundedJson(request, options.limits.maxRequestBytes);
+        } catch (error) {
+          const tooLarge =
+            error instanceof Error && error.message === "request_too_large";
+          jsonResponse(response, tooLarge ? 413 : 400, {
+            error: tooLarge
+              ? "Request body exceeds the limit"
+              : "Invalid JSON body",
+          });
+          return;
+        }
+        const result =
+          request.url === "/explorer/api/search"
+            ? await explorerSearch(options.runtime, body)
+            : await explorerProperty(options.runtime, body);
+        explorerJsonResponse(response, result, options.limits.maxResponseBytes);
         return;
       }
       if (request.method !== "POST" || request.url !== "/mcp") {

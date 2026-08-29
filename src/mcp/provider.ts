@@ -7,9 +7,9 @@ import { DuckDBInstance } from "@duckdb/node-api";
 import type {
   LocalArtifactProviderConfig,
   McpProviderConfig,
-  PublicIpnsProviderConfig,
 } from "./config.js";
 import type { McpContractRegistry } from "./contracts.js";
+import { PublicIpnsProvider } from "./public-ipns-provider.js";
 import { validatePublicationPlan } from "../publication/plan.js";
 
 export type JsonObject = Record<string, unknown>;
@@ -36,14 +36,28 @@ export interface DatasetMetadata {
   canonicalDocumentCount: number;
   completedAt: string;
   coordinateCount: number;
+  coverageMode: "authoritative_complete" | "partial" | "sample";
   contractorCoverage: "available" | "partial" | "unavailable";
   datasetVersion: string;
   fixtureMatches: number;
+  limitations: string[];
   manifestSha256: string;
   objectCount: number;
   parquetSha256: string;
   plan: JsonObject;
   providerMode: McpProviderConfig["mode"];
+  publication: {
+    manifestCid: string;
+    openDataIpns: string | null;
+    openDataRootCid: string;
+    planCid: string | null;
+    planSha256: string;
+    queryTableIpns: string | null;
+    queryTableRootCid: string;
+    scopeId: string;
+    selectionHash: string;
+    sourceSnapshotId: string | null;
+  };
   permitCoverage: "available" | "partial" | "unavailable";
   runId: string;
   runSummary: JsonObject;
@@ -421,6 +435,20 @@ export class LocalArtifactProvider implements OracleMcpProvider {
     ) {
       throw new Error("Publication source watermark reconciliation failed");
     }
+    const graph = (
+      publicationPlan as unknown as {
+        graph?: {
+          openDataRoot: { expectedCid: string };
+          queryTableRoot: { expectedCid: string };
+        };
+      }
+    ).graph;
+    const manifestCid = (
+      publicationPlan.artifacts
+        .manifest as typeof publicationPlan.artifacts.manifest & {
+        expectedCid?: string;
+      }
+    ).expectedCid;
 
     return new LocalArtifactProvider({
       contracts,
@@ -431,14 +459,29 @@ export class LocalArtifactProvider implements OracleMcpProvider {
         canonicalDocumentCount: entriesByPublicId.size,
         completedAt,
         coordinateCount,
+        coverageMode: publicationPlan.coverage.mode,
         contractorCoverage: "unavailable",
         datasetVersion: `pasco-25k-${publicationPlan.planSha256.slice(0, 16)}`,
         fixtureMatches: 0,
+        limitations: publicationPlan.limitations,
         manifestSha256,
         objectCount: publicationPlan.artifacts.objectInventory.length,
         parquetSha256,
         plan: { sourceWatermark },
         providerMode: "local-artifact",
+        publication: {
+          manifestCid: manifestCid ?? "",
+          openDataIpns: null,
+          openDataRootCid: graph?.openDataRoot.expectedCid ?? "",
+          planCid: null,
+          planSha256: publicationPlan.planSha256,
+          queryTableIpns: null,
+          queryTableRootCid: graph?.queryTableRoot.expectedCid ?? "",
+          scopeId: publicationPlan.coverage.scopeId,
+          selectionHash:
+            publicationPlan.coverage.selection.selectedRecordSha256,
+          sourceSnapshotId: publicationPlan.coverage.sourceSnapshotId,
+        },
         permitCoverage: "unavailable",
         runId,
         runSummary,
@@ -623,38 +666,13 @@ async function readQueryRows(parquetPath: string): Promise<QueryPropertyRow[]> {
   }
 }
 
-export class PublicIpnsProvider implements OracleMcpProvider {
-  constructor(readonly config: PublicIpnsProviderConfig) {}
-
-  static create(config: PublicIpnsProviderConfig): never {
-    void config;
-    throw new Error(
-      "Public IPNS/IPFS publication is not configured for this local checkpoint",
-    );
-  }
-
-  getCanonicalProperty(): Promise<JsonObject | null> {
-    throw new Error("Public IPNS/IPFS provider is unavailable");
-  }
-
-  getMetadata(): Promise<DatasetMetadata> {
-    throw new Error("Public IPNS/IPFS provider is unavailable");
-  }
-
-  getPermit(): Promise<JsonObject | null> {
-    throw new Error("Public IPNS/IPFS provider is unavailable");
-  }
-
-  getQueryRows(): Promise<readonly QueryPropertyRow[]> {
-    throw new Error("Public IPNS/IPFS provider is unavailable");
-  }
-}
-
 export async function createMcpProvider(
   config: McpProviderConfig,
   contracts: McpContractRegistry,
 ): Promise<OracleMcpProvider> {
   return config.mode === "local-artifact"
     ? LocalArtifactProvider.create(config, contracts)
-    : PublicIpnsProvider.create(config);
+    : PublicIpnsProvider.create(config, contracts);
 }
+
+export { PublicIpnsProvider } from "./public-ipns-provider.js";
