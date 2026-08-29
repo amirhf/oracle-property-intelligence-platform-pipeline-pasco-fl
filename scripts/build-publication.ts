@@ -15,6 +15,7 @@ const runId = deterministicId("run", [
 const summary = await buildPublicationDryRun({
   dataDir: config.dataDir,
   databaseUrl: config.databaseUrl,
+  exportMode: "bounded",
   runId,
 });
 console.log(JSON.stringify(summary, null, 2));

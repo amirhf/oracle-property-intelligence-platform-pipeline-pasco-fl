@@ -10,6 +10,7 @@ import type {
   PublicIpnsProviderConfig,
 } from "./config.js";
 import type { McpContractRegistry } from "./contracts.js";
+import { validatePublicationPlan } from "../publication/plan.js";
 
 export type JsonObject = Record<string, unknown>;
 
@@ -282,14 +283,14 @@ export class LocalArtifactProvider implements OracleMcpProvider {
       ]);
     const manifestSha256 = await sha256File(manifestPath);
     const parquetSha256 = await sha256File(parquetPath);
-    const artifactHashes = record(plan.artifactHashes, "artifact hashes");
+    const publicationPlan = validatePublicationPlan(plan);
     if (
-      artifactHashes.openDataManifest !== manifestSha256 ||
-      artifactHashes.queryTable !== parquetSha256
+      publicationPlan.artifacts.manifest.sha256 !== manifestSha256 ||
+      publicationPlan.artifacts.parquet.sha256 !== parquetSha256
     ) {
       throw new Error("Publication artifact hash validation failed");
     }
-    const fixtureExclusion = record(plan.fixtureExclusion, "fixture exclusion");
+    const fixtureExclusion = publicationPlan.fixtureExclusion;
     if (fixtureExclusion.passed !== true || fixtureExclusion.matches !== 0) {
       throw new Error("Publication fixture isolation validation failed");
     }
@@ -396,24 +397,27 @@ export class LocalArtifactProvider implements OracleMcpProvider {
         ),
       ),
     );
-    const sourceWatermark = record(plan.sourceWatermark, "source watermark");
-    const reconciliation = record(plan.reconciliation, "reconciliation");
+    const sourceWatermark = {
+      appraiserObservedDate: publicationPlan.freshness.observedAt.slice(0, 10),
+      asOf: publicationPlan.freshness.asOf,
+      loadedAt: publicationPlan.freshness.loadedAt,
+      runId: publicationPlan.coverage.runId,
+      workflowId: publicationPlan.coverage.workflowId,
+    };
+    const reconciliation = publicationPlan.counts;
     const resultCounts = record(runSummary.resultCounts, "run counts");
     const completedAt = iso(sourceWatermark.loadedAt, "loaded timestamp");
     const elapsedMs = numberValue(
       resultCounts.elapsedMs,
       "elapsed milliseconds",
     );
-    const artifacts = record(plan.artifacts, "artifacts");
-    const openData = record(artifacts.openData, "open-data artifacts");
-    const queryTable = record(artifacts.queryTable, "query-table artifacts");
     const runId = stringValue(runSummary.runId, "run ID");
     const workflowId = stringValue(runSummary.workflowId, "workflow ID");
     if (
       runId !== manifest.sourceRunId ||
       runId !== sourceWatermark.runId ||
       workflowId !== sourceWatermark.workflowId ||
-      reconciliation.distinctParquetPropertyIds !== 25_000
+      reconciliation.queryTableDistinctPropertyIds !== 25_000
     ) {
       throw new Error("Publication source watermark reconciliation failed");
     }
@@ -428,15 +432,12 @@ export class LocalArtifactProvider implements OracleMcpProvider {
         completedAt,
         coordinateCount,
         contractorCoverage: "unavailable",
-        datasetVersion: `pasco-25k-${manifestSha256.slice(0, 16)}`,
+        datasetVersion: `pasco-25k-${publicationPlan.planSha256.slice(0, 16)}`,
         fixtureMatches: 0,
         manifestSha256,
-        objectCount:
-          numberValue(openData.objectCount, "open-data object count") +
-          numberValue(queryTable.objectCount, "query-table object count") +
-          2,
+        objectCount: publicationPlan.artifacts.objectInventory.length,
         parquetSha256,
-        plan,
+        plan: { sourceWatermark },
         providerMode: "local-artifact",
         permitCoverage: "unavailable",
         runId,

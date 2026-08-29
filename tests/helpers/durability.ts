@@ -152,6 +152,7 @@ export async function createSyntheticLifecycleSnapshot(
   }
   const rawPath = path.join(dataDir, "synthetic", `${options.label}.zip`);
   const extractedPath = path.join(dataDir, "synthetic", `${options.label}.csv`);
+  const gisPath = path.join(dataDir, "synthetic", `${options.label}.geojson`);
   await mkdir(path.dirname(rawPath), { recursive: true });
   await writeFile(rawPath, `synthetic-source-${options.label}\n`, {
     mode: 0o600,
@@ -161,6 +162,9 @@ export async function createSyntheticLifecycleSnapshot(
     `${options.folios.join("\n")}\nsynthetic-${options.label}\n`,
     { mode: 0o600 },
   );
+  await writeFile(gisPath, `synthetic-gis-${options.label}\n`, {
+    mode: 0o600,
+  });
   const downloadedSource = await createSourceObject({
     dataDir,
     filePath: rawPath,
@@ -177,6 +181,14 @@ export async function createSyntheticLifecycleSnapshot(
     sourceIdentifier: PASCO_PARCEL_AUTHORITY_SOURCE_IDENTIFIER,
     sourceSystem: "pasco_appraiser",
     stage: "extracted_source",
+  });
+  const gisSource = await createSourceObject({
+    dataDir,
+    filePath: gisPath,
+    observedAt: SYNTHETIC_AS_OF,
+    sourceIdentifier: `https://synthetic.invalid/${options.label}/gis.geojson`,
+    sourceSystem: "pasco_gis",
+    stage: "downloaded_source",
   });
   const folios = [...options.folios];
   const selectedRecordSha256 = sha256(JSON.stringify([...folios].sort()));
@@ -214,7 +226,7 @@ export async function createSyntheticLifecycleSnapshot(
     createdAt: options.createdAt ?? "2026-08-29T00:00:01.000Z",
     dataDir,
     sampling,
-    sourceObjects: [downloadedSource, parcelSource],
+    sourceObjects: [downloadedSource, parcelSource, gisSource],
   });
   const changedFolios = new Set(options.changedFolios ?? []);
   const properties = folios.map((folio) =>

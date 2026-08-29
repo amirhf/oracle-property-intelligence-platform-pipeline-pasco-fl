@@ -4,6 +4,11 @@ import {
   queryTableColumns,
   unavailablePublicationFields,
 } from "../../src/publication/dry-run.js";
+import {
+  parsePreparePublicationRequest,
+  parsePublicationApprovalRequest,
+  parsePublicationStatusRequest,
+} from "../../src/publication/requests.js";
 
 describe("local publication dry run", () => {
   it("keeps the frozen searchable property fields and explicit availability columns", () => {
@@ -23,6 +28,11 @@ describe("local publication dry run", () => {
       bbb_source_availability: "VARCHAR",
       open_roofing_permit_count: "INTEGER",
       maximum_open_roofing_permit_days: "INTEGER",
+      coverage_mode: "VARCHAR",
+      coverage_scope_id: "VARCHAR",
+      source_snapshot_id: "VARCHAR",
+      source_run_id: "VARCHAR",
+      selection_hash: "VARCHAR",
     });
   });
 
@@ -35,5 +45,36 @@ describe("local publication dry run", () => {
       open_roofing_permit_count: null,
       maximum_open_roofing_permit_days: null,
     });
+  });
+
+  it("strictly validates Publish/pasco requests", () => {
+    expect(
+      parsePreparePublicationRequest({
+        county: "pasco",
+        exportMode: "bounded",
+        runId: `run_${"a".repeat(32)}`,
+      }),
+    ).toMatchObject({ exportMode: "bounded" });
+    expect(() =>
+      parsePreparePublicationRequest({
+        county: "pasco",
+        exportMode: "authoritative",
+        runId: `run_${"a".repeat(32)}`,
+        authoritative: true,
+      }),
+    ).toThrow("strict validation");
+    expect(() =>
+      parsePublicationApprovalRequest({
+        approverReference: "controller",
+        county: "pasco",
+        planId: `plan_${"b".repeat(32)}`,
+        planSha256: "c".repeat(64),
+        unexpected: true,
+      }),
+    ).toThrow("strict validation");
+    expect(parsePublicationStatusRequest({})).toEqual({});
+    expect(() => parsePublicationStatusRequest({ county: "pasco" })).toThrow(
+      "strict validation",
+    );
   });
 });

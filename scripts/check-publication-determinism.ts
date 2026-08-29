@@ -14,17 +14,23 @@ const runId = deterministicId("run", [
 const first = await buildPublicationDryRun({
   dataDir: config.dataDir,
   databaseUrl: config.databaseUrl,
+  exportMode: "bounded",
   runId,
 });
 const second = await buildPublicationDryRun({
   dataDir: config.dataDir,
   databaseUrl: config.databaseUrl,
+  exportMode: "bounded",
   runId,
 });
 const comparable = (value: typeof first) => ({
+  activeProperties: value.activeProperties,
+  coverageMode: value.coverageMode,
+  inactiveProperties: value.inactiveProperties,
   objectCount: value.objectCount,
   openDataBytes: value.openDataBytes,
   openDataManifestSha256: value.openDataManifestSha256,
+  planId: value.planId,
   planSha256: value.planSha256,
   propertyCount: value.propertyCount,
   queryTableBytes: value.queryTableBytes,

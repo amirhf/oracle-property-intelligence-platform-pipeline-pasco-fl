@@ -1,6 +1,10 @@
 import * as restate from "@restatedev/restate-sdk";
 
 import {
+  approvePublicationPlan,
+  getPublicationState,
+} from "../src/db/publication-durability.js";
+import {
   loadPreparedPilot,
   markRunFailed,
   recordRunStarted,
@@ -12,6 +16,12 @@ import {
   DurableInputError,
 } from "../src/lib/durability-errors.js";
 import { deterministicId } from "../src/lib/hash.js";
+import { buildPublicationDryRun } from "../src/publication/dry-run.js";
+import {
+  parsePreparePublicationRequest,
+  parsePublicationApprovalRequest,
+  parsePublicationStatusRequest,
+} from "../src/publication/requests.js";
 import { preparePilot } from "../src/pilot/prepare.js";
 import { prepareScaleDataset } from "../src/scale/prepare.js";
 import { verifyPreparedInput } from "../src/snapshot/model.js";
@@ -277,11 +287,46 @@ export function createPipelineServices(dependencies: PipelineDependencies) {
   const publish = restate.object({
     name: "Publish",
     handlers: {
-      status: async (
-        _ctx: restate.ObjectContext,
-        _request: Record<string, never>,
-      ) => ({ enabled: false, reason: "publication_not_authorized" }),
+      approve: async (ctx: restate.ObjectContext, input: unknown) => {
+        if (ctx.key !== "pasco") {
+          throw new DurableInputError(
+            "Publish must be invoked with the Pasco county key",
+          );
+        }
+        const request = parsePublicationApprovalRequest(input);
+        return ctx.run("approve-exact-publication-plan", () =>
+          approvePublicationPlan(dependencies.databaseUrl, request),
+        );
+      },
+      prepare: async (ctx: restate.ObjectContext, input: unknown) => {
+        if (ctx.key !== "pasco") {
+          throw new DurableInputError(
+            "Publish must be invoked with the Pasco county key",
+          );
+        }
+        const request = parsePreparePublicationRequest(input);
+        return ctx.run("prepare-lifecycle-aware-publication-plan", () =>
+          buildPublicationDryRun({
+            dataDir: dependencies.dataDir,
+            databaseUrl: dependencies.databaseUrl,
+            exportMode: request.exportMode,
+            runId: request.runId,
+          }),
+        );
+      },
+      status: async (ctx: restate.ObjectContext, input: unknown) => {
+        if (ctx.key !== "pasco") {
+          throw new DurableInputError(
+            "Publish must be invoked with the Pasco county key",
+          );
+        }
+        parsePublicationStatusRequest(input);
+        return ctx.run("read-publication-state", () =>
+          getPublicationState(dependencies.databaseUrl),
+        );
+      },
     },
+    options: { asTerminalError: terminalError },
   });
 
   return {
