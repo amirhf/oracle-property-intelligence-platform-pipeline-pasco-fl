@@ -11,13 +11,21 @@ assessment publication.
 
 The approved 25-property candidate plan has 34 provider-CID-verified object
 checkpoints totaling 178,045 bytes. Its open-data Names API control plane reports
-the approved target, but the two required independent public resolvers still
-report the immutable prior. The durable plan is therefore
-`manual_intervention_required`, and the existing open-data intent is
-`update_ambiguous`. The query-table intent remains `prior_confirmed`; its IPNS
-identity has not been updated. The candidate executor is disabled. No completed
-IPNS publication, public read-plane verification, owner/canonical publication,
-or Vercel deployment is claimed.
+the approved target. The latest bounded observation also found the official
+Filebase gateway and dweb.link at the target while ipfs.io remained at the
+immutable prior. The durable plan therefore remains
+`manual_intervention_required`, and the existing open-data intent remains
+`update_ambiguous`, until a fresh policy-bound cycle is recorded. The query-table
+intent remains `prior_confirmed`; its IPNS identity has not been updated. The
+candidate executor is disabled. No completed IPNS publication, public read-plane
+verification, owner/canonical publication, or Vercel deployment is claimed.
+
+The controller-authorized `candidate_filebase_dweb_v1` policy is restricted to
+this exact candidate plan and approval. It requires the Filebase control plane,
+official Filebase public gateway and dweb.link to report the approved target.
+ipfs.io is retained as immutable diagnostic evidence but does not block this
+candidate-only profile. The policy cannot authorize `authoritative_complete`,
+owner/canonical publication or any different plan, approval, identity or CID.
 
 The candidate flow has separate `oracle_candidate_demo_*` plan, approval,
 object-effect, IPNS-intent and event tables. It never updates the accepted

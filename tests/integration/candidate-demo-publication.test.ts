@@ -4,7 +4,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   approveCandidateDemoPlan,
   assertCandidateIpnsMutationReady,
+  authorizeCandidateResolverPolicy,
   beginCandidateDemoExecution,
+  CANDIDATE_FILEBASE_DWEB_POLICY,
   checkpointCandidateIpnsVerified,
   checkpointCandidateObjectVerified,
   completeCandidateDemoPlan,
@@ -49,7 +51,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(databaseUrl)).toHaveLength(17);
+  expect(await runMigrations(databaseUrl)).toHaveLength(18);
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });
 
@@ -118,6 +120,30 @@ describe("candidate demo publication durability", () => {
       demoPlanSha256: demoPlan.demoPlanSha256,
     });
     expect(approval.state).toBe("approved");
+    const resolverAuthorization = await authorizeCandidateResolverPolicy(
+      databaseUrl,
+      {
+        approvalId: approval.approvalId!,
+        authorizedAt: "2026-08-30T00:00:00.500Z",
+        authorizerReference: "synthetic-controller",
+        demoPlanId: demoPlan.demoPlanId,
+        demoPlanSha256: demoPlan.demoPlanSha256,
+        policyId: CANDIDATE_FILEBASE_DWEB_POLICY,
+      },
+    );
+    expect(resolverAuthorization).toMatchObject({
+      policyId: CANDIDATE_FILEBASE_DWEB_POLICY,
+    });
+    await expect(
+      authorizeCandidateResolverPolicy(databaseUrl, {
+        approvalId: approval.approvalId!,
+        authorizedAt: "2026-08-30T00:00:00.501Z",
+        authorizerReference: "synthetic-controller",
+        demoPlanId: demoPlan.demoPlanId,
+        demoPlanSha256: demoPlan.demoPlanSha256,
+        policyId: CANDIDATE_FILEBASE_DWEB_POLICY,
+      }),
+    ).rejects.toThrow("replay conflict");
     expect(
       await approveCandidateDemoPlan(databaseUrl, {
         approvedAt: "2026-08-30T00:00:00.000Z",
@@ -184,12 +210,20 @@ describe("candidate demo publication durability", () => {
       },
       "open_data",
     );
+    const policyObservations = targetObservations(
+      demoPlan.targets.openData.targetCid,
+    );
+    policyObservations[2] = {
+      ...policyObservations[2]!,
+      observedCid: priorOpen,
+    };
     await expect(
       recordCandidateResolutionCycle(databaseUrl, {
         demoPlanId: demoPlan.demoPlanId,
         demoPlanSha256: demoPlan.demoPlanSha256,
         domain: "open_data",
-        observations: targetObservations(demoPlan.targets.openData.targetCid),
+        observations: policyObservations,
+        resolverPolicyId: CANDIDATE_FILEBASE_DWEB_POLICY,
       }),
     ).resolves.toMatchObject({
       classification: "target_observed",

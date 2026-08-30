@@ -29,6 +29,9 @@ const identitySchema = z.strictObject({
   demoPlanId: z.string().regex(/^demo_[a-f0-9]{32}$/),
   demoPlanSha256: sha256Schema,
 });
+export const CANDIDATE_FILEBASE_DWEB_POLICY =
+  "candidate_filebase_dweb_v1" as const;
+const candidateResolverPolicySchema = z.literal(CANDIDATE_FILEBASE_DWEB_POLICY);
 export const candidateDemoApprovalSchema = identitySchema.extend({
   approvedAt: z.string().datetime(),
   approverReference: z.string().regex(/^[a-z0-9][a-z0-9_-]{2,127}$/),
@@ -101,6 +104,13 @@ export interface CandidateResolutionCycleResult {
   sequence: number;
 }
 
+export interface CandidateResolverPolicyAuthorization {
+  authorizationSha256: string;
+  authorizedAt: string;
+  authorizerReference: string;
+  policyId: typeof CANDIDATE_FILEBASE_DWEB_POLICY;
+}
+
 function validateCandidateResolutionObservations(
   value: unknown,
 ): CandidateResolutionObservation[] {
@@ -139,12 +149,28 @@ function validateCandidateResolutionObservations(
 export function classifyCandidateResolutionObservations(input: {
   observations: unknown;
   priorCid: string;
+  resolverPolicyId?: typeof CANDIDATE_FILEBASE_DWEB_POLICY;
   targetCid: string;
 }): CandidateResolutionClassification {
   const observations = validateCandidateResolutionObservations(
     input.observations,
   );
-  const observed = observations
+  const policy = input.resolverPolicyId
+    ? candidateResolverPolicySchema.parse(input.resolverPolicyId)
+    : null;
+  if (policy && observations.length !== 4) {
+    throw new DurableInputError(
+      "Candidate resolver policy requires four observations",
+    );
+  }
+  const considered = policy
+    ? observations.filter((entry) =>
+        ["filebase_control", "filebase_gateway", "dweb_link"].includes(
+          entry.resolver,
+        ),
+      )
+    : observations;
+  const observed = considered
     .map((entry) => entry.observedCid)
     .filter((entry): entry is string => entry !== null);
   if (
@@ -154,7 +180,7 @@ export function classifyCandidateResolutionObservations(input: {
   ) {
     return "unexpected_cid";
   }
-  if (observations.some((entry) => entry.outcome !== "resolved")) {
+  if (considered.some((entry) => entry.outcome !== "resolved")) {
     return "unavailable";
   }
   if (observed.every((entry) => entry === input.targetCid)) {
@@ -164,6 +190,126 @@ export function classifyCandidateResolutionObservations(input: {
     return "prior_observed";
   }
   return "split";
+}
+
+export async function authorizeCandidateResolverPolicy(
+  databaseUrl: string,
+  requestValue: {
+    approvalId: string;
+    authorizedAt: string;
+    authorizerReference: string;
+    demoPlanId: string;
+    demoPlanSha256: string;
+    policyId: typeof CANDIDATE_FILEBASE_DWEB_POLICY;
+  },
+): Promise<CandidateResolverPolicyAuthorization> {
+  const identity = parse(
+    identitySchema,
+    {
+      demoPlanId: requestValue.demoPlanId,
+      demoPlanSha256: requestValue.demoPlanSha256,
+    },
+    "candidate resolver policy",
+  );
+  const policyId = candidateResolverPolicySchema.parse(requestValue.policyId);
+  const approvalId = z
+    .string()
+    .regex(/^demoapproval_[a-f0-9]{32}$/)
+    .parse(requestValue.approvalId);
+  const authorizedAt = z.string().datetime().parse(requestValue.authorizedAt);
+  const authorizerReference = z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9_-]{2,127}$/)
+    .parse(requestValue.authorizerReference);
+  const authorization = {
+    approvalId,
+    authorizedAt,
+    authorizerReference,
+    demoPlanId: identity.demoPlanId,
+    demoPlanSha256: identity.demoPlanSha256,
+    diagnosticResolver: "ipfs_io",
+    ownerCanonicalAuthority: false,
+    policyId,
+    requiredResolvers: ["filebase_control", "filebase_gateway", "dweb_link"],
+    scope: "candidate_owned_non_authoritative_demo",
+  } as const;
+  const authorizationSha256 = canonicalJsonSha256(authorization);
+  const sql = postgres(databaseUrl, { max: 1 });
+  try {
+    return await sql.begin(async (transaction) => {
+      await lock(transaction);
+      const plan = await loadPlan(transaction, identity);
+      const current = await loadState(transaction, identity);
+      if (
+        plan.coverageMode !== "sample" ||
+        current.approval_id !== approvalId
+      ) {
+        throw new DurableConflictError(
+          "Candidate resolver policy requires the exact approved sample plan",
+        );
+      }
+      await transaction`
+        INSERT INTO oracle_candidate_demo_resolver_policies (
+          policy_id, demo_plan_id, demo_plan_sha256, approval_id,
+          authorizer_reference, authorized_at, scope, required_resolvers,
+          diagnostic_resolver, owner_canonical_authority,
+          authorization_sha256
+        ) VALUES (
+          ${policyId}, ${identity.demoPlanId}, ${identity.demoPlanSha256},
+          ${approvalId}, ${authorizerReference}, ${authorizedAt},
+          'candidate_owned_non_authoritative_demo',
+          ${["filebase_control", "filebase_gateway", "dweb_link"]},
+          'ipfs_io', false, ${authorizationSha256}
+        )
+        ON CONFLICT (demo_plan_id, policy_id) DO NOTHING
+      `;
+      const rows = await transaction<
+        {
+          approval_id: string;
+          authorization_sha256: string;
+          authorized_at: Date | string;
+          authorizer_reference: string;
+        }[]
+      >`
+        SELECT approval_id, authorization_sha256, authorized_at,
+               authorizer_reference
+        FROM oracle_candidate_demo_resolver_policies
+        WHERE demo_plan_id = ${identity.demoPlanId}
+          AND policy_id = ${policyId}
+      `;
+      const row = rows[0];
+      if (
+        !row ||
+        row.approval_id !== approvalId ||
+        row.authorization_sha256 !== authorizationSha256 ||
+        new Date(row.authorized_at).toISOString() !== authorizedAt ||
+        row.authorizer_reference !== authorizerReference
+      ) {
+        throw new DurableConflictError(
+          "Candidate resolver policy replay conflict",
+        );
+      }
+      await recordEvent(
+        transaction,
+        identity.demoPlanId,
+        "candidate_resolver_policy_authorized",
+        {
+          approvalId,
+          authorizationSha256,
+          policyId,
+          scope: "candidate_owned_non_authoritative_demo",
+        },
+      );
+      return {
+        authorizationSha256,
+        authorizedAt,
+        authorizerReference,
+        policyId,
+      };
+    });
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
 }
 
 interface StateRow {
@@ -1122,6 +1268,7 @@ export async function recordCandidateResolutionCycle(
     demoPlanSha256: string;
     domain: "open_data" | "query_table";
     observations: unknown;
+    resolverPolicyId?: typeof CANDIDATE_FILEBASE_DWEB_POLICY;
   },
 ): Promise<CandidateResolutionCycleResult> {
   const identity = parse(
@@ -1138,6 +1285,9 @@ export async function recordCandidateResolutionCycle(
   const observations = validateCandidateResolutionObservations(
     requestValue.observations,
   );
+  const resolverPolicyId = requestValue.resolverPolicyId
+    ? candidateResolverPolicySchema.parse(requestValue.resolverPolicyId)
+    : null;
   const observationsCanonical = canonicalJson(observations);
   const evidenceSha256 = sha256(observationsCanonical);
   const sql = postgres(databaseUrl, { max: 1 });
@@ -1208,6 +1358,7 @@ export async function recordCandidateResolutionCycle(
       const classification = classifyCandidateResolutionObservations({
         observations,
         priorCid: intent.prior_cid,
+        ...(resolverPolicyId ? { resolverPolicyId } : {}),
         targetCid: intent.target_cid,
       });
       const replay = await transaction<
@@ -1217,11 +1368,12 @@ export async function recordCandidateResolutionCycle(
           evidence_sha256: string;
           intent_id: string;
           observations_canonical: string;
+          resolver_policy_id: string | null;
           sequence: number;
         }[]
       >`
         SELECT cycle_id, intent_id, sequence, classification,
-               evidence_sha256, observations_canonical
+               evidence_sha256, observations_canonical, resolver_policy_id
         FROM oracle_candidate_demo_resolution_cycles
         WHERE intent_id = ${intent.intent_id}
           AND evidence_sha256 = ${evidenceSha256}
@@ -1229,7 +1381,8 @@ export async function recordCandidateResolutionCycle(
       if (replay[0]) {
         if (
           replay[0].classification !== classification ||
-          replay[0].observations_canonical !== observationsCanonical
+          replay[0].observations_canonical !== observationsCanonical ||
+          replay[0].resolver_policy_id !== resolverPolicyId
         ) {
           throw new DurableConflictError(
             "Candidate resolution evidence replay conflict",
@@ -1261,12 +1414,12 @@ export async function recordCandidateResolutionCycle(
         INSERT INTO oracle_candidate_demo_resolution_cycles (
           cycle_id, intent_id, demo_plan_id, demo_plan_sha256, domain,
           sequence, classification, evidence_sha256, observation_count,
-          observations_canonical
+          observations_canonical, resolver_policy_id
         ) VALUES (
           ${cycleId}, ${intent.intent_id}, ${identity.demoPlanId},
           ${identity.demoPlanSha256}, ${domain}, ${sequence},
           ${classification}, ${evidenceSha256}, ${observations.length},
-          ${observationsCanonical}
+          ${observationsCanonical}, ${resolverPolicyId}
         )
       `;
       const allowedState =
@@ -1333,6 +1486,7 @@ export async function recordCandidateResolutionCycle(
           evidenceSha256,
           intentId: intent.intent_id,
           observationCount: observations.length,
+          resolverPolicyId,
           sequence,
         },
       );
