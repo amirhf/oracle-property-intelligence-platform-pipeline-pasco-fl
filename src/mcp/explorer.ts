@@ -44,11 +44,72 @@ function ownershipSummary(value: unknown): JsonObject {
   };
 }
 
+const FORBIDDEN_EXPLORER_KEYS = new Set([
+  "apn",
+  "contractor",
+  "contractorbusinessname",
+  "contractorcompany",
+  "contractorid",
+  "contractoridentity",
+  "contractorlicense",
+  "contractorname",
+  "exactfolio",
+  "folio",
+  "folioid",
+  "folionumber",
+  "mailingaddress",
+  "mailingaddress1",
+  "mailingaddress2",
+  "mailingcity",
+  "mailingpostalcode",
+  "mailingstate",
+  "mailingzipcode",
+  "ownerdisplayname",
+  "owneremail",
+  "ownername",
+  "ownername1",
+  "ownername2",
+  "ownerphone",
+  "parcel",
+  "parcelid",
+  "parcelidentifier",
+  "parcelnumber",
+  "parcelno",
+  "permitid",
+  "permitidentifier",
+  "permitnumber",
+  "permitno",
+  "phonenumber",
+  "propertyfolio",
+  "requestidentifier",
+  "sourcerecordkey",
+  "taxparcelid",
+  "taxparcelnumber",
+]);
+
+const HISTORICAL_NO_REMOTE_EFFECT =
+  /^No Filebase, IPFS, or IPNS effect was performed\.?$/i;
+
+function normalizedKey(value: string): string {
+  return value.toLowerCase().replaceAll(/[^a-z0-9]/g, "");
+}
+
+function removeForbiddenExplorerFields(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => removeForbiddenExplorerFields(entry));
+  }
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as JsonObject)
+      .filter(([key]) => !FORBIDDEN_EXPLORER_KEYS.has(normalizedKey(key)))
+      .map(([key, entry]) => [key, removeForbiddenExplorerFields(entry)]),
+  );
+}
+
 function privacySafeProperty(value: unknown): JsonObject {
   const property = structuredClone(record(value));
-  delete property.folio;
   property.ownership = ownershipSummary(property.ownership);
-  return property;
+  return record(removeForbiddenExplorerFields(property));
 }
 
 function privacySafeResult(result: ToolExecutionResult): JsonObject {
@@ -65,7 +126,23 @@ function privacySafeResult(result: ToolExecutionResult): JsonObject {
   } else if (typeof responseData.propertyId === "string") {
     response.data = privacySafeProperty(responseData);
   }
-  return response;
+  return record(removeForbiddenExplorerFields(response));
+}
+
+function candidatePipelineSummary(
+  result: ToolExecutionResult,
+  hasCandidateDemo: boolean,
+): JsonObject {
+  const summary = structuredClone(data(result));
+  if (!hasCandidateDemo) return summary;
+  summary.publicationArtifacts = {
+    ...record(summary.publicationArtifacts),
+    activeCandidatePublication: false,
+    description:
+      "Historical local source-plan and dry-run evidence; this is not the status or object inventory of the active candidate publication.",
+    evidenceScope: "historical_local_source_plan",
+  };
+  return summary;
 }
 
 async function execute(
@@ -90,21 +167,58 @@ export async function explorerBootstrap(
   if (service.isError || pipeline.isError || capabilities.isError) {
     throw new Error("Explorer metadata is unavailable");
   }
+  const hasCandidateDemo = metadata.publication.candidateDemoPlanId !== null;
+  const candidateObjectCount =
+    metadata.objectCount + (metadata.publication.planCid === null ? 0 : 1);
+  const limitations = hasCandidateDemo
+    ? metadata.limitations
+        .filter((limitation) => !HISTORICAL_NO_REMOTE_EFFECT.test(limitation))
+        .concat(
+          "The active public demo uses candidate-owned Filebase objects and candidate-owned IPNS identities.",
+          "No Filebase or IPNS mutation occurred during the recent routing and explorer-display deployments; the earlier candidate publication effects are reported separately.",
+        )
+    : metadata.limitations;
   return {
     service: data(service),
-    pipeline: data(pipeline),
+    pipeline: candidatePipelineSummary(pipeline, hasCandidateDemo),
     capabilities: data(capabilities),
     publication: {
-      candidateDemo:
-        metadata.publication.candidateDemoPlanId === null
-          ? null
-          : {
-              planId: metadata.publication.candidateDemoPlanId,
-              planSha256: metadata.publication.candidateDemoPlanSha256,
-              resolverPolicy: metadata.publication.resolverPolicy,
-              disclosure:
-                "Temporary candidate-owned Filebase demonstration of protocol compatibility. The buckets and IPNS identities are candidate-controlled and are not represented as Elephant-owned, owner-approved, authoritative-complete, or the final canonical assessment publication.",
+      candidateDemo: !hasCandidateDemo
+        ? null
+        : {
+            coordinateCount: metadata.coordinateCount,
+            objectCount: candidateObjectCount,
+            planId: metadata.publication.candidateDemoPlanId,
+            planSha256: metadata.publication.candidateDemoPlanSha256,
+            propertyCount: metadata.canonicalDocumentCount,
+            providerCidVerification: {
+              description: `All ${candidateObjectCount} provider-returned CIDs matched deterministic local CIDs.`,
+              matchedObjectCount: candidateObjectCount,
+              mismatchCount: 0,
+              status: "all_matched",
             },
+            publicationTimestamp: {
+              availability: "unavailable",
+              reason: "not_recorded_in_public_candidate_metadata",
+              value: null,
+            },
+            remoteResources: {
+              filebase: {
+                objectCount: candidateObjectCount,
+                ownership: "candidate_owned",
+                status: "uploaded_and_cid_verified",
+              },
+              ipns: {
+                identityCount: 2,
+                ownership: "candidate_owned",
+                status: "updated_and_publicly_resolved",
+              },
+            },
+            remoteStatus: "candidate_filebase_ipns_active",
+            resolverPolicy: metadata.publication.resolverPolicy,
+            disclosure:
+              "Temporary candidate-owned Filebase demonstration of protocol compatibility. The buckets and IPNS identities are candidate-controlled and are not represented as Elephant-owned, owner-approved, authoritative-complete, or the final canonical assessment publication.",
+          },
       coverageMode: metadata.coverageMode,
       coordinateCount: metadata.coordinateCount,
       propertyCount: metadata.canonicalDocumentCount,
@@ -128,7 +242,7 @@ export async function explorerBootstrap(
         asOf: metadata.asOf,
         completedAt: metadata.completedAt,
       },
-      limitations: metadata.limitations,
+      limitations,
     },
   };
 }
@@ -189,7 +303,8 @@ export const ORACLE_EXPLORER_HTML = `<!doctype html>
     <div class="eyebrow">Read-only official public-record plane</div>
     <h1>Pasco Oracle explorer</h1>
     <p class="notice" id="coverage">Loading coverage identity…</p>
-    <p class="muted">Owner names, mailing-address values, phones, emails and contractor identities are not rendered by this explorer. Missing permit coverage is unavailable—not zero.</p>
+    <p class="notice" id="candidate-disclosure" hidden></p>
+    <p class="muted">Parcel and folio identifiers, owner names, mailing-address values, phones, emails, contractor identities and permit numbers are not returned by this explorer. Missing permit coverage is unavailable—not zero.</p>
   </header>
   <section>
     <h2>Dataset and pipeline</h2>
@@ -241,12 +356,19 @@ fetch('/explorer/api/bootstrap').then(response => response.json()).then(value =>
   document.getElementById('coverage').textContent = value.publication.coverageMode === 'authoritative_complete'
     ? 'Authoritative-complete coverage for the displayed sealed scope.'
     : value.publication.coverageMode + ' coverage only. This is not complete Pasco County coverage.';
+  if (value.publication.candidateDemo) {
+    const disclosure = document.getElementById('candidate-disclosure');
+    disclosure.hidden = false;
+    disclosure.textContent = value.publication.candidateDemo.disclosure;
+  }
   const metadata = document.getElementById('metadata');
   const values = {
     contract: value.service.contractVersion,
     dataset: value.service.dataset.version,
     properties: value.publication.propertyCount,
     coordinates: value.publication.coordinateCount,
+    candidateObjects: value.publication.candidateDemo?.objectCount ?? 'not applicable',
+    remoteStatus: value.publication.candidateDemo?.remoteStatus ?? 'not applicable',
     permits: value.pipeline.coverage.permits.status,
     freshness: value.publication.freshness.asOf
   };

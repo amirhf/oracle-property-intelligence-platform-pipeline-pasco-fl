@@ -9,6 +9,7 @@ import { McpContractRegistry } from "../../src/mcp/contracts.js";
 import { MCP_TOOL_NAMES } from "../../src/mcp/constants.js";
 import { PublicIpnsProvider } from "../../src/mcp/public-ipns-provider.js";
 import { OracleMcpRuntime } from "../../src/mcp/runtime.js";
+import { explorerProperty, explorerSearch } from "../../src/mcp/explorer.js";
 import {
   createOracleMcpHttpServer,
   listenOracleMcpServer,
@@ -27,7 +28,79 @@ const SENSITIVE_SENTINELS = [
   SYNTHETIC_MAILING_SENTINEL,
   SYNTHETIC_PHONE_SENTINEL,
   SYNTHETIC_EMAIL_SENTINEL,
+  "SYNTH-1",
+  "CONTRACTOR-SENTINEL",
+  "PERMIT-SENTINEL",
 ];
+
+const FORBIDDEN_EXPLORER_KEYS = new Set([
+  "apn",
+  "contractor",
+  "contractorbusinessname",
+  "contractorcompany",
+  "contractorid",
+  "contractoridentity",
+  "contractorlicense",
+  "contractorname",
+  "exactfolio",
+  "folio",
+  "folioid",
+  "folionumber",
+  "mailingaddress",
+  "mailingaddress1",
+  "mailingaddress2",
+  "mailingcity",
+  "mailingpostalcode",
+  "mailingstate",
+  "mailingzipcode",
+  "ownerdisplayname",
+  "owneremail",
+  "ownername",
+  "ownername1",
+  "ownername2",
+  "ownerphone",
+  "parcel",
+  "parcelid",
+  "parcelidentifier",
+  "parcelnumber",
+  "parcelno",
+  "permitid",
+  "permitidentifier",
+  "permitnumber",
+  "permitno",
+  "phonenumber",
+  "propertyfolio",
+  "requestidentifier",
+  "sourcerecordkey",
+  "taxparcelid",
+  "taxparcelnumber",
+]);
+
+function assertPrivacySafeExplorerJson(value: unknown): void {
+  const forbiddenPaths: string[] = [];
+  const visit = (candidate: unknown, path: string): void => {
+    if (Array.isArray(candidate)) {
+      candidate.forEach((entry, index) => visit(entry, `${path}[${index}]`));
+      return;
+    }
+    if (candidate === null || typeof candidate !== "object") return;
+    for (const [key, entry] of Object.entries(
+      candidate as Record<string, unknown>,
+    )) {
+      const normalizedKey = key.toLowerCase().replaceAll(/[^a-z0-9]/g, "");
+      if (FORBIDDEN_EXPLORER_KEYS.has(normalizedKey)) {
+        forbiddenPaths.push(`${path}.${key}`);
+      }
+      visit(entry, `${path}.${key}`);
+    }
+  };
+  visit(value, "$response");
+  expect(forbiddenPaths).toEqual([]);
+  const serialized = JSON.stringify(value);
+  for (const sentinel of SENSITIVE_SENTINELS) {
+    expect(serialized).not.toContain(sentinel);
+  }
+}
 
 describe("privacy-safe public Oracle explorer", () => {
   let baseUrl: string;
@@ -39,7 +112,7 @@ describe("privacy-safe public Oracle explorer", () => {
 
   beforeAll(async () => {
     const contracts = await McpContractRegistry.create();
-    const set = await syntheticPublicSet();
+    const set = await syntheticPublicSet({ candidatePlanBindings: true });
     propertyId = set.propertyIds[0]!;
     publicationPropertyCount = set.propertyIds.length;
     const provider = await PublicIpnsProvider.create(
@@ -95,12 +168,29 @@ describe("privacy-safe public Oracle explorer", () => {
     expect(bootstrap.status).toBe(200);
     const value = (await bootstrap.json()) as Record<string, unknown>;
     expect(value.publication).toMatchObject({
+      candidateDemo: {
+        objectCount: expect.any(Number),
+        propertyCount: publicationPropertyCount,
+        providerCidVerification: {
+          mismatchCount: 0,
+          status: "all_matched",
+        },
+        remoteStatus: "candidate_filebase_ipns_active",
+      },
       coverageMode: "sample",
       coordinateCount: publicationCoordinateCount,
       propertyCount: publicationPropertyCount,
     });
-    expect(JSON.stringify(value)).toContain("not complete Pasco coverage");
-    expect(JSON.stringify(value)).not.toContain(process.cwd());
+    const serialized = JSON.stringify(value);
+    expect(serialized).toContain("not complete Pasco coverage");
+    expect(serialized).toContain(
+      "candidate-owned Filebase objects and candidate-owned IPNS identities",
+    );
+    expect(serialized).toContain("historical_local_source_plan");
+    expect(serialized).not.toContain(
+      "No Filebase, IPFS, or IPNS effect was performed.",
+    );
+    expect(serialized).not.toContain(process.cwd());
   });
 
   it("executes validated searches while suppressing owner/contact values", async () => {
@@ -116,17 +206,13 @@ describe("privacy-safe public Oracle explorer", () => {
     );
     expect(response.status).toBe(200);
     const value = (await response.json()) as Record<string, unknown>;
-    const serialized = JSON.stringify(value);
-    for (const sentinel of SENSITIVE_SENTINELS) {
-      expect(serialized).not.toContain(sentinel);
-    }
+    assertPrivacySafeExplorerJson(value);
     const opportunity = (
       (value.data as Record<string, unknown>).opportunities as Array<
         Record<string, unknown>
       >
     )[0]!;
     const property = opportunity.property as Record<string, unknown>;
-    expect(property).not.toHaveProperty("folio");
     expect(property.ownership).toMatchObject({
       currentOwners: { availability: "available", ownerCount: 1 },
       phone: { availability: "unavailable" },
@@ -152,10 +238,7 @@ describe("privacy-safe public Oracle explorer", () => {
     );
     const serialized = await response.text();
     expect(response.status).toBe(200);
-    expect(JSON.parse(serialized)).not.toHaveProperty("data.folio");
-    for (const sentinel of SENSITIVE_SENTINELS) {
-      expect(serialized).not.toContain(sentinel);
-    }
+    assertPrivacySafeExplorerJson(JSON.parse(serialized));
     for (const request of [
       fetch(`${baseUrl}/explorer/api/sql`, { method: "POST", body: "{}" }),
       fetch(`${baseUrl}/publish`, { method: "POST", body: "{}" }),
@@ -165,6 +248,61 @@ describe("privacy-safe public Oracle explorer", () => {
       await expect(request).resolves.toMatchObject({ status: 404 });
     }
   });
+
+  it.each([
+    ["search", explorerSearch],
+    ["property", explorerProperty],
+  ])(
+    "removes nested forbidden aliases and sentinels from %s JSON",
+    async (kind, project) => {
+      const hostileProperty = {
+        APN: "SYNTH-1",
+        contractor: {
+          name: "CONTRACTOR-SENTINEL",
+        },
+        evidence: [
+          {
+            evidenceId: `evidence_${"a".repeat(32)}`,
+            sourceRecordKey: "SYNTH-1",
+          },
+        ],
+        folioNumber: "SYNTH-1",
+        mailingAddress1: SYNTHETIC_MAILING_SENTINEL,
+        ownerName1: SYNTHETIC_OWNER_SENTINEL,
+        ownership: {
+          classification: { availability: "unavailable" },
+          currentOwners: {
+            availability: "available",
+            value: [{ ownerName: SYNTHETIC_OWNER_SENTINEL }],
+          },
+          email: { availability: "unavailable" },
+          phone: { availability: "unavailable" },
+          publicMailingAddress: {
+            availability: "available",
+            value: { line1: SYNTHETIC_MAILING_SENTINEL },
+          },
+        },
+        parcelNumber: "SYNTH-1",
+        taxParcelId: "SYNTH-1",
+        permits: [
+          {
+            permitNumber: "PERMIT-SENTINEL",
+            requestIdentifier: "PERMIT-SENTINEL",
+          },
+        ],
+        propertyId: `prop_${"b".repeat(32)}`,
+      };
+      const result =
+        kind === "search"
+          ? { data: { opportunities: [{ property: hostileProperty }] } }
+          : { data: hostileProperty };
+      const mockRuntime = {
+        execute: async () => ({ isError: false, result }),
+      } as unknown as OracleMcpRuntime;
+      const projected = await project(mockRuntime, {});
+      assertPrivacySafeExplorerJson(projected);
+    },
+  );
 
   it("preserves request-size limits after pathname routing", async () => {
     const response = await fetch(
