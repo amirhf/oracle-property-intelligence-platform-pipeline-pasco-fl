@@ -123,6 +123,7 @@ describe("privacy-safe public Oracle explorer", () => {
       >
     )[0]!;
     const property = opportunity.property as Record<string, unknown>;
+    expect(property).not.toHaveProperty("folio");
     expect(property.ownership).toMatchObject({
       currentOwners: { availability: "available", ownerCount: 1 },
       phone: { availability: "unavailable" },
@@ -148,6 +149,7 @@ describe("privacy-safe public Oracle explorer", () => {
     );
     const serialized = await response.text();
     expect(response.status).toBe(200);
+    expect(JSON.parse(serialized)).not.toHaveProperty("data.folio");
     for (const sentinel of SENSITIVE_SENTINELS) {
       expect(serialized).not.toContain(sentinel);
     }

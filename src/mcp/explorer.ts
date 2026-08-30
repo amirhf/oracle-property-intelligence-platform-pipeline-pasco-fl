@@ -46,6 +46,7 @@ function ownershipSummary(value: unknown): JsonObject {
 
 function privacySafeProperty(value: unknown): JsonObject {
   const property = structuredClone(record(value));
+  delete property.folio;
   property.ownership = ownershipSummary(property.ownership);
   return property;
 }
@@ -242,7 +243,7 @@ fetch('/explorer/api/bootstrap').then(response => response.json()).then(value =>
   const metadata = document.getElementById('metadata');
   const values = {
     contract: value.service.contractVersion,
-    dataset: value.service.datasetVersion,
+    dataset: value.service.dataset.version,
     properties: value.publication.propertyCount,
     coordinates: value.pipeline.coverage.coordinates.available,
     permits: value.pipeline.coverage.permits.status,
