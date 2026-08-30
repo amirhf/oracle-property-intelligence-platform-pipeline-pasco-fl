@@ -32,6 +32,7 @@ const SENSITIVE_SENTINELS = [
 describe("privacy-safe public Oracle explorer", () => {
   let baseUrl: string;
   let client: Client;
+  let publicationCoordinateCount: number;
   let propertyId: string;
   let publicationPropertyCount: number;
   let server: ReturnType<typeof createOracleMcpHttpServer>;
@@ -46,6 +47,7 @@ describe("privacy-safe public Oracle explorer", () => {
       contracts,
       set.transport,
     );
+    publicationCoordinateCount = (await provider.getMetadata()).coordinateCount;
     const limits = {
       maxRequestBytes: 65_536,
       maxResponseBytes: 2 * 1024 * 1024,
@@ -94,6 +96,7 @@ describe("privacy-safe public Oracle explorer", () => {
     const value = (await bootstrap.json()) as Record<string, unknown>;
     expect(value.publication).toMatchObject({
       coverageMode: "sample",
+      coordinateCount: publicationCoordinateCount,
       propertyCount: publicationPropertyCount,
     });
     expect(JSON.stringify(value)).toContain("not complete Pasco coverage");
