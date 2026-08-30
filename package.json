@@ -2,6 +2,7 @@
   "name": "prism-pasco-oracle",
   "version": "0.1.0",
   "private": true,
+  "main": "api/index.ts",
   "type": "module",
   "engines": {
     "node": "22.23.2"
