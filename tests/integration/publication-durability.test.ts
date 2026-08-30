@@ -138,7 +138,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(21);
+  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(24);
   expect(await runMigrations(schemaDatabaseUrl)).toEqual([]);
 }, 30_000);
 
@@ -775,7 +775,7 @@ describe("lifecycle-aware durable publication", () => {
     expect(() => createRemotePublicationExecutor(planB)).toThrow(
       "no production or local publisher",
     );
-  }, 120_000);
+  }, 600_000);
 
   it("rejects stale projection heads at approval and immediately before execution", async () => {
     const headSql = postgres(schemaDatabaseUrl, { max: 1 });

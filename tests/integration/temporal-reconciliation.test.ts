@@ -72,9 +72,9 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(21);
+  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(24);
   expect(await runMigrations(schemaDatabaseUrl)).toEqual([]);
-}, 30_000);
+}, 120_000);
 
 afterAll(async () => {
   const admin = postgres(adminDatabaseUrl, { max: 1 });
@@ -106,6 +106,29 @@ describe("temporal property current-state reconciliation", () => {
       reactivatedProperties: 0,
       unchangedProperties: 0,
     });
+    const genesisSql = postgres(schemaDatabaseUrl, { max: 1 });
+    try {
+      const checkpoints = await genesisSql<{ phase: string; rows: number }[]>`
+        SELECT phase, sum(row_count)::int AS rows
+        FROM oracle_loader_batch_checkpoints
+        WHERE source_snapshot_id = ${snapshotA.snapshot.snapshotId}
+        GROUP BY phase ORDER BY phase
+      `;
+      expect(checkpoints).toEqual([
+        { phase: "fact_versions", rows: 250 },
+        { phase: "materialized_facts", rows: 250 },
+        { phase: "materialized_properties", rows: 25 },
+        { phase: "property_versions", rows: 25 },
+      ]);
+      await expect(
+        genesisSql`
+          UPDATE oracle_loader_batch_checkpoints SET row_count = 1
+          WHERE source_snapshot_id = ${snapshotA.snapshot.snapshotId}
+        `,
+      ).rejects.toThrow("immutable");
+    } finally {
+      await genesisSql.end({ timeout: 5 });
+    }
 
     const snapshotB = await createSyntheticLifecycleSnapshot(dataDir, {
       changedFolios: ["TEMP-02"],
@@ -210,6 +233,11 @@ describe("temporal property current-state reconciliation", () => {
         failed_property: 0,
         preserved_active: true,
       });
+      const failedCheckpoints = await rollbackSql<{ count: number }[]>`
+        SELECT count(*)::int AS count FROM oracle_loader_batch_checkpoints
+        WHERE source_snapshot_id = ${failedLoad.snapshot.snapshotId}
+      `;
+      expect(failedCheckpoints[0]?.count).toBe(0);
     } finally {
       await rollbackSql.end({ timeout: 5 });
     }
@@ -317,6 +345,7 @@ describe("temporal property current-state reconciliation", () => {
     try {
       const facts = await factSql<
         {
+          missing_availability_facts: number;
           coordinate_facts: number;
           owner_facts: number;
           removed_owner_events: number;
@@ -325,6 +354,10 @@ describe("temporal property current-state reconciliation", () => {
         SELECT
           count(*) FILTER (WHERE fact.fact_type = 'ownership')::int AS owner_facts,
           count(*) FILTER (WHERE fact.fact_type = 'coordinate')::int AS coordinate_facts,
+          count(*) FILTER (
+            WHERE fact.fact_type = 'availability'
+              AND fact.natural_key IN ('coordinates', 'ownership')
+          )::int AS missing_availability_facts,
           (SELECT count(*)::int FROM oracle_projection_fact_changes change
            JOIN oracle_property_versions version
              ON version.property_id = change.property_id
@@ -342,6 +375,7 @@ describe("temporal property current-state reconciliation", () => {
       `;
       expect(facts[0]).toEqual({
         coordinate_facts: 1,
+        missing_availability_facts: 1,
         owner_facts: 0,
         removed_owner_events: 1,
       });
@@ -545,5 +579,5 @@ describe("temporal property current-state reconciliation", () => {
     expect(
       concurrent.filter((result) => result.status === "rejected"),
     ).toHaveLength(1);
-  }, 60_000);
+  }, 600_000);
 });

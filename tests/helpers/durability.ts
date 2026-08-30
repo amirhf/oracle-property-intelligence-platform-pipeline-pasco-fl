@@ -196,8 +196,10 @@ export async function createSyntheticLifecycleSnapshot(
     stage: "downloaded_source",
   });
   const folios = [...options.folios];
-  const selectedRecordSha256 = sha256(JSON.stringify([...folios].sort()));
   const completeIntent = options.coverage !== "sample";
+  const selectedRecordSha256 = completeIntent
+    ? sha256(`${[...folios].sort().join("\n")}\n`)
+    : sha256(JSON.stringify([...folios].sort()));
   const sampling = {
     algorithm: completeIntent
       ? AUTHORITATIVE_PARCEL_SELECTION_ALGORITHM

@@ -98,7 +98,7 @@ const fileBindingSchema = z.strictObject({
 
 export const preparedInputManifestSchema = z.strictObject({
   createdAt: isoDateTimeSchema,
-  kind: z.enum(["pilot", "scale"]),
+  kind: z.enum(["pilot", "scale", "authoritative"]),
   manifestVersion: z.literal(PREPARED_INPUT_MANIFEST_VERSION),
   prepared: fileBindingSchema,
   preparedInputId: preparedInputIdSchema,
@@ -108,7 +108,7 @@ export const preparedInputManifestSchema = z.strictObject({
 });
 
 export const preparedInputReferenceSchema = z.strictObject({
-  kind: z.enum(["pilot", "scale"]),
+  kind: z.enum(["pilot", "scale", "authoritative"]),
   manifest: fileBindingSchema,
   preparedInputId: preparedInputIdSchema,
   snapshotId: snapshotIdSchema,
@@ -593,11 +593,13 @@ export async function verifyPreparedInput(
   const prepared = parsePrepared(
     JSON.parse(await readFile(preparedPath, "utf8")),
   );
-  const selectedRecordSha256 = sha256(
-    JSON.stringify(
-      prepared.properties.map((property) => property.parcel.exactFolio).sort(),
-    ),
-  );
+  const sortedFolios = prepared.properties
+    .map((property) => property.parcel.exactFolio)
+    .sort();
+  const selectedRecordSha256 =
+    prepared.sampleAlgorithm === "official-parcel-complete-v1"
+      ? sha256(`${sortedFolios.join("\n")}\n`)
+      : sha256(JSON.stringify(sortedFolios));
   if (
     prepared.snapshotId !== reference.snapshotId ||
     prepared.snapshotManifestSha256 !== manifest.snapshotManifest.sha256 ||

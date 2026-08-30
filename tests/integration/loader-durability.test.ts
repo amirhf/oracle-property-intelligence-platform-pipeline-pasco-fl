@@ -65,7 +65,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(21);
+  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(24);
   expect(await runMigrations(schemaDatabaseUrl)).toEqual([]);
   snapshotA = await createSyntheticSnapshot(dataDir, "a");
   snapshotB = await createSyntheticSnapshot(dataDir, "b");
@@ -113,14 +113,52 @@ describe("Loader/pasco durability", () => {
 
   it("serializes concurrent Snapshot A calls and returns the stored replay", async () => {
     await recordRunStarted(schemaDatabaseUrl, snapshotA.request);
-    const [first, concurrentReplay] = await Promise.all([
-      load(snapshotA),
-      load(snapshotA),
-    ]);
+    const timingSql = postgres(schemaDatabaseUrl, { max: 1 });
+    try {
+      await timingSql.unsafe(`
+        CREATE FUNCTION oracle_test_pause_sample_insert()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          PERFORM pg_sleep(0.25);
+          RETURN NULL;
+        END
+        $$
+      `);
+      await timingSql.unsafe(`
+        CREATE TRIGGER oracle_test_pause_sample_insert
+        BEFORE INSERT ON oracle_sample_property_versions
+        FOR EACH STATEMENT EXECUTE FUNCTION oracle_test_pause_sample_insert()
+      `);
+      await timingSql`
+        UPDATE oracle_pipeline_runs SET started_at = clock_timestamp()
+        WHERE run_id = ${snapshotA.request.runId}
+      `;
+    } finally {
+      await timingSql.end({ timeout: 5 });
+    }
+    const [first, concurrentReplay] = await (async () => {
+      try {
+        return await Promise.all([load(snapshotA), load(snapshotA)]);
+      } finally {
+        const cleanupSql = postgres(schemaDatabaseUrl, { max: 1 });
+        try {
+          await cleanupSql.unsafe(`
+            DROP TRIGGER oracle_test_pause_sample_insert
+            ON oracle_sample_property_versions
+          `);
+          await cleanupSql.unsafe(
+            "DROP FUNCTION oracle_test_pause_sample_insert()",
+          );
+        } finally {
+          await cleanupSql.end({ timeout: 5 });
+        }
+      }
+    })();
     const restartedReplay = await load(snapshotA);
 
     expect(concurrentReplay).toEqual(first);
     expect(restartedReplay).toEqual(first);
+    expect(first.elapsedMs).toBeGreaterThanOrEqual(200);
     expect(first).toMatchObject({
       acceptedProperties: 25,
       activeProperties: 25,
@@ -138,6 +176,7 @@ describe("Loader/pasco durability", () => {
       const counts = await sql<
         {
           completed_effects: number;
+          completion_elapsed_ms: number;
           hashed_results: number;
           canonical_properties: number;
           sample_properties: number;
@@ -146,12 +185,17 @@ describe("Loader/pasco durability", () => {
       >`
         SELECT
           (SELECT count(*)::int FROM oracle_loader_effects WHERE status = 'completed') AS completed_effects,
+          (SELECT GREATEST(0, EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)::int
+           FROM oracle_pipeline_runs WHERE run_id = ${snapshotA.request.runId}) AS completion_elapsed_ms,
           (SELECT count(*)::int FROM oracle_loader_effects WHERE result_sha256 ~ '^[a-f0-9]{64}$') AS hashed_results,
           (SELECT count(*)::int FROM oracle_properties) AS canonical_properties,
           (SELECT count(*)::int FROM oracle_sample_property_versions) AS sample_properties,
           (SELECT count(*)::int FROM oracle_reconciliation_outcomes) AS reconciliations
       `;
-      expect(counts[0]).toEqual({
+      const { completion_elapsed_ms: completionElapsedMs, ...stableCounts } =
+        counts[0]!;
+      expect(completionElapsedMs).toBeGreaterThanOrEqual(200);
+      expect(stableCounts).toEqual({
         completed_effects: 1,
         hashed_results: 1,
         canonical_properties: 0,

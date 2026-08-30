@@ -341,29 +341,33 @@ export async function loadPreparedScale(
           `;
         }
 
-        const roofRows = propertyBatch.map((entry) => {
+        const roofRows = propertyBatch.flatMap((entry) => {
+          if (entry.yearBuilt === null) return [];
           const roofSignal = yearBuiltRoofProxy(entry.yearBuilt, request.asOf);
-          return {
-            age_years: roofSignal.ageYears,
-            as_of: request.asOf,
-            basis: roofSignal.basis,
-            basis_quality: roofSignal.basisQuality,
-            basis_year: entry.yearBuilt,
-            derivation_rule: "roof_age.year_built_proxy.v1",
-            first_seen_run_id: request.runId,
-            last_seen_run_id: request.runId,
-            precision: roofSignal.precision,
-            property_id: entry.propertyId,
-            roof_signal_id: deterministicId("roof", [
-              "1.0.0",
-              "roof-signal",
-              entry.propertyId,
-              roofSignal.basis,
-            ]),
-            source_record_hash: sourceRecordHash(roofSignal),
-          };
+          return [
+            {
+              age_years: roofSignal.ageYears,
+              as_of: request.asOf,
+              basis: roofSignal.basis,
+              basis_quality: roofSignal.basisQuality,
+              basis_year: entry.yearBuilt,
+              derivation_rule: "roof_age.year_built_proxy.v1",
+              first_seen_run_id: request.runId,
+              last_seen_run_id: request.runId,
+              precision: roofSignal.precision,
+              property_id: entry.propertyId,
+              roof_signal_id: deterministicId("roof", [
+                "1.0.0",
+                "roof-signal",
+                entry.propertyId,
+                roofSignal.basis,
+              ]),
+              source_record_hash: sourceRecordHash(roofSignal),
+            },
+          ];
         });
-        await transaction`
+        if (roofRows.length > 0)
+          await transaction`
           INSERT INTO oracle_roof_signals ${transaction(roofRows)}
           ON CONFLICT (roof_signal_id) DO UPDATE SET
             age_years = EXCLUDED.age_years,

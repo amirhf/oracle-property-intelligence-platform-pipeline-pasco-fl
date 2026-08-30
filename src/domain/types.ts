@@ -10,9 +10,12 @@ export type SourceParseCounts = Record<string, SourceParseCount>;
 
 export interface ParcelSourceRow {
   acres: number | null;
+  countyAssessed?: number | null;
+  countyTaxable?: number | null;
   exactFolio: string;
   heatedSquareFeet: number | null;
   homestead: string | null;
+  justValue?: number | null;
   neighborhoodCode: string | null;
   propertyUseCode: string | null;
   propertyUseDescription: string | null;
@@ -64,7 +67,7 @@ export interface PilotSelectionEntry extends PilotCandidate {
   rank: string;
   useGroup: string;
   yearBucket: string;
-  yearBuilt: number;
+  yearBuilt: number | null;
 }
 
 export interface CoordinateResult {
@@ -101,6 +104,13 @@ export interface PreparedProperty extends PilotSelectionEntry {
 }
 
 export interface PreparedPilot {
+  authorityRecord?: {
+    authorityClass: "owner_assumed_authoritative_snapshot";
+    authorityRecordId: string;
+    completenessEvidenceSha256: string;
+    decisionSha256: string;
+    payload: Record<string, unknown>;
+  };
   artifacts: ArtifactCapture[];
   gisMetrics: GisAcquisitionMetrics;
   permitRequestCount: number;
@@ -109,6 +119,10 @@ export interface PreparedPilot {
     diskAvailableBytes: number;
     elapsedMs: number;
     peakRssBytes: number;
+    projectedArtifactCount?: number;
+    projectedDatabaseGrowthBytes?: number;
+    projectedPreparedBytes?: number;
+    requiredDiskReserveBytes?: number;
   };
   sampleAlgorithm: string;
   sampleSeed: string;
@@ -118,6 +132,19 @@ export interface PreparedPilot {
   snapshotManifestSha256: string;
   sourceCounts: SourceParseCounts;
   sourceLimitations: string[];
+  sourceReconciliation?: Record<
+    string,
+    {
+      ambiguous: number;
+      duplicates: number;
+      matchedProperties: number;
+      matchedRecords: number;
+      missingProperties: number;
+      rejected: number;
+      source: number;
+      unmatchedRecords: number;
+    }
+  >;
 }
 
 export interface GisAcquisitionMetrics {
@@ -137,13 +164,14 @@ export interface PilotRunRequest {
   runId: string;
   sampleAlgorithm: string;
   sampleSeed: string;
-  selectionSize: 25 | 5_000 | 25_000;
+  selectionSize: 25 | 5_000 | 25_000 | 325_213;
   workflowId: string;
 }
 
 export interface PilotRunSummary {
   acceptedProperties: number;
   activeProperties: number;
+  authorityRecordId?: string;
   buildings: number;
   // Content-hash delta counts remain independent of lifecycle transitions.
   changedProperties: number;
@@ -159,6 +187,8 @@ export interface PilotRunSummary {
   inactiveProperties: number;
   inactivatedProperties: number;
   missingCoordinates: number;
+  materializationId?: string;
+  materializationSha256?: string;
   newProperties: number;
   ownership: number;
   peakRssBytes: number;
@@ -169,8 +199,11 @@ export interface PilotRunSummary {
   roofSignals: number;
   roofSignalBasis: Record<string, number>;
   runId: string;
+  scopeId?: string;
   selectionSize: number;
   sourceCounts: SourceParseCounts;
+  sourceReconciliation?: PreparedPilot["sourceReconciliation"];
+  snapshotId?: string;
   throughputPropertiesPerSecond: number;
   unchangedProperties: number;
   workflowId: string;

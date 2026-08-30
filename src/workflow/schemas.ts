@@ -1,9 +1,14 @@
 import { z } from "zod";
 
 import type { PilotRunRequest, PreparedPilot } from "../domain/types.js";
+import { PASCO_PARCEL_LAST_MODIFIED } from "../authoritative/authority.js";
 import { canonicalJsonSha256 } from "../lib/canonical-json.js";
 import { DurableInputError } from "../lib/durability-errors.js";
 import { deterministicId } from "../lib/hash.js";
+import {
+  AUTHORITATIVE_PARCEL_SELECTION_ALGORITHM,
+  AUTHORITATIVE_PARCEL_SELECTION_SEED,
+} from "../snapshot/coverage.js";
 import {
   preparedInputReferenceSchema,
   type PreparedInputReference,
@@ -29,7 +34,12 @@ export const countyIngestRequestSchema = z.strictObject({
   runId: z.string().regex(/^run_[a-f0-9]{32}$/),
   sampleAlgorithm: z.string().min(1).max(200),
   sampleSeed: z.string().min(1).max(500),
-  selectionSize: z.union([z.literal(25), z.literal(5_000), z.literal(25_000)]),
+  selectionSize: z.union([
+    z.literal(25),
+    z.literal(5_000),
+    z.literal(25_000),
+    z.literal(325_213),
+  ]),
   workflowId: z.string().regex(/^pasco-[a-z0-9-]{1,180}$/),
 });
 
@@ -37,7 +47,12 @@ export const ingestChunkRequestSchema = countyIngestRequestSchema
   .extend({
     chunkCount: z.literal(1),
     chunkIndex: z.literal(0),
-    endExclusive: z.union([z.literal(25), z.literal(5_000), z.literal(25_000)]),
+    endExclusive: z.union([
+      z.literal(25),
+      z.literal(5_000),
+      z.literal(25_000),
+      z.literal(325_213),
+    ]),
     parentRequestSha256: sha256Schema,
     startIndex: z.literal(0),
   })
@@ -78,9 +93,12 @@ const sourceParseCountSchema = z.strictObject({
 
 const parcelSchema = z.strictObject({
   acres: nullableNumber,
+  countyAssessed: nullableNumber.optional(),
+  countyTaxable: nullableNumber.optional(),
   exactFolio: z.string().min(1).max(100),
   heatedSquareFeet: nullableNumber,
   homestead: nullableText,
+  justValue: nullableNumber.optional(),
   neighborhoodCode: nullableText,
   propertyUseCode: nullableText,
   propertyUseDescription: nullableText,
@@ -163,10 +181,19 @@ const preparedPropertySchema = z.strictObject({
   siteAddress: siteAddressSchema,
   useGroup: z.string().min(1).max(200),
   yearBucket: z.string().min(1).max(200),
-  yearBuilt: z.number().int().min(1500).max(3000),
+  yearBuilt: z.number().int().min(1500).max(3000).nullable(),
+});
+
+const authorityRecordSchema = z.strictObject({
+  authorityClass: z.literal("owner_assumed_authoritative_snapshot"),
+  authorityRecordId: z.string().regex(/^authority_[a-f0-9]{32}$/),
+  completenessEvidenceSha256: sha256Schema,
+  decisionSha256: sha256Schema,
+  payload: z.record(z.string(), z.unknown()),
 });
 
 export const preparedPilotSchema = z.strictObject({
+  authorityRecord: authorityRecordSchema.optional(),
   artifacts: z.array(artifactSchema),
   gisMetrics: z.strictObject({
     batchCount: z.number().int().nonnegative(),
@@ -183,6 +210,10 @@ export const preparedPilotSchema = z.strictObject({
     diskAvailableBytes: z.number().nonnegative(),
     elapsedMs: z.number().int().nonnegative(),
     peakRssBytes: z.number().nonnegative(),
+    projectedArtifactCount: z.number().int().nonnegative().optional(),
+    projectedDatabaseGrowthBytes: z.number().int().nonnegative().optional(),
+    projectedPreparedBytes: z.number().int().nonnegative().optional(),
+    requiredDiskReserveBytes: z.number().int().nonnegative().optional(),
   }),
   sampleAlgorithm: z.string().min(1).max(200),
   sampleSeed: z.string().min(1).max(500),
@@ -192,6 +223,21 @@ export const preparedPilotSchema = z.strictObject({
   snapshotManifestSha256: sha256Schema,
   sourceCounts: z.record(z.string(), sourceParseCountSchema),
   sourceLimitations: z.array(z.string().min(1).max(2_000)),
+  sourceReconciliation: z
+    .record(
+      z.string(),
+      z.strictObject({
+        ambiguous: z.number().int().nonnegative(),
+        duplicates: z.number().int().nonnegative(),
+        matchedProperties: z.number().int().nonnegative(),
+        matchedRecords: z.number().int().nonnegative(),
+        missingProperties: z.number().int().nonnegative(),
+        rejected: z.number().int().nonnegative(),
+        source: z.number().int().nonnegative(),
+        unmatchedRecords: z.number().int().nonnegative(),
+      }),
+    )
+    .optional(),
 });
 
 function parseStrict<T>(schema: z.ZodType<T>, value: unknown, name: string): T {
@@ -228,6 +274,31 @@ export function parseCountyIngestRequest(value: unknown): PilotRunRequest {
   if (normalized.runId !== expectedRunId) {
     throw new DurableInputError(
       `CountyIngest runId does not match workflow identity (${normalized.workflowId})`,
+    );
+  }
+  if (
+    normalized.selectionSize === 325_213 &&
+    (normalized.sampleAlgorithm !== AUTHORITATIVE_PARCEL_SELECTION_ALGORITHM ||
+      normalized.sampleSeed !== AUTHORITATIVE_PARCEL_SELECTION_SEED)
+  ) {
+    throw new DurableInputError(
+      "Authoritative ingestion must use the fixed complete-source selection identity",
+    );
+  }
+  if (
+    normalized.selectionSize === 325_213 &&
+    normalized.asOf !== PASCO_PARCEL_LAST_MODIFIED
+  ) {
+    throw new DurableInputError(
+      "Authoritative ingestion as-of must match the fixed source observation",
+    );
+  }
+  if (
+    normalized.selectionSize !== 325_213 &&
+    normalized.sampleAlgorithm === AUTHORITATIVE_PARCEL_SELECTION_ALGORITHM
+  ) {
+    throw new DurableInputError(
+      "A bounded selection cannot request the authoritative algorithm",
     );
   }
   return normalized;

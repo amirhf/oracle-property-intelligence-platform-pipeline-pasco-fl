@@ -1,5 +1,7 @@
-import { access, readFile, stat } from "node:fs/promises";
+import { access, lstat, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
+
+import { z } from "zod";
 
 import type {
   ArtifactCapture,
@@ -8,6 +10,8 @@ import type {
 } from "../domain/types.js";
 import { captureTextArtifact } from "../lib/artifacts.js";
 import { SourceAccessStopError } from "../lib/access-stop.js";
+import { canonicalJsonSha256 } from "../lib/canonical-json.js";
+import { DurableInputError } from "../lib/durability-errors.js";
 import { sha256 } from "../lib/hash.js";
 
 export const PASCO_GIS_LAYER_URL =
@@ -32,12 +36,17 @@ interface GeoJsonFeatureCollection {
   type: "FeatureCollection";
 }
 
-interface ReadyMarker {
-  bytes: number;
-  sha256: string;
-  sourceSystem: string;
-  sourceUrl: string;
-}
+const PASCO_GIS_QUERY_URL = `${PASCO_GIS_LAYER_URL}/query`;
+const VERIFIED_LOCAL_GIS_ARTIFACT_COUNT = 60;
+const VERIFIED_LOCAL_GIS_BYTES = 13_827_105;
+const VERIFIED_LOCAL_GIS_INVENTORY_SHA256 =
+  "985c545525eba8022d3f933ed5ea9c97aa8a18777a8d539950942bd918c72365";
+const readyMarkerSchema = z.strictObject({
+  bytes: z.number().int().positive(),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  sourceSystem: z.literal("pasco_gis"),
+  sourceUrl: z.literal(PASCO_GIS_QUERY_URL),
+});
 
 function ringCentroid(ring: Position[]): {
   area: number;
@@ -148,6 +157,32 @@ export function parsePascoGeoJson(body: string): Map<string, CoordinateResult> {
   return results;
 }
 
+export function assertVerifiedLocalPascoGisInventory(
+  artifacts: readonly ArtifactCapture[],
+): void {
+  const inventory = artifacts
+    .map((artifact) => ({
+      bytes: artifact.bytes,
+      sha256: artifact.sha256,
+      sourceSystem: artifact.sourceSystem,
+      sourceUrl: artifact.sourceUrl,
+    }))
+    .sort((left, right) => left.sha256.localeCompare(right.sha256));
+  const totalBytes = inventory.reduce(
+    (sum, artifact) => sum + artifact.bytes,
+    0,
+  );
+  if (
+    inventory.length !== VERIFIED_LOCAL_GIS_ARTIFACT_COUNT ||
+    totalBytes !== VERIFIED_LOCAL_GIS_BYTES ||
+    canonicalJsonSha256(inventory) !== VERIFIED_LOCAL_GIS_INVENTORY_SHA256
+  ) {
+    throw new DurableInputError(
+      "Local GIS inventory does not match the verified checkpoint set",
+    );
+  }
+}
+
 async function existingArtifact(
   finalPath: string,
 ): Promise<{ artifact: ArtifactCapture; body: string } | null> {
@@ -158,15 +193,26 @@ async function existingArtifact(
   } catch {
     return null;
   }
-  const [body, markerText, fileStat] = await Promise.all([
-    readFile(finalPath, "utf8"),
-    readFile(readyMarkerPath, "utf8"),
-    stat(finalPath),
-  ]);
-  const marker = JSON.parse(markerText) as ReadyMarker;
+  const [body, markerText, fileStat, fileLinkStat, markerLinkStat] =
+    await Promise.all([
+      readFile(finalPath, "utf8"),
+      readFile(readyMarkerPath, "utf8"),
+      stat(finalPath),
+      lstat(finalPath),
+      lstat(readyMarkerPath),
+    ]);
+  if (
+    fileLinkStat.isSymbolicLink() ||
+    markerLinkStat.isSymbolicLink() ||
+    !fileLinkStat.isFile() ||
+    !markerLinkStat.isFile()
+  ) {
+    throw new DurableInputError("GIS checkpoint is not a regular local file");
+  }
+  const marker = readyMarkerSchema.parse(JSON.parse(markerText));
   const currentHash = sha256(body);
   if (marker.bytes !== fileStat.size || marker.sha256 !== currentHash) {
-    throw new Error(`GIS checkpoint failed hash validation: ${finalPath}`);
+    throw new DurableInputError("GIS checkpoint failed hash validation");
   }
   return {
     artifact: {
@@ -178,6 +224,64 @@ async function existingArtifact(
       sourceUrl: marker.sourceUrl,
     },
     body,
+  };
+}
+
+export async function loadVerifiedLocalPascoCoordinates(
+  dataDir: string,
+): Promise<{
+  artifacts: ArtifactCapture[];
+  coordinates: Map<string, CoordinateResult>;
+  metrics: GisAcquisitionMetrics;
+}> {
+  const root = path.join(dataDir, "pasco", "raw", "gis", "scales");
+  const artifacts: ArtifactCapture[] = [];
+  const coordinates = new Map<string, CoordinateResult>();
+  const directories = await readdir(root, { withFileTypes: true });
+  for (const directory of directories
+    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+    .sort((left, right) => left.name.localeCompare(right.name))) {
+    const directoryPath = path.join(root, directory.name);
+    const entries = await readdir(directoryPath, { withFileTypes: true });
+    for (const entry of entries
+      .filter(
+        (candidate) =>
+          candidate.isFile() &&
+          !candidate.isSymbolicLink() &&
+          candidate.name.endsWith(".geojson"),
+      )
+      .sort((left, right) => left.name.localeCompare(right.name))) {
+      const verified = await existingArtifact(
+        path.join(directoryPath, entry.name),
+      );
+      if (!verified)
+        throw new Error("GIS checkpoint is missing its ready marker");
+      artifacts.push(verified.artifact);
+      for (const [folio, coordinate] of parsePascoGeoJson(verified.body)) {
+        const existing = coordinates.get(folio);
+        if (
+          existing &&
+          JSON.stringify(existing) !== JSON.stringify(coordinate)
+        ) {
+          throw new Error("Conflicting verified GIS coordinates for one folio");
+        }
+        coordinates.set(folio, coordinate);
+      }
+    }
+  }
+  assertVerifiedLocalPascoGisInventory(artifacts);
+  return {
+    artifacts,
+    coordinates,
+    metrics: {
+      batchCount: artifacts.length,
+      batchSize: 500,
+      concurrency: 1,
+      requestCount: 0,
+      retryCount: 0,
+      reusedBatchCount: artifacts.length,
+      statusCounts: { checkpoint: artifacts.length },
+    },
   };
 }
 
@@ -220,7 +324,7 @@ async function fetchCoordinateBatch(options: {
     };
   }
 
-  const queryUrl = `${PASCO_GIS_LAYER_URL}/query`;
+  const queryUrl = PASCO_GIS_QUERY_URL;
   const escaped = options.exactFolios.map(
     (folio) => `'${folio.replaceAll("'", "''")}'`,
   );

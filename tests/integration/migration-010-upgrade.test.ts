@@ -66,6 +66,9 @@ async function applyMigrationRange(
         "019_candidate_signed_ipns_observation.sql",
         "020_candidate_delegated_resolver_policy.sql",
         "021_candidate_delegated_completion.sql",
+        "022_owner_authoritative_ingestion.sql",
+        "023_contractor_source_staging.sql",
+        "024_contractor_staging_hardening.sql",
       ];
       const filename = filenames.find((candidate) =>
         candidate.startsWith(prefix),
@@ -237,6 +240,9 @@ describe("migration 010 drift-safe legacy publication policy", () => {
         "019_candidate_signed_ipns_observation.sql",
         "020_candidate_delegated_resolver_policy.sql",
         "021_candidate_delegated_completion.sql",
+        "022_owner_authoritative_ingestion.sql",
+        "023_contractor_source_staging.sql",
+        "024_contractor_staging_hardening.sql",
       ]);
       expect(await runMigrations(url)).toEqual([]);
     });
@@ -303,14 +309,14 @@ describe("migration 010 drift-safe legacy publication policy", () => {
     });
   }
 
-  it("converges the supported local 020→021 path and a fresh 001–021 install", async () => {
+  it("converges the supported local 023→024 path and a fresh 001–024 install", async () => {
     const upgradeSchema = await createSchema("converge_upgrade");
     const freshSchema = await createSchema("converge_fresh");
     const upgradeUrl = databaseUrl(upgradeSchema);
     const freshUrl = databaseUrl(freshSchema);
-    await applyMigrationRange(upgradeUrl, 1, 20);
-    await applyMigrationRange(upgradeUrl, 21, 21);
-    await applyMigrationRange(freshUrl, 1, 21);
+    await applyMigrationRange(upgradeUrl, 1, 23);
+    await applyMigrationRange(upgradeUrl, 24, 24);
+    await applyMigrationRange(freshUrl, 1, 24);
     expect(await schemaSignature(upgradeUrl)).toEqual(
       await schemaSignature(freshUrl),
     );
@@ -319,5 +325,91 @@ describe("migration 010 drift-safe legacy publication policy", () => {
     );
     expect(await runMigrations(upgradeUrl)).toEqual([]);
     expect(await runMigrations(freshUrl)).toEqual([]);
+  });
+
+  it("fails closed instead of synthesizing evidence for populated migration-023 staging", async () => {
+    const schema = await createSchema("contractor_populated");
+    const url = databaseUrl(schema);
+    await applyMigrationRange(url, 1, 23);
+    const sql = postgres(url, { max: 1 });
+    const state = createHash("sha256")
+      .update("contractor-populated")
+      .digest("hex");
+    const runId = `run_${state.slice(0, 32)}`;
+    const sourceSha = createHash("sha256").update("source").digest("hex");
+    const termsSha = createHash("sha256").update("terms").digest("hex");
+    try {
+      await sql`
+        INSERT INTO oracle_pipeline_runs (
+          run_id, workflow_id, county, sample_algorithm, sample_seed,
+          window_start, window_end, as_of, status, selection_size, coverage_mode
+        ) VALUES (
+          ${runId}, 'synthetic-contractor-upgrade', 'pasco', 'synthetic',
+          'synthetic', '2026-08-30T00:00:00.000Z',
+          '2026-08-30T00:00:00.000Z', '2026-08-30T00:00:00.000Z',
+          'completed', 1, 'sample'
+        )
+      `;
+      await sql`
+        INSERT INTO oracle_contractor_source_datasets (
+          dataset_id, source_run_id, provider, source_classification,
+          acquisition_method, coverage_mode, coverage_geography,
+          category_filters, license_terms_status,
+          license_terms_evidence_sha256,
+          license_terms_evidence_relative_path,
+          license_terms_evidence_byte_size, source_file_relative_path,
+          source_file_byte_size, source_file_sha256, observation_status,
+          observation_start, observation_end, retrieval_status, retrieved_at,
+          parser_version, transform_version, manifest_sha256,
+          manifest_payload, source_count, parsed_count, accepted_count,
+          rejected_count, duplicate_count
+        ) VALUES (
+          ${`contractordataset_${state.slice(0, 32)}`}, ${runId},
+          'better_business_bureau', 'third_party', 'owner_supplied_file',
+          'partial', 'synthetic', ${sql.json([])}, 'verified_compatible',
+          ${termsSha}, 'contractors/terms.txt', 1,
+          'contractors/source.jsonl', 1, ${sourceSha}, 'recorded',
+          '2026-08-30T00:00:00.000Z', '2026-08-30T00:00:00.000Z',
+          'recorded', '2026-08-30T00:00:00.000Z',
+          'contractor-jsonl-v1', 'contractor-identity-match-v1', ${state},
+          ${sql.json({
+            coverageMode: "partial",
+            licenseTerms: {
+              evidenceFile: {
+                byteSize: 1,
+                relativePath: "contractors/terms.txt",
+                sha256: termsSha,
+              },
+              evidenceSha256: termsSha,
+            },
+            provider: "better_business_bureau",
+            sourceClassification: "third_party",
+            sourceFile: {
+              byteSize: 1,
+              relativePath: "contractors/source.jsonl",
+              sha256: sourceSha,
+            },
+          })}, 1, 1, 1, 0, 0
+        )
+      `;
+    } finally {
+      await sql.end({ timeout: 5 });
+    }
+    await expect(applyMigrationRange(url, 24, 24)).rejects.toThrow(
+      "requires empty legacy table oracle_contractor_source_datasets",
+    );
+    const verify = postgres(url, { max: 1 });
+    try {
+      const rows = await verify<{ applied: number; datasets: number }[]>`
+        SELECT
+          (SELECT count(*)::int FROM oracle_schema_migrations
+           WHERE filename = '024_contractor_staging_hardening.sql') AS applied,
+          (SELECT count(*)::int FROM oracle_contractor_source_datasets)
+            AS datasets
+      `;
+      expect(rows[0]).toEqual({ applied: 0, datasets: 1 });
+    } finally {
+      await verify.end({ timeout: 5 });
+    }
   });
 });

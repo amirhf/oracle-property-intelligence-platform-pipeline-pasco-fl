@@ -1,4 +1,5 @@
 import { createReadStream } from "node:fs";
+import { open } from "node:fs/promises";
 
 import { parse } from "csv-parse";
 
@@ -13,6 +14,113 @@ import type {
 } from "../domain/types.js";
 
 type CsvRow = Record<string, string>;
+
+export const APPRAISER_HEADERS = {
+  building: [
+    "Parcel_Num",
+    "Bldg_Num",
+    "Bldg_Section",
+    "Bldg_Style",
+    "Bldg_Style_Desc",
+    "Bldg_EffYrBlt",
+    "Bldg_ActYrBlt",
+    "Bldg_Bathrooms",
+    "Bldg_Use_Code",
+    "Bldg_Use_Desc",
+    "Bldg_Quality",
+    "Bldg_Quality_Desc",
+    "Bldg_ExtWall_1",
+    "Bldg_ExtWall_1_Desc",
+    "Bldg_ExtWall_2",
+    "Bldg_ExtWall_2_Desc",
+    "Bldg_Observerd_Condition",
+    "Bldg_Roof_Cover",
+    "Bldg_Roof_Cover_Desc",
+    "Bldg_Roof_Struct",
+    "Bldg_Roof_Structure_Desc",
+    "Bldg_AC_Type",
+    "Bldg_AC_Type_Desc",
+    "Bldg_Heat_Type",
+    "Bldg_Heat_Type_Desc",
+    "Bldg_Heat_System",
+    "Bldg_Heat_System_Desc",
+    "Bldg_Stories",
+    "Bldg_Floor_1",
+    "Bldg_Floor_1_Desc",
+    "Bldg_Floor_2",
+    "Bldg_Floor_2_Desc",
+    "Bldg_IntWall_1",
+    "Bldg_IntWall_1_Desc",
+    "Bldg_IntWall_2",
+    "Bldg_IntWall_2_Desc",
+    "Bldg_Total_Sqft",
+    "Bldg_Heated_Sqft",
+    "Bldg_Value",
+  ],
+  owners: [
+    "Parcel_Num",
+    "Owner_Mail_Name1",
+    "Owner_Mail_Name2",
+    "Owner_Mail_Addr1",
+    "Owner_Mail_Addr2",
+    "Owner_Mail_City",
+    "Owner_Mail_State",
+    "Owner_Mail_Zip",
+    "Owner_Mail_Country",
+  ],
+  parcel: [
+    "Parcel_Num",
+    "Tax_Area",
+    "Prop_Use_Code",
+    "Prop_Use_Desc",
+    "NBHD_Code",
+    "Hmstd",
+    "TotSqFt",
+    "HstSqFt",
+    "Acres",
+    "Just_Value",
+    "County_Assessed",
+    "County_Exemptions",
+    "County_Taxable",
+    "School_Assessed",
+    "School_Exemptions",
+    "School_Taxable",
+    "NBHD_Desc",
+  ],
+  siteAddresses: [
+    "PARCEL",
+    "ADDRESS_NUMBER",
+    "STREET_NAME",
+    "STREET_SUFFIX",
+    "CITY",
+    "ZIP_CODE",
+    "UNIT_TYPE",
+    "UNIT_IDENTIFIER",
+  ],
+} as const;
+
+export async function assertExactCsvHeader(
+  filePath: string,
+  expected: readonly string[],
+): Promise<void> {
+  const handle = await open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(8_192);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const firstLine = buffer
+      .subarray(0, bytesRead)
+      .toString("utf8")
+      .replace(/^\uFEFF/, "")
+      .split(/\r?\n/, 1)[0];
+    const actual =
+      firstLine?.split(",").map((value) => value.replace(/^"|"$/g, "")) ?? [];
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      throw new Error("appraiser CSV header mismatch");
+    }
+  } finally {
+    await handle.close();
+  }
+}
 
 function clean(value: string | undefined): string | null {
   const result = value?.trim() ?? "";
@@ -52,9 +160,12 @@ function optionalYear(value: string | undefined): number | null {
 export function parseParcelRow(row: CsvRow): ParcelSourceRow {
   return {
     acres: optionalNumber(row.Acres),
+    countyAssessed: optionalNumber(row.County_Assessed),
+    countyTaxable: optionalNumber(row.County_Taxable),
     exactFolio: exactFolio(row.Parcel_Num),
     heatedSquareFeet: optionalNumber(row.HstSqFt),
     homestead: clean(row.Hmstd),
+    justValue: optionalNumber(row.Just_Value),
     neighborhoodCode: clean(row.NBHD_Code),
     propertyUseCode: clean(row.Prop_Use_Code),
     propertyUseDescription: clean(row.Prop_Use_Desc),
@@ -189,9 +300,11 @@ export async function loadPilotCandidateData(
 ): Promise<{
   candidates: Map<string, PilotCandidate>;
   counts: SourceParseCounts;
+  matchedRows: { building: number; siteAddresses: number };
 }> {
   const candidates = new Map<string, PilotCandidate>();
   const counts: SourceParseCounts = {};
+  const matchedRows = { building: 0, siteAddresses: 0 };
 
   counts.parcel = await parseInto({
     filePath: paths.parcel,
@@ -208,7 +321,10 @@ export async function loadPilotCandidateData(
   counts.building = await parseInto({
     filePath: paths.building,
     onAccepted: (building) => {
-      candidates.get(building.exactFolio)?.buildings.push(building);
+      const candidate = candidates.get(building.exactFolio);
+      if (!candidate) return;
+      candidate.buildings.push(building);
+      matchedRows.building += 1;
     },
     parseRow: parseBuildingRow,
   });
@@ -218,6 +334,7 @@ export async function loadPilotCandidateData(
     onAccepted: (siteAddress) => {
       const candidate = candidates.get(siteAddress.exactFolio);
       if (!candidate) return;
+      matchedRows.siteAddresses += 1;
       if (
         candidate.siteAddress === null ||
         siteAddress.siteAddress.localeCompare(
@@ -230,7 +347,7 @@ export async function loadPilotCandidateData(
     parseRow: parseSiteAddressRow,
   });
 
-  return { candidates, counts };
+  return { candidates, counts, matchedRows };
 }
 
 export async function loadSelectedOwners(

@@ -36,8 +36,31 @@ import {
   type PropertyTemporalDelta,
 } from "./temporal-reconciliation.js";
 import { recordProjectionLoad } from "./projection-repository.js";
+import {
+  OWNER_AUTHORITY_CLASS,
+  PASCO_PARCEL_FOLIO_COUNT,
+  PASCO_PARCEL_FOLIO_SET_SHA256,
+  PASCO_PARCEL_MEMBERSHIP_CLAIM,
+  validateOwnerAuthorityRecord,
+} from "../authoritative/authority.js";
+import { AUTHORITATIVE_PARCEL_SELECTION_ALGORITHM } from "../snapshot/coverage.js";
 
-function pipelineLimitations(selectionSize: number): string[] {
+function pipelineLimitations(
+  selectionSize: number,
+  sampleAlgorithm?: string,
+): string[] {
+  if (
+    selectionSize === PASCO_PARCEL_FOLIO_COUNT &&
+    sampleAlgorithm === AUTHORITATIVE_PARCEL_SELECTION_ALGORITHM
+  ) {
+    return [
+      PASCO_PARCEL_MEMBERSHIP_CLAIM,
+      "Authority is owner-assumed for the exact hash-bound source snapshot and is not represented as independent Pasco certification.",
+      "The separately published 335,946 real-property-parcel statistic remains semantically unreconciled.",
+      "GIS, coordinate, building, address, and ownership coverage is measured independently from parcel membership.",
+      "Permit and contractor coverage remains unavailable.",
+    ];
+  }
   return [
     `${selectionSize.toLocaleString("en-US")}-property deterministic appraisal/GIS sample; not complete Pasco coverage.`,
     "Pasco Accela coverage can exclude incorporated-city permit systems.",
@@ -129,7 +152,9 @@ export async function recordRunStarted(
           ${request.runId}, ${request.workflowId}, ${request.county},
           ${request.sampleAlgorithm}, ${request.sampleSeed},
           ${request.asOf}, ${request.asOf}, ${request.asOf}, 'running',
-          ${transaction.json(pipelineLimitations(request.selectionSize))},
+          ${transaction.json(
+            pipelineLimitations(request.selectionSize, request.sampleAlgorithm),
+          )},
           ${request.selectionSize}, ${databaseSize[0]?.bytes ?? 0},
           ${requestSha256}
         ) ON CONFLICT (run_id) DO NOTHING
@@ -171,12 +196,12 @@ export async function markRunFailed(
   try {
     await sql`
       UPDATE oracle_pipeline_runs
-      SET status = 'failed', completed_at = now()
+      SET status = 'failed', completed_at = clock_timestamp()
       WHERE run_id = ${runId}
     `;
     await sql`
       UPDATE oracle_pipeline_attempts
-      SET status = 'failed', completed_at = now(), error_code = ${errorCode}
+      SET status = 'failed', completed_at = clock_timestamp(), error_code = ${errorCode}
       WHERE run_id = ${runId} AND status = 'running'
     `;
   } finally {
@@ -201,6 +226,63 @@ export async function loadPreparedPilot(
       const replay = await beginLoaderEffect(transaction, durability);
       if (replay) return replay;
       if (durability.snapshot.manifestVersion === "1.2.0") {
+        if (
+          request.selectionSize === PASCO_PARCEL_FOLIO_COUNT &&
+          request.sampleAlgorithm === AUTHORITATIVE_PARCEL_SELECTION_ALGORITHM
+        ) {
+          if (
+            prepared.selectionSize !== PASCO_PARCEL_FOLIO_COUNT ||
+            prepared.selectedRecordSha256 !== PASCO_PARCEL_FOLIO_SET_SHA256 ||
+            durability.snapshot.coverage.mode !== "authoritative_complete" ||
+            !prepared.authorityRecord
+          ) {
+            throw new DurableInputError(
+              "Authoritative Loader input lacks the exact owner-accepted identity",
+            );
+          }
+          const authority = validateOwnerAuthorityRecord(
+            prepared.authorityRecord,
+          );
+          await transaction`
+            INSERT INTO oracle_source_authority_records (
+              authority_record_id, authority_class, source_snapshot_id,
+              source_run_id, source_system, scope_id, decision_sha256,
+              completeness_evidence_sha256,
+              source_snapshot_manifest_sha256, authority_payload
+            ) VALUES (
+              ${authority.authorityRecordId}, ${OWNER_AUTHORITY_CLASS},
+              ${durability.snapshot.snapshotId}, ${request.runId},
+              'pasco_appraiser', ${durability.snapshot.coverage.scopeId},
+              ${authority.decisionSha256},
+              ${authority.completenessEvidenceSha256},
+              ${durability.preparedManifest.snapshotManifest.sha256},
+              ${transaction.json(authority.payload as postgres.JSONValue)}
+            ) ON CONFLICT (authority_record_id) DO NOTHING
+          `;
+          const storedAuthority = await transaction<
+            {
+              completeness_evidence_sha256: string;
+              decision_sha256: string;
+              source_snapshot_id: string;
+            }[]
+          >`
+            SELECT source_snapshot_id, decision_sha256,
+                   completeness_evidence_sha256
+            FROM oracle_source_authority_records
+            WHERE authority_record_id = ${authority.authorityRecordId}
+          `;
+          if (
+            storedAuthority[0]?.source_snapshot_id !==
+              durability.snapshot.snapshotId ||
+            storedAuthority[0]?.decision_sha256 !== authority.decisionSha256 ||
+            storedAuthority[0]?.completeness_evidence_sha256 !==
+              authority.completenessEvidenceSha256
+          ) {
+            throw new DurableConflictError(
+              `Authority record identity conflict (${authority.authorityRecordId})`,
+            );
+          }
+        }
         const attemptId = deterministicId("attempt", [
           "1.0.0",
           "attempt",
@@ -231,7 +313,7 @@ export async function loadPreparedPilot(
           SELECT
             pg_database_size(current_database())::bigint AS database_size_after_bytes,
             COALESCE(database_size_before_bytes, 0)::bigint AS database_size_before_bytes,
-            GREATEST(0, EXTRACT(EPOCH FROM (now() - started_at)) * 1000)::bigint AS elapsed_ms
+            GREATEST(0, EXTRACT(EPOCH FROM (clock_timestamp() - started_at)) * 1000)::bigint AS elapsed_ms
           FROM oracle_pipeline_runs WHERE run_id = ${request.runId}
         `;
         const databaseSizeAfterBytes = Number(
@@ -252,6 +334,21 @@ export async function loadPreparedPilot(
           (total, property) => total + property.buildings.length,
           0,
         );
+        const roofSignals = prepared.properties.filter(
+          (property) => property.yearBuilt !== null,
+        ).length;
+        const explicitUnavailableFacts =
+          prepared.properties.length * 6 +
+          (prepared.properties.length - coordinates) +
+          prepared.properties.filter(
+            (property) => property.buildings.length === 0,
+          ).length +
+          prepared.properties.filter((property) => property.owners.length === 0)
+            .length +
+          prepared.properties.filter(
+            (property) => property.siteAddress === null,
+          ).length +
+          (prepared.properties.length - roofSignals);
         const rejectedRecords = Object.values(prepared.sourceCounts).reduce(
           (sum, count) => sum + count.rejected,
           0,
@@ -259,6 +356,9 @@ export async function loadPreparedPilot(
         const summary: PilotRunSummary = {
           acceptedProperties: prepared.properties.length,
           activeProperties: projection.activeProperties,
+          ...(prepared.authorityRecord
+            ? { authorityRecordId: prepared.authorityRecord.authorityRecordId }
+            : {}),
           buildings,
           changedProperties: projection.changedProperties,
           coordinates,
@@ -271,11 +371,17 @@ export async function loadPreparedPilot(
           diskAvailableBytes: prepared.resourceMetrics.diskAvailableBytes,
           duplicateProperties: 0,
           elapsedMs,
-          explicitUnavailableFacts: prepared.properties.length * 6,
+          explicitUnavailableFacts,
           gisMetrics: prepared.gisMetrics,
           inactiveProperties: projection.inactiveProperties,
           inactivatedProperties: projection.inactivatedProperties,
           missingCoordinates: prepared.properties.length - coordinates,
+          ...(projection.materializationId
+            ? { materializationId: projection.materializationId }
+            : {}),
+          ...(projection.materializationSha256
+            ? { materializationSha256: projection.materializationSha256 }
+            : {}),
           newProperties: projection.newProperties,
           ownership,
           peakRssBytes: Math.max(
@@ -286,11 +392,20 @@ export async function loadPreparedPilot(
           permits: 0,
           reactivatedProperties: projection.reactivatedProperties,
           rejectedRecords,
-          roofSignalBasis: { year_built_proxy: prepared.properties.length },
-          roofSignals: prepared.properties.length,
+          roofSignalBasis: { year_built_proxy: roofSignals },
+          roofSignals,
           runId: request.runId,
+          ...(!projection.sampleIsolated
+            ? { scopeId: durability.snapshot.coverage.scopeId }
+            : {}),
           selectionSize: prepared.selectionSize,
           sourceCounts: prepared.sourceCounts,
+          ...(prepared.sourceReconciliation
+            ? { sourceReconciliation: prepared.sourceReconciliation }
+            : {}),
+          ...(!projection.sampleIsolated
+            ? { snapshotId: durability.snapshot.snapshotId }
+            : {}),
           throughputPropertiesPerSecond:
             elapsedMs > 0
               ? Number(
@@ -333,11 +448,14 @@ export async function loadPreparedPilot(
         }
         await transaction`
           UPDATE oracle_pipeline_runs SET
-            status = 'completed', completed_at = now(),
+            status = 'completed', completed_at = clock_timestamp(),
             source_counts = ${transaction.json(prepared.sourceCounts as unknown as postgres.JSONValue)},
             result_counts = ${transaction.json(summary as unknown as postgres.JSONValue)},
             limitations = ${transaction.json([
-              ...pipelineLimitations(prepared.selectionSize),
+              ...pipelineLimitations(
+                prepared.selectionSize,
+                prepared.sampleAlgorithm,
+              ),
               ...prepared.sourceLimitations,
               projection.sampleIsolated
                 ? "Sample observations are isolated and do not advance a current or authoritative projection head."
@@ -347,7 +465,7 @@ export async function loadPreparedPilot(
         `;
         await transaction`
           UPDATE oracle_pipeline_attempts
-          SET status = 'completed', completed_at = now()
+          SET status = 'completed', completed_at = clock_timestamp()
           WHERE run_id = ${request.runId} AND status = 'running'
         `;
         return completeLoaderEffect(transaction, durability, summary);
@@ -572,15 +690,16 @@ export async function loadPreparedPilot(
           `;
         }
 
-        const roofSignal = yearBuiltRoofProxy(entry.yearBuilt, request.asOf);
-        const roofHash = sourceRecordHash(roofSignal);
-        const roofSignalId = deterministicId("roof", [
-          "1.0.0",
-          "roof-signal",
-          entry.propertyId,
-          roofSignal.basis,
-        ]);
-        await transaction`
+        if (entry.yearBuilt !== null) {
+          const roofSignal = yearBuiltRoofProxy(entry.yearBuilt, request.asOf);
+          const roofHash = sourceRecordHash(roofSignal);
+          const roofSignalId = deterministicId("roof", [
+            "1.0.0",
+            "roof-signal",
+            entry.propertyId,
+            roofSignal.basis,
+          ]);
+          await transaction`
           INSERT INTO oracle_roof_signals (
             roof_signal_id, property_id, basis, basis_quality, precision,
             basis_year, age_years, as_of, derivation_rule,
@@ -598,6 +717,7 @@ export async function loadPreparedPilot(
             source_record_hash = EXCLUDED.source_record_hash,
             last_seen_run_id = EXCLUDED.last_seen_run_id
         `;
+        }
 
         for (const permit of entry.permits) {
           const sourceRecordKey = `pasco_accela:${permit.recordNumber}`;
@@ -711,7 +831,7 @@ export async function loadPreparedPilot(
         SELECT
           pg_database_size(current_database())::bigint AS database_size_after_bytes,
           COALESCE(database_size_before_bytes, 0)::bigint AS database_size_before_bytes,
-          GREATEST(0, EXTRACT(EPOCH FROM (now() - started_at)) * 1000)::bigint AS elapsed_ms
+          GREATEST(0, EXTRACT(EPOCH FROM (clock_timestamp() - started_at)) * 1000)::bigint AS elapsed_ms
         FROM oracle_pipeline_runs WHERE run_id = ${request.runId}
       `;
       const databaseSizeAfterBytes = Number(
@@ -801,7 +921,7 @@ export async function loadPreparedPilot(
 
       await transaction`
         UPDATE oracle_pipeline_runs SET
-          status = 'completed', completed_at = now(),
+          status = 'completed', completed_at = clock_timestamp(),
           source_counts = ${transaction.json(
             prepared.sourceCounts as unknown as postgres.JSONValue,
           )},
@@ -816,7 +936,7 @@ export async function loadPreparedPilot(
       `;
       await transaction`
         UPDATE oracle_pipeline_attempts
-        SET status = 'completed', completed_at = now()
+        SET status = 'completed', completed_at = clock_timestamp()
         WHERE run_id = ${request.runId} AND status = 'running'
       `;
       return completeLoaderEffect(transaction, durability, summary);

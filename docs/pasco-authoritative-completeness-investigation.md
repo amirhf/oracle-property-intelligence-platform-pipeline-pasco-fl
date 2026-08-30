@@ -11,6 +11,14 @@ an ingestion.
 
 **AUTHORITY_NOT_PROVEN**
 
+This remains the result of the independent official-metadata investigation. A
+subsequent human controller decision accepts the exact hash-bound archive for a
+narrower `owner_assumed_authoritative_snapshot` checkpoint. That later risk
+acceptance does not retroactively turn this investigation into Pasco
+certification and does not resolve the 335,946-versus-325,213 semantic
+difference. See `docs/authoritative-appraisal-ingestion.md` for the accepted
+operational boundary.
+
 The exact archive identity and extraction were verified, but the official
 materials inspected did not establish the required coverage definition, supply
 an independent control total for the same source cycle, or reconcile the
@@ -131,7 +139,11 @@ reconciliation may be inferred.
 
 ## Operational consequence
 
-- Authoritative Pasco appraisal ingestion remains blocked.
+- At the conclusion of this independent investigation, authoritative Pasco
+  appraisal ingestion was blocked. The later explicit human risk acceptance
+  authorizes only the exact hash-bound archive under the distinct
+  `owner_assumed_authoritative_snapshot` authority class; it does not change
+  this investigation's `AUTHORITY_NOT_PROVEN` result.
 - The deterministic 25,000-property dataset remains usable only as a sample; it
   must not be reclassified as complete or authoritative.
 - GIS coverage is a separate enrichment dimension and cannot prove appraiser

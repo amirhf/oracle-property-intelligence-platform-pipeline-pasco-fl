@@ -61,6 +61,7 @@ const addFormats = require("ajv-formats") as FormatsPlugin;
 interface ExportPropertyRow {
   acres: number | null;
   actual_year_built: number | null;
+  assessed_value: number | null;
   coordinate_hash: string | null;
   coordinate_source_last_update: string | null;
   exact_folio: string;
@@ -71,9 +72,10 @@ interface ExportPropertyRow {
   property_id: string;
   property_use_code: string | null;
   property_use_description: string | null;
-  roof_age_years: number;
-  roof_basis: string;
-  roof_basis_quality: string;
+  market_value: number | null;
+  roof_age_years: number | null;
+  roof_basis: string | null;
+  roof_basis_quality: string | null;
   roof_cover: string | null;
   roof_structure: string | null;
   site_address: string;
@@ -81,7 +83,7 @@ interface ExportPropertyRow {
   site_zip: string | null;
   source_record_hash: string;
   total_square_feet: number | null;
-  year_built: number;
+  year_built: number | null;
 }
 
 interface ExportOwnerRow {
@@ -654,8 +656,14 @@ function strictCoverage(value: unknown): SnapshotCoverage {
   return parsed.data;
 }
 
-function selectedRecordSha256(folios: readonly string[]): string {
-  return sha256(JSON.stringify([...folios].sort()));
+function selectedRecordSha256(
+  folios: readonly string[],
+  algorithm?: string,
+): string {
+  const sorted = [...folios].sort();
+  return algorithm === "official-parcel-complete-v1"
+    ? sha256(`${sorted.join("\n")}\n`)
+    : sha256(JSON.stringify(sorted));
 }
 
 async function resolveExportScope(
@@ -803,8 +811,10 @@ async function resolveExportScope(
     }
     if (
       coverage.mode === "authoritative_complete" &&
-      (selectedRecordSha256(activeFolios.map((row) => row.exact_folio)) !==
-        coverage.selection.selectedRecordSha256 ||
+      (selectedRecordSha256(
+        activeFolios.map((row) => row.exact_folio),
+        coverage.selection.algorithm,
+      ) !== coverage.selection.selectedRecordSha256 ||
         activeFolios.length !== coverage.selection.selectionSize)
     ) {
       throw new Error(
@@ -1057,6 +1067,8 @@ export async function buildPublicationDryRun(
           exactFolio: string;
           heatedSquareFeet: number | null;
           parcel: {
+            countyAssessed?: number | null;
+            justValue?: number | null;
             propertyUseCode: string | null;
             propertyUseDescription: string | null;
             totalSquareFeet: number | null;
@@ -1067,7 +1079,7 @@ export async function buildPublicationDryRun(
             zipCode: string | null;
           } | null;
           totalSquareFeet: number | null;
-          yearBuilt: number;
+          yearBuilt: number | null;
         };
         const facts = factsByProperty.get(row.property_id) ?? [];
         const coordinate = facts.find(
@@ -1119,6 +1131,7 @@ export async function buildPublicationDryRun(
         return {
           acres: payload.acres,
           actual_year_built: buildingPayload?.actualYearBuilt ?? null,
+          assessed_value: payload.parcel.countyAssessed ?? null,
           coordinate_hash: coordinate?.source_record_sha256 ?? null,
           coordinate_source_last_update:
             coordinatePayload?.sourceLastUpdate ?? null,
@@ -1126,13 +1139,14 @@ export async function buildPublicationDryRun(
           heated_square_feet: payload.heatedSquareFeet,
           latitude: coordinatePayload?.latitude ?? null,
           longitude: coordinatePayload?.longitude ?? null,
+          market_value: payload.parcel.justValue ?? null,
           parcel_id: parcelId(row.parcel_identifier),
           property_id: row.property_id,
           property_use_code: payload.parcel.propertyUseCode,
           property_use_description: payload.parcel.propertyUseDescription,
-          roof_age_years: roofPayload?.ageYears ?? 0,
-          roof_basis: roofPayload?.basis ?? "year_built_proxy",
-          roof_basis_quality: roofPayload?.basisQuality ?? "proxy",
+          roof_age_years: roofPayload?.ageYears ?? null,
+          roof_basis: roofPayload?.basis ?? null,
+          roof_basis_quality: roofPayload?.basisQuality ?? null,
           roof_cover: buildingPayload?.roofCover ?? null,
           roof_structure: buildingPayload?.roofStructure ?? null,
           site_address: payload.siteAddress?.siteAddress ?? "",
@@ -1169,6 +1183,8 @@ export async function buildPublicationDryRun(
         p.property_use_code,
         p.property_use_description,
         p.acres::double precision AS acres,
+        NULL::double precision AS assessed_value,
+        NULL::double precision AS market_value,
         p.total_square_feet::double precision AS total_square_feet,
         p.heated_square_feet::double precision AS heated_square_feet,
         p.year_built,
@@ -1448,30 +1464,42 @@ export async function buildPublicationDryRun(
                 "normalized",
                 [gisEvidenceId],
               ),
-        yearBuilt: available(property.year_built, "raw", [appraiserEvidenceId]),
+        yearBuilt:
+          property.year_built === null
+            ? unavailable("raw", "not_provided_by_source", [
+                appraiserEvidenceId,
+              ])
+            : available(property.year_built, "raw", [appraiserEvidenceId]),
         roofInstallationDate: unavailable("raw", "not_provided_by_source", [
           appraiserEvidenceId,
         ]),
         roofInstallationYear: unavailable("raw", "not_provided_by_source", [
           appraiserEvidenceId,
         ]),
-        roofAgeSignal: available(
-          {
-            ageYears: property.roof_age_years,
-            precision: "year",
-            basis: property.roof_basis,
-            basisQuality: property.roof_basis_quality,
-            asOf,
-          },
-          "derived",
-          [appraiserEvidenceId],
-          {
-            rule: "year_difference_proxy",
-            ruleVersion: CONTRACT_VERSION,
-            asOf,
-            inputs: ["property.yearBuilt"],
-          },
-        ),
+        roofAgeSignal:
+          property.roof_age_years === null ||
+          property.roof_basis === null ||
+          property.roof_basis_quality === null
+            ? unavailable("derived", "not_provided_by_source", [
+                appraiserEvidenceId,
+              ])
+            : available(
+                {
+                  ageYears: property.roof_age_years,
+                  precision: "year",
+                  basis: property.roof_basis,
+                  basisQuality: property.roof_basis_quality,
+                  asOf,
+                },
+                "derived",
+                [appraiserEvidenceId],
+                {
+                  rule: "year_difference_proxy",
+                  ruleVersion: CONTRACT_VERSION,
+                  asOf,
+                  inputs: ["property.yearBuilt"],
+                },
+              ),
         ownership:
           owners.length > 0
             ? available(
@@ -1556,8 +1584,8 @@ export async function buildPublicationDryRun(
         built_year: property.year_built,
         livable_floor_area: property.heated_square_feet,
         total_area: property.total_square_feet,
-        assessed_value: null,
-        market_value: null,
+        assessed_value: property.assessed_value,
+        market_value: property.market_value,
         land_value: null,
         avm_value: null,
         owner_name: primaryOwner?.owner_name_1 ?? null,

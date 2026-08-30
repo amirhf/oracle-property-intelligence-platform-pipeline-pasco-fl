@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type postgres from "postgres";
 
 import type { PreparedPilot, PreparedProperty } from "../domain/types.js";
@@ -126,23 +128,36 @@ function factsFor(
       sourceRecordHash: sourceRecordHash(entry.coordinates),
     });
   }
-  const roof = yearBuiltRoofProxy(entry.yearBuilt, observedThrough);
-  facts.push({
-    collectionSemantics: "positive_upsert",
-    evidenceRefs,
-    factType: "roof_signal",
-    naturalKey: "year_built_proxy",
-    payload: roof,
-    sourceRecordHash: sourceRecordHash(roof),
-  });
-  for (const [feature, reason] of [
+  if (entry.yearBuilt !== null) {
+    const roof = yearBuiltRoofProxy(entry.yearBuilt, observedThrough);
+    facts.push({
+      collectionSemantics: "positive_upsert",
+      evidenceRefs,
+      factType: "roof_signal",
+      naturalKey: "year_built_proxy",
+      payload: roof,
+      sourceRecordHash: sourceRecordHash(roof),
+    });
+  }
+  const unavailable: Array<readonly [string, string]> = [
     ["permits", "source_unavailable"],
     ["contractors", "source_unavailable"],
     ["phones", "not_provided_by_source"],
     ["emails", "not_provided_by_source"],
     ["sunbiz", "source_not_collected"],
     ["bbb", "source_not_collected"],
-  ] as const) {
+  ];
+  if (entry.coordinates === null)
+    unavailable.push(["coordinates", "not_observed_for_property"]);
+  if (entry.buildings.length === 0)
+    unavailable.push(["building", "not_observed_for_property"]);
+  if (entry.owners.length === 0)
+    unavailable.push(["ownership", "not_observed_for_property"]);
+  if (entry.siteAddress === null)
+    unavailable.push(["site_address", "not_observed_for_property"]);
+  if (entry.yearBuilt === null)
+    unavailable.push(["year_built_proxy", "source_fact_unavailable"]);
+  for (const [feature, reason] of unavailable) {
     const payload = { availability: "unavailable", feature, reason };
     facts.push({
       collectionSemantics: "positive_upsert",
@@ -165,6 +180,24 @@ function propertySourceHash(entry: PreparedProperty): string {
   return sourceRecordHash(propertyPayload(entry));
 }
 
+function authoritativeContentSha256(
+  properties: readonly PreparedProperty[],
+): string {
+  const hash = createHash("sha256");
+  hash.update("[");
+  properties.forEach((entry, index) => {
+    if (index > 0) hash.update(",");
+    hash.update(
+      JSON.stringify({
+        propertyId: entry.propertyId,
+        sourceRecordHash: propertySourceHash(entry),
+      }),
+    );
+  });
+  hash.update("]");
+  return hash.digest("hex");
+}
+
 function factVersionId(propertyId: string, fact: ProjectionFactInput): string {
   return deterministicId("factversion", [
     "1.0.0",
@@ -175,6 +208,380 @@ function factVersionId(propertyId: string, fact: ProjectionFactInput): string {
     canonicalJsonSha256(fact.payload),
     fact.sourceRecordHash,
   ]);
+}
+
+const AUTHORITATIVE_BATCH_SIZE = 4_000;
+
+async function recordBatchCheckpoint(
+  transaction: postgres.TransactionSql,
+  options: {
+    batchIndex: number;
+    firstPropertyId: string;
+    ids: readonly string[];
+    lastPropertyId: string;
+    phase:
+      | "fact_versions"
+      | "materialized_facts"
+      | "materialized_properties"
+      | "property_versions";
+    runId: string;
+    snapshotId: string;
+  },
+): Promise<void> {
+  const batchSha256 = canonicalJsonSha256(options.ids);
+  const checkpointId = deterministicId("checkpoint", [
+    "1.0.0",
+    "loader-batch",
+    options.snapshotId,
+    options.phase,
+    String(options.batchIndex),
+    batchSha256,
+  ]);
+  await transaction`
+    INSERT INTO oracle_loader_batch_checkpoints (
+      checkpoint_id, source_snapshot_id, source_run_id, phase, batch_index,
+      row_count, first_property_id, last_property_id, batch_sha256
+    ) VALUES (
+      ${checkpointId}, ${options.snapshotId}, ${options.runId},
+      ${options.phase}, ${options.batchIndex}, ${options.ids.length},
+      ${options.firstPropertyId}, ${options.lastPropertyId}, ${batchSha256}
+    ) ON CONFLICT (checkpoint_id) DO NOTHING
+  `;
+}
+
+async function recordAuthoritativeGenesis(
+  transaction: postgres.TransactionSql,
+  snapshot: SourceSnapshotManifest,
+  runId: string,
+  prepared: PreparedPilot,
+): Promise<ProjectionLoadResult> {
+  const coverage = snapshot.coverage;
+  const properties = [...prepared.properties].sort((left, right) =>
+    codeUnitCompare(left.propertyId, right.propertyId),
+  );
+  const materializationHash = createHash("sha256");
+  materializationHash.update('{"facts":[');
+  let firstFact = true;
+  let factBatchIndex = 0;
+  let factVersionRows: Record<string, unknown>[] = [];
+  let factChangeRows: Record<string, unknown>[] = [];
+  let factCheckpointIds: string[] = [];
+  let factFirstPropertyId = "";
+  let factLastPropertyId = "";
+  const flushFactVersions = async (): Promise<void> => {
+    if (factVersionRows.length === 0) return;
+    await transaction`
+      INSERT INTO oracle_child_fact_versions ${transaction(
+        factVersionRows,
+        "version_id",
+        "property_id",
+        "fact_type",
+        "natural_key",
+        "collection_semantics",
+        "payload_sha256",
+        "payload",
+        "source_record_sha256",
+        "source_snapshot_id",
+        "source_run_id",
+        "evidence_refs",
+      )} ON CONFLICT (version_id) DO NOTHING
+    `;
+    await transaction`
+      INSERT INTO oracle_projection_fact_changes ${transaction(
+        factChangeRows,
+        "snapshot_id",
+        "property_id",
+        "fact_type",
+        "natural_key",
+        "event_type",
+        "from_version_id",
+        "to_version_id",
+      )} ON CONFLICT (snapshot_id, property_id, fact_type, natural_key)
+        DO NOTHING
+    `;
+    await recordBatchCheckpoint(transaction, {
+      batchIndex: factBatchIndex,
+      firstPropertyId: factFirstPropertyId,
+      ids: factCheckpointIds,
+      lastPropertyId: factLastPropertyId,
+      phase: "fact_versions",
+      runId,
+      snapshotId: snapshot.snapshotId,
+    });
+    factBatchIndex += 1;
+    factVersionRows = [];
+    factChangeRows = [];
+    factCheckpointIds = [];
+    factFirstPropertyId = "";
+    factLastPropertyId = "";
+  };
+  for (const entry of properties) {
+    for (const fact of factsFor(entry, snapshot.observationWindow.end)) {
+      const versionId = factVersionId(entry.propertyId, fact);
+      if (!firstFact) materializationHash.update(",");
+      firstFact = false;
+      materializationHash.update(JSON.stringify(versionId));
+      if (factFirstPropertyId.length === 0)
+        factFirstPropertyId = entry.propertyId;
+      factLastPropertyId = entry.propertyId;
+      factCheckpointIds.push(versionId);
+      factVersionRows.push({
+        collection_semantics: fact.collectionSemantics,
+        evidence_refs: transaction.json(fact.evidenceRefs),
+        fact_type: fact.factType,
+        natural_key: fact.naturalKey,
+        payload: transaction.json(fact.payload as postgres.JSONValue),
+        payload_sha256: canonicalJsonSha256(fact.payload),
+        property_id: entry.propertyId,
+        source_record_sha256: fact.sourceRecordHash,
+        source_run_id: runId,
+        source_snapshot_id: snapshot.snapshotId,
+        version_id: versionId,
+      });
+      factChangeRows.push({
+        event_type: "new",
+        fact_type: fact.factType,
+        from_version_id: null,
+        natural_key: fact.naturalKey,
+        property_id: entry.propertyId,
+        snapshot_id: snapshot.snapshotId,
+        to_version_id: versionId,
+      });
+      if (factVersionRows.length >= AUTHORITATIVE_BATCH_SIZE)
+        await flushFactVersions();
+    }
+  }
+  await flushFactVersions();
+  materializationHash.update('],"properties":[');
+
+  let propertyBatchIndex = 0;
+  for (
+    let offset = 0;
+    offset < properties.length;
+    offset += AUTHORITATIVE_BATCH_SIZE
+  ) {
+    const batch = properties.slice(offset, offset + AUTHORITATIVE_BATCH_SIZE);
+    const versionRows: Record<string, unknown>[] = [];
+    const changeRows: Record<string, unknown>[] = [];
+    const versionIds: string[] = [];
+    for (const [batchOffset, entry] of batch.entries()) {
+      const payload = propertyPayload(entry);
+      const payloadSha256 = canonicalJsonSha256(payload);
+      const sourceHash = propertySourceHash(entry);
+      const versionId = deterministicId("propertyversion", [
+        "1.0.0",
+        "property-version",
+        entry.propertyId,
+        payloadSha256,
+        sourceHash,
+      ]);
+      if (offset + batchOffset > 0) materializationHash.update(",");
+      materializationHash.update(
+        JSON.stringify({
+          active: true,
+          propertyId: entry.propertyId,
+          versionId,
+        }),
+      );
+      versionIds.push(versionId);
+      versionRows.push({
+        parcel_identifier: entry.parcel.exactFolio,
+        payload: transaction.json(payload as postgres.JSONValue),
+        payload_sha256: payloadSha256,
+        property_id: entry.propertyId,
+        source_record_sha256: sourceHash,
+        source_run_id: runId,
+        source_snapshot_id: snapshot.snapshotId,
+        version_id: versionId,
+      });
+      changeRows.push({
+        event_type: "new",
+        from_version_id: null,
+        property_id: entry.propertyId,
+        reason: null,
+        snapshot_id: snapshot.snapshotId,
+        to_version_id: versionId,
+      });
+    }
+    await transaction`
+      INSERT INTO oracle_property_versions ${transaction(
+        versionRows,
+        "version_id",
+        "property_id",
+        "parcel_identifier",
+        "payload_sha256",
+        "payload",
+        "source_record_sha256",
+        "source_snapshot_id",
+        "source_run_id",
+      )} ON CONFLICT (version_id) DO NOTHING
+    `;
+    await transaction`
+      INSERT INTO oracle_projection_property_changes ${transaction(
+        changeRows,
+        "snapshot_id",
+        "property_id",
+        "event_type",
+        "from_version_id",
+        "to_version_id",
+        "reason",
+      )} ON CONFLICT (snapshot_id, property_id) DO NOTHING
+    `;
+    await recordBatchCheckpoint(transaction, {
+      batchIndex: propertyBatchIndex,
+      firstPropertyId: batch[0]!.propertyId,
+      ids: versionIds,
+      lastPropertyId: batch.at(-1)!.propertyId,
+      phase: "property_versions",
+      runId,
+      snapshotId: snapshot.snapshotId,
+    });
+    propertyBatchIndex += 1;
+  }
+  materializationHash.update(
+    `],"scopeId":${JSON.stringify(coverage.scopeId)},"snapshotId":${JSON.stringify(snapshot.snapshotId)}}`,
+  );
+  const materializationSha256 = materializationHash.digest("hex");
+  const materializationId = deterministicId("materialization", [
+    "1.0.0",
+    "sealed-projection",
+    materializationSha256,
+  ]);
+  await transaction`
+    INSERT INTO oracle_projection_materializations (
+      materialization_id, snapshot_id, scope_id, materialization_sha256,
+      property_count, active_count, inactive_count, sealed
+    ) VALUES (
+      ${materializationId}, ${snapshot.snapshotId}, ${coverage.scopeId},
+      ${materializationSha256}, ${properties.length}, ${properties.length},
+      0, true
+    )
+  `;
+
+  let materializedPropertyBatchIndex = 0;
+  for (
+    let offset = 0;
+    offset < properties.length;
+    offset += AUTHORITATIVE_BATCH_SIZE
+  ) {
+    const batch = properties.slice(offset, offset + AUTHORITATIVE_BATCH_SIZE);
+    const rows = batch.map((entry) => {
+      const payloadSha256 = canonicalJsonSha256(propertyPayload(entry));
+      const versionId = deterministicId("propertyversion", [
+        "1.0.0",
+        "property-version",
+        entry.propertyId,
+        payloadSha256,
+        propertySourceHash(entry),
+      ]);
+      return {
+        inactivated_at_snapshot_id: null,
+        inactivation_watermark: null,
+        is_active: true,
+        materialization_id: materializationId,
+        property_id: entry.propertyId,
+        property_version_id: versionId,
+      };
+    });
+    await transaction`
+      INSERT INTO oracle_projection_materialized_properties ${transaction(
+        rows,
+        "materialization_id",
+        "property_id",
+        "property_version_id",
+        "is_active",
+        "inactivated_at_snapshot_id",
+        "inactivation_watermark",
+      )}
+    `;
+    await recordBatchCheckpoint(transaction, {
+      batchIndex: materializedPropertyBatchIndex,
+      firstPropertyId: batch[0]!.propertyId,
+      ids: rows.map((row) => row.property_version_id),
+      lastPropertyId: batch.at(-1)!.propertyId,
+      phase: "materialized_properties",
+      runId,
+      snapshotId: snapshot.snapshotId,
+    });
+    materializedPropertyBatchIndex += 1;
+  }
+
+  let materializedFactBatchIndex = 0;
+  let materializedFactRows: Record<string, unknown>[] = [];
+  let materializedFactIds: string[] = [];
+  let materializedFactFirstPropertyId = "";
+  let materializedFactLastPropertyId = "";
+  const flushMaterializedFacts = async (): Promise<void> => {
+    if (materializedFactRows.length === 0) return;
+    await transaction`
+      INSERT INTO oracle_projection_materialized_facts ${transaction(
+        materializedFactRows,
+        "materialization_id",
+        "property_id",
+        "fact_type",
+        "natural_key",
+        "fact_version_id",
+      )}
+    `;
+    await recordBatchCheckpoint(transaction, {
+      batchIndex: materializedFactBatchIndex,
+      firstPropertyId: materializedFactFirstPropertyId,
+      ids: materializedFactIds,
+      lastPropertyId: materializedFactLastPropertyId,
+      phase: "materialized_facts",
+      runId,
+      snapshotId: snapshot.snapshotId,
+    });
+    materializedFactBatchIndex += 1;
+    materializedFactRows = [];
+    materializedFactIds = [];
+    materializedFactFirstPropertyId = "";
+    materializedFactLastPropertyId = "";
+  };
+  for (const entry of properties) {
+    for (const fact of factsFor(entry, snapshot.observationWindow.end)) {
+      const versionId = factVersionId(entry.propertyId, fact);
+      if (materializedFactFirstPropertyId.length === 0)
+        materializedFactFirstPropertyId = entry.propertyId;
+      materializedFactLastPropertyId = entry.propertyId;
+      materializedFactIds.push(versionId);
+      materializedFactRows.push({
+        fact_type: fact.factType,
+        fact_version_id: versionId,
+        materialization_id: materializationId,
+        natural_key: fact.naturalKey,
+        property_id: entry.propertyId,
+      });
+      if (materializedFactRows.length >= AUTHORITATIVE_BATCH_SIZE)
+        await flushMaterializedFacts();
+    }
+  }
+  await flushMaterializedFacts();
+  await transaction`
+    INSERT INTO oracle_projection_heads (
+      scope_id, county, current_snapshot_id,
+      authoritative_base_snapshot_id, revision
+    ) VALUES (
+      ${coverage.scopeId}, 'pasco', ${snapshot.snapshotId},
+      ${snapshot.snapshotId}, 1
+    )
+  `;
+  await transaction`
+    UPDATE oracle_projection_snapshots SET sealed = true
+    WHERE snapshot_id = ${snapshot.snapshotId} AND NOT sealed
+  `;
+  return {
+    activeProperties: properties.length,
+    changedProperties: 0,
+    inactiveProperties: 0,
+    inactivatedProperties: 0,
+    materializationId,
+    materializationSha256,
+    newProperties: properties.length,
+    reactivatedProperties: 0,
+    sampleIsolated: false,
+    unchangedProperties: 0,
+  };
 }
 
 export function planProjectionFactChanges(options: {
@@ -452,12 +859,15 @@ export async function recordProjectionLoad(
     }
   }
 
-  const contentSha256 = canonicalJsonSha256(
-    prepared.properties.map((entry) => ({
-      propertyId: entry.propertyId,
-      sourceRecordHash: propertySourceHash(entry),
-    })),
-  );
+  const contentSha256 =
+    coverage.mode === "authoritative_complete" && !head
+      ? authoritativeContentSha256(prepared.properties)
+      : canonicalJsonSha256(
+          prepared.properties.map((entry) => ({
+            propertyId: entry.propertyId,
+            sourceRecordHash: propertySourceHash(entry),
+          })),
+        );
   await transaction`
     INSERT INTO oracle_projection_snapshots (
       snapshot_id, run_id, county, coverage_mode, scope_id,
@@ -478,6 +888,10 @@ export async function recordProjectionLoad(
       false
     )
   `;
+
+  if (coverage.mode === "authoritative_complete" && !head) {
+    return recordAuthoritativeGenesis(transaction, snapshot, runId, prepared);
+  }
 
   const priorMaterializations = predecessor
     ? await transaction<{ materialization_id: string }[]>`
@@ -504,12 +918,12 @@ export async function recordProjectionLoad(
   const propertyState = new Map(
     priorProperties.map((row) => [row.property_id, { ...row }]),
   );
-  const factState = new Map(
-    priorFacts.map((row) => [
-      `${row.property_id}\u0000${row.fact_type}\u0000${row.natural_key}`,
-      { ...row },
-    ]),
-  );
+  const factsByProperty = new Map<string, Map<string, MaterializedFactRow>>();
+  for (const row of priorFacts) {
+    const propertyFacts = factsByProperty.get(row.property_id) ?? new Map();
+    propertyFacts.set(`${row.fact_type}\u0000${row.natural_key}`, { ...row });
+    factsByProperty.set(row.property_id, propertyFacts);
+  }
   const observedIds = new Set<string>();
   const counts = {
     changed: 0,
@@ -576,24 +990,36 @@ export async function recordProjectionLoad(
       )
     `;
 
-    const facts = factsFor(entry, snapshot.observationWindow.end);
+    let facts = factsFor(entry, snapshot.observationWindow.end);
+    const priorPropertyFacts = factsByProperty.get(entry.propertyId);
+    if (priorPropertyFacts) {
+      const priorValues = [...priorPropertyFacts.values()];
+      facts = facts.filter((fact) => {
+        if (fact.factType !== "availability") return true;
+        if (
+          fact.naturalKey === "coordinates" &&
+          priorValues.some((prior) => prior.fact_type === "coordinate")
+        )
+          return false;
+        if (
+          fact.naturalKey === "year_built_proxy" &&
+          priorValues.some((prior) => prior.fact_type === "roof_signal")
+        )
+          return false;
+        return true;
+      });
+    }
     const factPlan = planProjectionFactChanges({
       facts,
-      priorFacts: [...factState.values()].filter(
-        (fact) => fact.property_id === entry.propertyId,
-      ),
+      priorFacts: priorPropertyFacts ? [...priorPropertyFacts.values()] : [],
       propertyId: entry.propertyId,
       replaceSetTypes: ["building", "ownership"],
     });
-    for (const [key, fact] of factState) {
-      if (fact.property_id === entry.propertyId) factState.delete(key);
-    }
+    const nextPropertyFacts = new Map<string, MaterializedFactRow>();
     for (const fact of factPlan.nextFacts) {
-      factState.set(
-        `${entry.propertyId}\u0000${fact.fact_type}\u0000${fact.natural_key}`,
-        fact,
-      );
+      nextPropertyFacts.set(`${fact.fact_type}\u0000${fact.natural_key}`, fact);
     }
+    factsByProperty.set(entry.propertyId, nextPropertyFacts);
     for (const change of factPlan.changes) {
       if (change.fact && change.toVersionId) {
         const factSha256 = canonicalJsonSha256(change.fact.payload);
@@ -651,12 +1077,14 @@ export async function recordProjectionLoad(
   const sortedProperties = [...propertyState.values()].sort((left, right) =>
     codeUnitCompare(left.property_id, right.property_id),
   );
-  const sortedFacts = [...factState.values()].sort((left, right) =>
-    codeUnitCompare(
-      `${left.property_id}\u0000${left.fact_type}\u0000${left.natural_key}`,
-      `${right.property_id}\u0000${right.fact_type}\u0000${right.natural_key}`,
-    ),
-  );
+  const sortedFacts = [...factsByProperty.values()]
+    .flatMap((facts) => [...facts.values()])
+    .sort((left, right) =>
+      codeUnitCompare(
+        `${left.property_id}\u0000${left.fact_type}\u0000${left.natural_key}`,
+        `${right.property_id}\u0000${right.fact_type}\u0000${right.natural_key}`,
+      ),
+    );
   const materializationSha256 = canonicalJsonSha256({
     facts: sortedFacts.map((fact) => fact.fact_version_id),
     properties: sortedProperties.map((property) => ({
@@ -685,28 +1113,81 @@ export async function recordProjectionLoad(
       ${sortedProperties.length - activeCount}, true
     )
   `;
-  for (const property of sortedProperties) {
+  let materializedPropertyBatchIndex = 0;
+  for (
+    let offset = 0;
+    offset < sortedProperties.length;
+    offset += AUTHORITATIVE_BATCH_SIZE
+  ) {
+    const batch = sortedProperties.slice(
+      offset,
+      offset + AUTHORITATIVE_BATCH_SIZE,
+    );
+    const rows = batch.map((property) => ({
+      inactivated_at_snapshot_id: property.inactivated_at_snapshot_id,
+      inactivation_watermark: property.inactivation_watermark,
+      is_active: property.is_active,
+      materialization_id: materializationId,
+      property_id: property.property_id,
+      property_version_id: property.property_version_id,
+    }));
     await transaction`
-      INSERT INTO oracle_projection_materialized_properties (
-        materialization_id, property_id, property_version_id, is_active,
-        inactivated_at_snapshot_id, inactivation_watermark
-      ) VALUES (
-        ${materializationId}, ${property.property_id},
-        ${property.property_version_id}, ${property.is_active},
-        ${property.inactivated_at_snapshot_id}, ${property.inactivation_watermark}
-      )
+      INSERT INTO oracle_projection_materialized_properties ${transaction(
+        rows,
+        "materialization_id",
+        "property_id",
+        "property_version_id",
+        "is_active",
+        "inactivated_at_snapshot_id",
+        "inactivation_watermark",
+      )}
     `;
+    await recordBatchCheckpoint(transaction, {
+      batchIndex: materializedPropertyBatchIndex,
+      firstPropertyId: batch[0]!.property_id,
+      ids: batch.map((property) => property.property_version_id),
+      lastPropertyId: batch.at(-1)!.property_id,
+      phase: "materialized_properties",
+      runId,
+      snapshotId: snapshot.snapshotId,
+    });
+    materializedPropertyBatchIndex += 1;
   }
-  for (const fact of sortedFacts) {
+
+  let materializedFactBatchIndex = 0;
+  for (
+    let offset = 0;
+    offset < sortedFacts.length;
+    offset += AUTHORITATIVE_BATCH_SIZE
+  ) {
+    const batch = sortedFacts.slice(offset, offset + AUTHORITATIVE_BATCH_SIZE);
+    const rows = batch.map((fact) => ({
+      fact_type: fact.fact_type,
+      fact_version_id: fact.fact_version_id,
+      materialization_id: materializationId,
+      natural_key: fact.natural_key,
+      property_id: fact.property_id,
+    }));
     await transaction`
-      INSERT INTO oracle_projection_materialized_facts (
-        materialization_id, property_id, fact_type, natural_key,
-        fact_version_id
-      ) VALUES (
-        ${materializationId}, ${fact.property_id}, ${fact.fact_type},
-        ${fact.natural_key}, ${fact.fact_version_id}
-      )
+      INSERT INTO oracle_projection_materialized_facts ${transaction(
+        rows,
+        "materialization_id",
+        "property_id",
+        "fact_type",
+        "natural_key",
+        "fact_version_id",
+      )}
     `;
+    await recordBatchCheckpoint(transaction, {
+      batchIndex: materializedFactBatchIndex,
+      firstPropertyId: batch[0]!.property_id,
+      ids: batch.map((fact) => fact.fact_version_id),
+      lastPropertyId: batch.at(-1)!.property_id,
+      phase: "materialized_facts",
+      runId,
+      snapshotId: snapshot.snapshotId,
+    });
+    materializedFactBatchIndex += 1;
   }
   const authoritativeBase =
     coverage.mode === "authoritative_complete"
