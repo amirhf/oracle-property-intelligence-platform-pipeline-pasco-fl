@@ -85,7 +85,9 @@ describe("privacy-safe public Oracle explorer", () => {
       expect(html).not.toContain(sentinel);
     }
 
-    const bootstrap = await fetch(`${baseUrl}/explorer/api/bootstrap`);
+    const bootstrap = await fetch(
+      `${baseUrl}/explorer/api/bootstrap?vercelRewrite=api-index`,
+    );
     expect(bootstrap.status).toBe(200);
     const value = (await bootstrap.json()) as Record<string, unknown>;
     expect(value.publication).toMatchObject({ coverageMode: "sample" });
@@ -94,13 +96,16 @@ describe("privacy-safe public Oracle explorer", () => {
   });
 
   it("executes validated searches while suppressing owner/contact values", async () => {
-    const response = await fetch(`${baseUrl}/explorer/api/search`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(
-        coordinatesSearch({ latitude: 28.3, longitude: -82.4, limit: 1 }),
-      ),
-    });
+    const response = await fetch(
+      `${baseUrl}/explorer/api/search?source=explorer`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(
+          coordinatesSearch({ latitude: 28.3, longitude: -82.4, limit: 1 }),
+        ),
+      },
+    );
     expect(response.status).toBe(200);
     const value = (await response.json()) as Record<string, unknown>;
     const serialized = JSON.stringify(value);
@@ -128,11 +133,14 @@ describe("privacy-safe public Oracle explorer", () => {
   });
 
   it("returns privacy-safe direct property facts and exposes no write/query surface", async () => {
-    const response = await fetch(`${baseUrl}/explorer/api/property`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ propertyId }),
-    });
+    const response = await fetch(
+      `${baseUrl}/explorer/api/property?source=explorer`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ propertyId }),
+      },
+    );
     const serialized = await response.text();
     expect(response.status).toBe(200);
     for (const sentinel of SENSITIVE_SENTINELS) {
@@ -142,9 +150,25 @@ describe("privacy-safe public Oracle explorer", () => {
       fetch(`${baseUrl}/explorer/api/sql`, { method: "POST", body: "{}" }),
       fetch(`${baseUrl}/publish`, { method: "POST", body: "{}" }),
       fetch(`${baseUrl}/explorer/api/property`, { method: "PUT", body: "{}" }),
+      fetch(`${baseUrl}/explorer/api/bootstrap/extra?source=explorer`),
     ]) {
       await expect(request).resolves.toMatchObject({ status: 404 });
     }
+  });
+
+  it("preserves request-size limits after pathname routing", async () => {
+    const response = await fetch(
+      `${baseUrl}/explorer/api/search?source=explorer`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ oversized: "x".repeat(70_000) }),
+      },
+    );
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual({
+      error: "Request body exceeds the limit",
+    });
   });
 
   it("serves all six tools through the official Streamable HTTP client", async () => {

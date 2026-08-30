@@ -16,10 +16,9 @@ describe("Vercel public read-plane readiness", () => {
       { destination: "/api/index", source: "/" },
       { destination: "/api/index", source: "/health" },
       { destination: "/api/index", source: "/mcp" },
-      {
-        destination: "/api/index",
-        source: "/explorer/api/:path*",
-      },
+      { destination: "/api/index", source: "/explorer/api/bootstrap" },
+      { destination: "/api/index", source: "/explorer/api/search" },
+      { destination: "/api/index", source: "/explorer/api/property" },
     ]);
     expect(JSON.stringify(config)).not.toMatch(
       /filebase|secret|token|database|local-artifact/i,

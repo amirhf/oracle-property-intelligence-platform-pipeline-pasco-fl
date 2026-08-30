@@ -10,6 +10,8 @@
     { "source": "/", "destination": "/api/index" },
     { "source": "/health", "destination": "/api/index" },
     { "source": "/mcp", "destination": "/api/index" },
-    { "source": "/explorer/api/:path*", "destination": "/api/index" }
+    { "source": "/explorer/api/bootstrap", "destination": "/api/index" },
+    { "source": "/explorer/api/search", "destination": "/api/index" },
+    { "source": "/explorer/api/property", "destination": "/api/index" }
   ]
 }

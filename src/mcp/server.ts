@@ -211,11 +211,13 @@ export function createOracleMcpRequestHandler(options: {
   runtime: OracleMcpRuntime;
 }): (request: IncomingMessage, response: ServerResponse) => Promise<void> {
   return async (request, response) => {
-    if (request.method === "GET" && request.url === "/") {
+    const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+
+    if (request.method === "GET" && pathname === "/") {
       explorerHtmlResponse(response);
       return;
     }
-    if (request.method === "GET" && request.url === "/health") {
+    if (request.method === "GET" && pathname === "/health") {
       jsonResponse(response, 200, {
         status: "ok",
         service: MCP_SERVICE_NAME,
@@ -226,7 +228,7 @@ export function createOracleMcpRequestHandler(options: {
       });
       return;
     }
-    if (request.method === "GET" && request.url === "/explorer/api/bootstrap") {
+    if (request.method === "GET" && pathname === "/explorer/api/bootstrap") {
       try {
         explorerJsonResponse(
           response,
@@ -242,8 +244,8 @@ export function createOracleMcpRequestHandler(options: {
     }
     if (
       request.method === "POST" &&
-      (request.url === "/explorer/api/search" ||
-        request.url === "/explorer/api/property")
+      (pathname === "/explorer/api/search" ||
+        pathname === "/explorer/api/property")
     ) {
       let body: unknown;
       try {
@@ -259,13 +261,13 @@ export function createOracleMcpRequestHandler(options: {
         return;
       }
       const result =
-        request.url === "/explorer/api/search"
+        pathname === "/explorer/api/search"
           ? await explorerSearch(options.runtime, body)
           : await explorerProperty(options.runtime, body);
       explorerJsonResponse(response, result, options.limits.maxResponseBytes);
       return;
     }
-    if (request.method !== "POST" || request.url !== "/mcp") {
+    if (request.method !== "POST" || pathname !== "/mcp") {
       jsonResponse(response, 404, { error: "Not found" });
       return;
     }

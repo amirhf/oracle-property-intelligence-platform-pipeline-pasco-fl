@@ -169,4 +169,22 @@ describe("stateless MCP Streamable HTTP transport", () => {
       error: "Request body exceeds the limit",
     });
   });
+
+  it("accepts MCP POST requests when rewrite metadata is present", async () => {
+    const queryClient = new Client({
+      name: "oracle-mcp-query-test-client",
+      version: "1.0.0",
+    });
+    try {
+      await queryClient.connect(
+        new StreamableHTTPClientTransport(
+          new URL(`${mcpUrl}?vercelRewrite=api-index`),
+        ) as unknown as Transport,
+      );
+      const listed = await queryClient.listTools();
+      expect(listed.tools.map((tool) => tool.name)).toEqual(MCP_TOOL_NAMES);
+    } finally {
+      await queryClient.close();
+    }
+  });
 });
