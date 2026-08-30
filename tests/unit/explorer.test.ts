@@ -33,12 +33,14 @@ describe("privacy-safe public Oracle explorer", () => {
   let baseUrl: string;
   let client: Client;
   let propertyId: string;
+  let publicationPropertyCount: number;
   let server: ReturnType<typeof createOracleMcpHttpServer>;
 
   beforeAll(async () => {
     const contracts = await McpContractRegistry.create();
     const set = await syntheticPublicSet();
     propertyId = set.propertyIds[0]!;
+    publicationPropertyCount = set.propertyIds.length;
     const provider = await PublicIpnsProvider.create(
       set.config,
       contracts,
@@ -90,7 +92,10 @@ describe("privacy-safe public Oracle explorer", () => {
     );
     expect(bootstrap.status).toBe(200);
     const value = (await bootstrap.json()) as Record<string, unknown>;
-    expect(value.publication).toMatchObject({ coverageMode: "sample" });
+    expect(value.publication).toMatchObject({
+      coverageMode: "sample",
+      propertyCount: publicationPropertyCount,
+    });
     expect(JSON.stringify(value)).toContain("not complete Pasco coverage");
     expect(JSON.stringify(value)).not.toContain(process.cwd());
   });

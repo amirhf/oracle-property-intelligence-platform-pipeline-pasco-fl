@@ -105,6 +105,7 @@ export async function explorerBootstrap(
                 "Temporary candidate-owned Filebase demonstration of protocol compatibility. The buckets and IPNS identities are candidate-controlled and are not represented as Elephant-owned, owner-approved, authoritative-complete, or the final canonical assessment publication.",
             },
       coverageMode: metadata.coverageMode,
+      propertyCount: metadata.canonicalDocumentCount,
       scopeId: metadata.publication.scopeId,
       sourceSnapshotId: metadata.publication.sourceSnapshotId,
       selectionHash: metadata.publication.selectionHash,
@@ -242,7 +243,7 @@ fetch('/explorer/api/bootstrap').then(response => response.json()).then(value =>
   const values = {
     contract: value.service.contractVersion,
     dataset: value.service.datasetVersion,
-    properties: value.pipeline.reconciliationCounts.canonicalProperties,
+    properties: value.publication.propertyCount,
     coordinates: value.pipeline.coverage.coordinates.available,
     permits: value.pipeline.coverage.permits.status,
     freshness: value.publication.freshness.asOf
