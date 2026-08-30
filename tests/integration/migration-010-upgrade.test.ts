@@ -61,6 +61,7 @@ async function applyMigrationRange(
         "014_candidate_demo_publication.sql",
         "015_candidate_demo_bootstrap_cid.sql",
         "016_candidate_demo_resolution_evidence.sql",
+        "017_candidate_demo_filebase_gateway.sql",
       ];
       const filename = filenames.find((candidate) =>
         candidate.startsWith(prefix),
@@ -227,6 +228,7 @@ describe("migration 010 drift-safe legacy publication policy", () => {
         "014_candidate_demo_publication.sql",
         "015_candidate_demo_bootstrap_cid.sql",
         "016_candidate_demo_resolution_evidence.sql",
+        "017_candidate_demo_filebase_gateway.sql",
       ]);
       expect(await runMigrations(url)).toEqual([]);
     });
@@ -293,14 +295,14 @@ describe("migration 010 drift-safe legacy publication policy", () => {
     });
   }
 
-  it("converges the supported local 015→016 path and a fresh 001–016 install", async () => {
+  it("converges the supported local 016→017 path and a fresh 001–017 install", async () => {
     const upgradeSchema = await createSchema("converge_upgrade");
     const freshSchema = await createSchema("converge_fresh");
     const upgradeUrl = databaseUrl(upgradeSchema);
     const freshUrl = databaseUrl(freshSchema);
-    await applyMigrationRange(upgradeUrl, 1, 15);
-    await applyMigrationRange(upgradeUrl, 16, 16);
-    await applyMigrationRange(freshUrl, 1, 16);
+    await applyMigrationRange(upgradeUrl, 1, 16);
+    await applyMigrationRange(upgradeUrl, 17, 17);
+    await applyMigrationRange(freshUrl, 1, 17);
     expect(await schemaSignature(upgradeUrl)).toEqual(
       await schemaSignature(freshUrl),
     );

@@ -26,7 +26,7 @@ const priorOpen = "QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH";
 const priorQuery = "QmYwAPJzv5CZsnAzt8auVZRnGi9VQUg9nHfS3aB2NFv7fC";
 
 function targetObservations(targetCid: string) {
-  return ["filebase_control", "ipfs_io", "dweb_link"].map(
+  return ["filebase_control", "filebase_gateway", "ipfs_io", "dweb_link"].map(
     (resolver, index) => ({
       cacheAgeSeconds: index === 0 ? null : 0,
       httpStatus: 200,
@@ -49,7 +49,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(databaseUrl)).toHaveLength(16);
+  expect(await runMigrations(databaseUrl)).toHaveLength(17);
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });
 

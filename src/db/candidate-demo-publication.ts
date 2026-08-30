@@ -64,7 +64,7 @@ const candidateResolutionObservationSchema = z.strictObject({
   httpStatus: z.number().int().min(100).max(599).nullable(),
   observedAt: z.string().datetime(),
   observedCid: priorCidSchema.nullable(),
-  ordinal: z.number().int().min(1).max(3),
+  ordinal: z.number().int().min(1).max(4),
   outcome: z.enum([
     "resolved",
     "unavailable",
@@ -72,7 +72,12 @@ const candidateResolutionObservationSchema = z.strictObject({
     "http_error",
     "transport_error",
   ]),
-  resolver: z.enum(["filebase_control", "ipfs_io", "dweb_link"]),
+  resolver: z.enum([
+    "filebase_control",
+    "filebase_gateway",
+    "ipfs_io",
+    "dweb_link",
+  ]),
   resolverType: z.enum(["control_plane", "public_resolver"]),
   responseBytes: z.number().int().min(0).max(65_536),
   responseSha256: sha256Schema,
@@ -101,9 +106,18 @@ function validateCandidateResolutionObservations(
 ): CandidateResolutionObservation[] {
   const observations = z
     .array(candidateResolutionObservationSchema)
-    .length(3)
+    .min(3)
+    .max(4)
     .parse(value);
-  const expected = ["filebase_control", "ipfs_io", "dweb_link"] as const;
+  const expected =
+    observations.length === 4
+      ? ([
+          "filebase_control",
+          "filebase_gateway",
+          "ipfs_io",
+          "dweb_link",
+        ] as const)
+      : (["filebase_control", "ipfs_io", "dweb_link"] as const);
   for (let index = 0; index < expected.length; index += 1) {
     const observation = observations[index];
     if (
@@ -1257,7 +1271,7 @@ export async function recordCandidateResolutionCycle(
       `;
       const allowedState =
         classification === "target_observed"
-          ? ["update_in_flight", "target_observed"]
+          ? ["update_in_flight", "update_ambiguous", "target_observed"]
           : classification === "prior_observed"
             ? ["update_in_flight", "update_ambiguous", "prior_confirmed"]
             : classification === "unexpected_cid"
@@ -1329,6 +1343,107 @@ export async function recordCandidateResolutionCycle(
         intentId: intent.intent_id,
         sequence,
       };
+    });
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
+}
+
+export async function recordCandidateSameTargetReassertionDecision(
+  databaseUrl: string,
+  requestValue: {
+    controllerReference: string;
+    cycleId: string;
+    decidedAt: string;
+    demoPlanId: string;
+    demoPlanSha256: string;
+  },
+): Promise<void> {
+  const identity = parse(
+    identitySchema,
+    {
+      demoPlanId: requestValue.demoPlanId,
+      demoPlanSha256: requestValue.demoPlanSha256,
+    },
+    "candidate reassertion decision",
+  );
+  const controllerReference = z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9_-]{2,127}$/)
+    .parse(requestValue.controllerReference);
+  const cycleId = z
+    .string()
+    .regex(/^democycle_[a-f0-9]{32}$/)
+    .parse(requestValue.cycleId);
+  const decidedAt = z.string().datetime().parse(requestValue.decidedAt);
+  const sql = postgres(databaseUrl, { max: 1 });
+  try {
+    await sql.begin(async (transaction) => {
+      await lock(transaction);
+      const plan = await loadPlan(transaction, identity);
+      const current = await loadState(transaction, identity);
+      const cycles = await transaction<
+        { classification: string; observations_canonical: string }[]
+      >`
+        SELECT classification, observations_canonical
+        FROM oracle_candidate_demo_resolution_cycles
+        WHERE cycle_id = ${cycleId}
+          AND demo_plan_id = ${identity.demoPlanId}
+          AND domain = 'open_data'
+      `;
+      const intents = await transaction<{ state: string }[]>`
+        SELECT state FROM oracle_candidate_demo_ipns_intents
+        WHERE demo_plan_id = ${identity.demoPlanId}
+          AND domain = 'open_data'
+        FOR UPDATE
+      `;
+      const observations = cycles[0]
+        ? validateCandidateResolutionObservations(
+            JSON.parse(cycles[0].observations_canonical),
+          )
+        : [];
+      const [control, filebaseGateway, ipfsIo, dwebLink] = observations;
+      const exactDecisionC =
+        observations.length === 4 &&
+        cycles[0]?.classification === "split" &&
+        control?.observedCid === plan.targets.openData.targetCid &&
+        [filebaseGateway, ipfsIo, dwebLink].every(
+          (entry) =>
+            entry?.outcome === "resolved" &&
+            entry.observedCid === plan.targets.openData.priorCid,
+        );
+      if (
+        current.state !== "manual_intervention_required" ||
+        intents[0]?.state !== "update_ambiguous" ||
+        !exactDecisionC
+      ) {
+        throw new DurableConflictError(
+          "Candidate same-target reassertion does not match decision C",
+        );
+      }
+      await recordEvent(
+        transaction,
+        identity.demoPlanId,
+        "manual_same_target_reassertion_authorized",
+        {
+          controllerReference,
+          cycleId,
+          decidedAt,
+          demoPlanSha256: identity.demoPlanSha256,
+          domain: "open_data",
+          targetCid: plan.targets.openData.targetCid,
+        },
+      );
+      await transaction`
+        UPDATE oracle_candidate_demo_ipns_intents
+        SET state = 'prior_confirmed', revision = revision + 1
+        WHERE demo_plan_id = ${identity.demoPlanId} AND domain = 'open_data'
+      `;
+      await transaction`
+        UPDATE oracle_candidate_demo_plans
+        SET state = 'executing', revision = revision + 1, updated_at = now()
+        WHERE demo_plan_id = ${identity.demoPlanId}
+      `;
     });
   } finally {
     await sql.end({ timeout: 5 });

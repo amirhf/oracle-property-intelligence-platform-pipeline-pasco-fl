@@ -157,10 +157,10 @@ export interface CandidateDemoResolutionObservation {
   httpStatus: number | null;
   observedAt: string;
   observedCid: string | null;
-  ordinal: 1 | 2 | 3;
+  ordinal: 1 | 2 | 3 | 4;
   outcome:
     "resolved" | "unavailable" | "timeout" | "http_error" | "transport_error";
-  resolver: "filebase_control" | "ipfs_io" | "dweb_link";
+  resolver: "filebase_control" | "filebase_gateway" | "ipfs_io" | "dweb_link";
   resolverType: "control_plane" | "public_resolver";
   responseBytes: number;
   responseSha256: string;
@@ -184,14 +184,16 @@ async function observePublicResolver(options: {
   config: CandidateDemoPreflightConfig;
   fetchImpl: typeof fetch;
   identity: string;
-  ordinal: 2 | 3;
-  resolver: "ipfs_io" | "dweb_link";
+  ordinal: 2 | 3 | 4;
+  resolver: "filebase_gateway" | "ipfs_io" | "dweb_link";
 }): Promise<CandidateDemoResolutionObservation> {
   const observedAt = new Date().toISOString();
   const url =
-    options.resolver === "ipfs_io"
-      ? new URL(`https://ipfs.io/ipns/${options.identity}`)
-      : new URL(`https://${options.identity}.ipns.dweb.link/`);
+    options.resolver === "filebase_gateway"
+      ? new URL(`https://ipfs.filebase.io/ipns/${options.identity}`)
+      : options.resolver === "ipfs_io"
+        ? new URL(`https://ipfs.io/ipns/${options.identity}`)
+        : new URL(`https://${options.identity}.ipns.dweb.link/`);
   try {
     const response = await options.fetchImpl(url, {
       headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
@@ -283,23 +285,30 @@ export async function observeCandidateDemoResolutionCycle(options: {
     responseBytes: namesResult.responseBytes,
     responseSha256: namesResult.responseSha256,
   };
-  const [ipfsIo, dwebLink] = await Promise.all([
+  const [filebaseGateway, ipfsIo, dwebLink] = await Promise.all([
     observePublicResolver({
       config: options.config,
       fetchImpl,
       identity: target.ipnsNetworkKey,
       ordinal: 2,
-      resolver: "ipfs_io",
+      resolver: "filebase_gateway",
     }),
     observePublicResolver({
       config: options.config,
       fetchImpl,
       identity: target.ipnsNetworkKey,
       ordinal: 3,
+      resolver: "ipfs_io",
+    }),
+    observePublicResolver({
+      config: options.config,
+      fetchImpl,
+      identity: target.ipnsNetworkKey,
+      ordinal: 4,
       resolver: "dweb_link",
     }),
   ]);
-  return [control, ipfsIo, dwebLink];
+  return [control, filebaseGateway, ipfsIo, dwebLink];
 }
 
 async function headBucket(
