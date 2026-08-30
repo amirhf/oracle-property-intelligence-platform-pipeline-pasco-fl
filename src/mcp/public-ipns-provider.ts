@@ -36,6 +36,16 @@ const PUBLIC_GATEWAYS = [
   { id: "dweb_link", origin: "https://dweb.link" },
 ] as const;
 const FILEBASE_PUBLIC_GATEWAY_ORIGIN = "https://ipfs.filebase.io" as const;
+const FILEBASE_ARTIFACT_GATEWAYS = [
+  { id: "filebase_public_gateway", origin: FILEBASE_PUBLIC_GATEWAY_ORIGIN },
+] as const;
+const RETRY_BACKOFF_MS = 50;
+
+type PublicGateway = { id: string; origin: string };
+type RetryDelay = (milliseconds: number) => Promise<void>;
+
+const defaultRetryDelay: RetryDelay = (milliseconds) =>
+  new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 export type PublicReadErrorCode =
   | "artifact_invalid"
@@ -57,6 +67,7 @@ export class PublicReadError extends Error {
   constructor(
     readonly code: PublicReadErrorCode,
     message: string,
+    readonly retryable = false,
   ) {
     super(message);
   }
@@ -82,11 +93,15 @@ export interface PublicReadTransport {
   ): Promise<readonly IpnsResolutionObservation[]>;
 }
 
+export type PublicProviderInitializationStage =
+  "graph" | "ipns_resolution" | "manifest" | "parquet" | "plan";
+
 function publicError(
   code: PublicReadErrorCode,
   message: string,
+  retryable = false,
 ): PublicReadError {
-  return new PublicReadError(code, message);
+  return new PublicReadError(code, message, retryable);
 }
 
 function combinedSignal(
@@ -95,6 +110,13 @@ function combinedSignal(
 ): AbortSignal {
   const timeout = AbortSignal.timeout(timeoutMs);
   return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+function isAbortError(error: unknown): boolean {
+  return (
+    error instanceof DOMException &&
+    (error.name === "AbortError" || error.name === "TimeoutError")
+  );
 }
 
 function responseCid(headers: Headers, location: string | null): string | null {
@@ -118,14 +140,19 @@ function responseCid(headers: Headers, location: string | null): string | null {
   );
 }
 
-function allowedGatewayUrl(value: URL, kind: "ipfs" | "ipns"): boolean {
+function allowedGatewayUrl(
+  value: URL,
+  kind: "ipfs" | "ipns",
+  gateways: readonly PublicGateway[],
+): boolean {
   return (
     value.protocol === "https:" &&
-    PUBLIC_GATEWAYS.some((gateway) => gateway.origin === value.origin) &&
+    gateways.some((gateway) => gateway.origin === value.origin) &&
     (value.pathname.startsWith(`/${kind}/`) ||
       (kind === "ipns" && value.pathname.startsWith("/ipfs/"))) &&
     value.username === "" &&
     value.password === "" &&
+    value.search === "" &&
     value.hash === ""
   );
 }
@@ -168,18 +195,28 @@ async function boundedBody(
 }
 
 export class HttpPublicReadTransport implements PublicReadTransport {
+  readonly #gateways: readonly PublicGateway[];
+  readonly #retryDelay: RetryDelay;
+
   constructor(
     readonly limits: PublicIpnsProviderConfig["limits"],
     readonly fetchImplementation: typeof fetch = fetch,
-  ) {}
+    options: {
+      gateways?: readonly PublicGateway[];
+      retryDelay?: RetryDelay;
+    } = {},
+  ) {
+    this.#gateways = options.gateways ?? PUBLIC_GATEWAYS;
+    this.#retryDelay = options.retryDelay ?? defaultRetryDelay;
+  }
 
   async resolveIpns(
     identity: string,
     signal?: AbortSignal,
   ): Promise<readonly IpnsResolutionObservation[]> {
     return Promise.all(
-      PUBLIC_GATEWAYS.map(async (gateway) => {
-        const response = await this.#request(
+      this.#gateways.map(async (gateway) => {
+        const response = await this.#requestWithRetry(
           new URL(`/ipns/${identity}`, gateway.origin),
           "HEAD",
           "ipns",
@@ -213,7 +250,7 @@ export class HttpPublicReadTransport implements PublicReadTransport {
     signal?: AbortSignal,
   ): Promise<Uint8Array> {
     let lastError: unknown;
-    for (const gateway of PUBLIC_GATEWAYS) {
+    for (const gateway of this.#gateways) {
       for (let attempt = 0; attempt <= this.limits.retries; attempt += 1) {
         try {
           const response = await this.#request(
@@ -224,24 +261,51 @@ export class HttpPublicReadTransport implements PublicReadTransport {
           );
           return await boundedBody(response, maximumBytes);
         } catch (error) {
-          lastError = error;
-          if (error instanceof PublicReadError) {
-            if (
-              error.code === "artifact_too_large" ||
-              error.code === "redirect_rejected" ||
-              error.code === "timeout"
-            ) {
-              throw error;
-            }
+          const failure = isAbortError(error)
+            ? publicError("timeout", "Public read timed out", true)
+            : error;
+          lastError = failure;
+          if (!(failure instanceof PublicReadError) || !failure.retryable) {
+            throw failure;
+          }
+          if (attempt < this.limits.retries) {
+            await this.#retryDelay(RETRY_BACKOFF_MS * (attempt + 1));
           }
         }
       }
     }
+    if (lastError instanceof PublicReadError) throw lastError;
     throw publicError(
       "transport_unavailable",
-      lastError instanceof Error
-        ? "Public artifact transport is unavailable"
-        : "Public artifact could not be read",
+      "Public artifact transport is unavailable",
+    );
+  }
+
+  async #requestWithRetry(
+    initial: URL,
+    method: "GET" | "HEAD",
+    kind: "ipfs" | "ipns",
+    signal?: AbortSignal,
+  ): Promise<Response> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= this.limits.retries; attempt += 1) {
+      try {
+        return await this.#request(initial, method, kind, signal);
+      } catch (error) {
+        lastError = error;
+        if (!(error instanceof PublicReadError) || !error.retryable) {
+          throw error;
+        }
+        if (attempt < this.limits.retries) {
+          await this.#retryDelay(RETRY_BACKOFF_MS * (attempt + 1));
+        }
+      }
+    }
+    if (lastError instanceof PublicReadError) throw lastError;
+    throw publicError(
+      "transport_unavailable",
+      "Public gateway request failed",
+      true,
     );
   }
 
@@ -265,15 +329,13 @@ export class HttpPublicReadTransport implements PublicReadTransport {
           signal: combinedSignal(signal, this.limits.transportTimeoutMs),
         });
       } catch (error) {
-        if (
-          error instanceof DOMException &&
-          (error.name === "AbortError" || error.name === "TimeoutError")
-        ) {
-          throw publicError("timeout", "Public read timed out");
+        if (isAbortError(error)) {
+          throw publicError("timeout", "Public read timed out", true);
         }
         throw publicError(
           "transport_unavailable",
           "Public gateway request failed",
+          true,
         );
       }
       if (response.status >= 300 && response.status < 400) {
@@ -285,7 +347,7 @@ export class HttpPublicReadTransport implements PublicReadTransport {
           );
         }
         const target = new URL(location, current);
-        if (!allowedGatewayUrl(target, kind)) {
+        if (!allowedGatewayUrl(target, kind, this.#gateways)) {
           throw publicError(
             "redirect_rejected",
             "Public redirect was rejected",
@@ -295,9 +357,11 @@ export class HttpPublicReadTransport implements PublicReadTransport {
         continue;
       }
       if (!response.ok) {
+        const retryable = [500, 502, 503, 504].includes(response.status);
         throw publicError(
           "transport_unavailable",
           "Public gateway returned an unavailable response",
+          retryable,
         );
       }
       return response;
@@ -339,10 +403,12 @@ export class CandidateDelegatedPublicReadTransport implements PublicReadTranspor
   readonly #expectedByIdentity: ReadonlyMap<string, string>;
   readonly #fetchImplementation: typeof fetch;
   readonly #limits: PublicIpnsProviderConfig["limits"];
+  readonly #retryDelay: RetryDelay;
 
   constructor(
     config: PublicIpnsProviderConfig,
     fetchImplementation: typeof fetch = fetch,
+    retryDelay: RetryDelay = defaultRetryDelay,
   ) {
     if (config.resolverPolicy !== "candidate_filebase_delegated_v2") {
       throw publicError(
@@ -352,9 +418,14 @@ export class CandidateDelegatedPublicReadTransport implements PublicReadTranspor
     }
     this.#limits = config.limits;
     this.#fetchImplementation = fetchImplementation;
+    this.#retryDelay = retryDelay;
     this.#artifactTransport = new HttpPublicReadTransport(
       config.limits,
       fetchImplementation,
+      {
+        gateways: FILEBASE_ARTIFACT_GATEWAYS,
+        retryDelay,
+      },
     );
     this.#expectedByIdentity = new Map([
       [config.openDataIpns, config.expectedOpenDataRootCid],
@@ -427,10 +498,17 @@ export class CandidateDelegatedPublicReadTransport implements PublicReadTranspor
           signal: combinedSignal(signal, this.#limits.transportTimeoutMs),
         });
         if (response.status >= 400) {
-          lastError = publicError(
+          const retryable = [500, 502, 503, 504].includes(response.status);
+          const error = publicError(
             "transport_unavailable",
             "Official Filebase gateway is unavailable",
+            retryable,
           );
+          if (!retryable) throw error;
+          lastError = error;
+          if (attempt < this.#limits.retries) {
+            await this.#retryDelay(RETRY_BACKOFF_MS * (attempt + 1));
+          }
           continue;
         }
         const location = response.headers.get("location");
@@ -459,24 +537,37 @@ export class CandidateDelegatedPublicReadTransport implements PublicReadTranspor
           status: cid === null ? "unavailable" : "resolved",
         };
       } catch (error) {
-        if (error instanceof PublicReadError) throw error;
-        if (
-          error instanceof DOMException &&
-          (error.name === "AbortError" || error.name === "TimeoutError")
-        ) {
-          throw publicError(
+        if (error instanceof PublicReadError) {
+          if (!error.retryable) throw error;
+          lastError = error;
+          if (attempt < this.#limits.retries) {
+            await this.#retryDelay(RETRY_BACKOFF_MS * (attempt + 1));
+          }
+          continue;
+        }
+        if (isAbortError(error)) {
+          lastError = publicError(
             "timeout",
             "Official Filebase gateway resolution timed out",
+            true,
+          );
+        } else {
+          lastError = publicError(
+            "transport_unavailable",
+            "Official Filebase gateway resolution failed",
+            true,
           );
         }
-        lastError = error;
+        if (attempt < this.#limits.retries) {
+          await this.#retryDelay(RETRY_BACKOFF_MS * (attempt + 1));
+        }
       }
     }
+    if (lastError instanceof PublicReadError) throw lastError;
     throw publicError(
       "transport_unavailable",
-      lastError instanceof Error
-        ? "Official Filebase gateway resolution failed"
-        : "Official Filebase gateway is unavailable",
+      "Official Filebase gateway is unavailable",
+      true,
     );
   }
 }
@@ -918,6 +1009,7 @@ export class PublicIpnsProvider implements OracleMcpProvider {
     contracts: McpContractRegistry,
     transport?: PublicReadTransport,
     signal?: AbortSignal,
+    onStage?: (stage: PublicProviderInitializationStage) => void,
   ): Promise<PublicIpnsProvider> {
     validateConfig(config);
     const activeTransport =
@@ -925,6 +1017,7 @@ export class PublicIpnsProvider implements OracleMcpProvider {
       (config.resolverPolicy === "candidate_filebase_delegated_v2"
         ? new CandidateDelegatedPublicReadTransport(config)
         : new HttpPublicReadTransport(config.limits));
+    onStage?.("ipns_resolution");
     await Promise.all([
       resolveExpected(
         activeTransport,
@@ -942,6 +1035,7 @@ export class PublicIpnsProvider implements OracleMcpProvider {
       ),
     ]);
 
+    onStage?.("plan");
     const planBytes = await activeTransport.readCid(
       config.expectedPlanCid,
       config.limits.maxJsonObjectBytes,
@@ -1008,6 +1102,7 @@ export class PublicIpnsProvider implements OracleMcpProvider {
     const coverageBinding = artifact(plan, "open_data", "coverage.json");
     const provenanceBinding = artifact(plan, "open_data", "provenance.json");
     const summaryBinding = artifact(plan, "open_data", "run-summary.json");
+    onStage?.("manifest");
     const metadataBytes = await Promise.all(
       [
         manifestBinding,
@@ -1080,6 +1175,7 @@ export class PublicIpnsProvider implements OracleMcpProvider {
       );
     }
 
+    onStage?.("graph");
     const manifestEntries = manifest.entries;
     const rootShards = root.shards;
     if (!Array.isArray(manifestEntries) || !Array.isArray(rootShards)) {
@@ -1192,6 +1288,7 @@ export class PublicIpnsProvider implements OracleMcpProvider {
       );
     }
 
+    onStage?.("parquet");
     const parquetBytes = await activeTransport.readCid(
       queryBinding.expectedCid,
       config.limits.maxParquetBytes,

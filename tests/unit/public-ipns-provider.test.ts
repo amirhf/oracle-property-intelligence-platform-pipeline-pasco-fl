@@ -312,6 +312,89 @@ describe("public IPNS Oracle provider", () => {
       timedOut.readCid("QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH", 5),
     ).rejects.toMatchObject({ code: "timeout" });
 
+    let exhaustedTimeoutAttempts = 0;
+    const exhaustedTimeout = new HttpPublicReadTransport(
+      { ...baseLimits, retries: 1 },
+      async () => {
+        exhaustedTimeoutAttempts += 1;
+        throw new DOMException("timed out", "TimeoutError");
+      },
+      { retryDelay: async () => undefined },
+    );
+    await expect(
+      exhaustedTimeout.readCid(
+        "QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH",
+        5,
+      ),
+    ).rejects.toMatchObject({ code: "timeout", retryable: true });
+    expect(exhaustedTimeoutAttempts).toBe(4);
+
+    let timeoutThenSuccessAttempts = 0;
+    const timeoutThenSuccess = new HttpPublicReadTransport(
+      { ...baseLimits, retries: 1 },
+      async () => {
+        timeoutThenSuccessAttempts += 1;
+        if (timeoutThenSuccessAttempts === 1) {
+          throw new DOMException("timed out", "TimeoutError");
+        }
+        return new Response("ok", { status: 200 });
+      },
+      { retryDelay: async () => undefined },
+    );
+    await expect(
+      timeoutThenSuccess.readCid(
+        "QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH",
+        5,
+      ),
+    ).resolves.toEqual(new TextEncoder().encode("ok"));
+    expect(timeoutThenSuccessAttempts).toBe(2);
+
+    let bodyTimeoutAttempts = 0;
+    const bodyTimeoutThenSuccess = new HttpPublicReadTransport(
+      { ...baseLimits, retries: 1 },
+      async () => {
+        bodyTimeoutAttempts += 1;
+        if (bodyTimeoutAttempts === 1) {
+          return new Response(
+            new ReadableStream({
+              pull(controller) {
+                controller.error(new DOMException("timed out", "TimeoutError"));
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response("ok", { status: 200 });
+      },
+      { retryDelay: async () => undefined },
+    );
+    await expect(
+      bodyTimeoutThenSuccess.readCid(
+        "QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH",
+        5,
+      ),
+    ).resolves.toEqual(new TextEncoder().encode("ok"));
+    expect(bodyTimeoutAttempts).toBe(2);
+
+    let unavailableThenSuccessAttempts = 0;
+    const unavailableThenSuccess = new HttpPublicReadTransport(
+      { ...baseLimits, retries: 1 },
+      async () => {
+        unavailableThenSuccessAttempts += 1;
+        return unavailableThenSuccessAttempts === 1
+          ? new Response(null, { status: 503 })
+          : new Response("ok", { status: 200 });
+      },
+      { retryDelay: async () => undefined },
+    );
+    await expect(
+      unavailableThenSuccess.readCid(
+        "QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH",
+        5,
+      ),
+    ).resolves.toEqual(new TextEncoder().encode("ok"));
+    expect(unavailableThenSuccessAttempts).toBe(2);
+
     let attempts = 0;
     const retried = new HttpPublicReadTransport(
       { ...baseLimits, retries: 1 },
@@ -319,11 +402,29 @@ describe("public IPNS Oracle provider", () => {
         attempts += 1;
         return new Response(null, { status: 503 });
       },
+      { retryDelay: async () => undefined },
     );
     await expect(
       retried.readCid("QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH", 5),
     ).rejects.toMatchObject({ code: "transport_unavailable" });
     expect(attempts).toBe(4);
+
+    let permanentAttempts = 0;
+    const permanent = new HttpPublicReadTransport(
+      { ...baseLimits, retries: 2 },
+      async () => {
+        permanentAttempts += 1;
+        return new Response(null, { status: 403 });
+      },
+      { retryDelay: async () => undefined },
+    );
+    await expect(
+      permanent.readCid("QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH", 5),
+    ).rejects.toMatchObject({
+      code: "transport_unavailable",
+      retryable: false,
+    });
+    expect(permanentAttempts).toBe(1);
   });
 
   it("keeps equivalent synthetic evidence isolated per transport instance", async () => {

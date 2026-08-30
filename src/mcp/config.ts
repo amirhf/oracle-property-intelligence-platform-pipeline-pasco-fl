@@ -202,7 +202,7 @@ function publicProvider(
         "MCP_PUBLIC_TRANSPORT_TIMEOUT_MS",
         5_000,
         100,
-        15_000,
+        30_000,
       ),
     },
     mode: "public-ipns",

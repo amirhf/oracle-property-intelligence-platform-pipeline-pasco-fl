@@ -67,8 +67,11 @@ describe("Oracle MCP provider isolation", () => {
       loadMcpConfig({
         ...environment,
         MCP_PUBLIC_RESOLVER_POLICY: "candidate_filebase_delegated_v2",
+        MCP_PUBLIC_RETRIES: "1",
+        MCP_PUBLIC_TRANSPORT_TIMEOUT_MS: "20000",
       }).provider,
     ).toMatchObject({
+      limits: { retries: 1, transportTimeoutMs: 20_000 },
       resolverPolicy: "candidate_filebase_delegated_v2",
     });
     expect(() =>

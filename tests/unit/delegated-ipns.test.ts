@@ -330,12 +330,22 @@ describe("signed IPNS delegated-routing observation", () => {
       [query.networkKey, query.bytes],
     ]);
     const calls: string[] = [];
+    const filebaseAttempts = new Map<string, number>();
     const fetchImpl: typeof fetch = async (input, init) => {
       const url = new URL(String(input));
       calls.push(`${init?.method ?? "GET"} ${url.origin}${url.pathname}`);
       const identity = url.pathname.split("/").at(-1)!;
       const cid = expected.get(identity)!;
       if (url.origin === "https://ipfs.filebase.io") {
+        if (url.pathname.startsWith("/ipfs/")) {
+          return new Response("candidate artifact", { status: 200 });
+        }
+        const attempt = (filebaseAttempts.get(identity) ?? 0) + 1;
+        filebaseAttempts.set(identity, attempt);
+        if (attempt === 1 && identity === open.networkKey) {
+          throw new DOMException("timed out", "TimeoutError");
+        }
+        if (attempt === 1) return new Response(null, { status: 503 });
         return new Response(null, {
           headers: { "x-ipfs-path": `/ipfs/${cid}` },
           status: 301,
@@ -363,7 +373,7 @@ describe("signed IPNS delegated-routing observation", () => {
           maxJsonObjectBytes: 1024 * 1024,
           maxParquetBytes: 1024 * 1024,
           maxRedirects: 0,
-          retries: 0,
+          retries: 1,
           transportTimeoutMs: 1_000,
         },
         mode: "public-ipns",
@@ -372,6 +382,7 @@ describe("signed IPNS delegated-routing observation", () => {
         resolverPolicy: "candidate_filebase_delegated_v2",
       },
       fetchImpl,
+      async () => undefined,
     );
     await expect(transport.resolveIpns(open.networkKey)).resolves.toEqual([
       expect.objectContaining({
@@ -388,11 +399,21 @@ describe("signed IPNS delegated-routing observation", () => {
     await expect(transport.resolveIpns(query.networkKey)).resolves.toHaveLength(
       2,
     );
-    expect(calls).toEqual([
-      `HEAD https://ipfs.filebase.io/ipns/${open.networkKey}`,
-      `GET ${DELEGATED_IPFS_ORIGIN}/routing/v1/ipns/${open.networkKey}`,
-      `HEAD https://ipfs.filebase.io/ipns/${query.networkKey}`,
-      `GET ${DELEGATED_IPFS_ORIGIN}/routing/v1/ipns/${query.networkKey}`,
-    ]);
+    await expect(transport.readCid(targetCid, 100)).resolves.toEqual(
+      new TextEncoder().encode("candidate artifact"),
+    );
+    expect(filebaseAttempts).toEqual(
+      new Map([
+        [open.networkKey, 2],
+        [query.networkKey, 2],
+      ]),
+    );
+    expect(
+      calls.filter((call) => call.startsWith(`GET ${DELEGATED_IPFS_ORIGIN}`)),
+    ).toHaveLength(2);
+    expect(
+      calls.filter((call) => call.startsWith("HEAD https://ipfs.filebase.io")),
+    ).toHaveLength(4);
+    expect(calls.at(-1)).toBe(`GET https://ipfs.filebase.io/ipfs/${targetCid}`);
   });
 });
