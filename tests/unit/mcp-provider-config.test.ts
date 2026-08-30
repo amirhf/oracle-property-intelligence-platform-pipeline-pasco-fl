@@ -47,6 +47,38 @@ describe("Oracle MCP provider isolation", () => {
     ).toThrow("MCP_PUBLIC_MANIFEST_CID is required");
   });
 
+  it("accepts only the closed public resolver profiles", () => {
+    const environment = {
+      NODE_ENV: "production",
+      ORACLE_MCP_PROVIDER: "public-ipns",
+      MCP_OPEN_DATA_IPNS: `k51${"a".repeat(59)}`,
+      MCP_QUERY_TABLE_IPNS: `k51${"b".repeat(59)}`,
+      MCP_PUBLIC_MANIFEST_CID: `Qm${"a".repeat(44)}`,
+      MCP_PUBLIC_MANIFEST_SHA256: "a".repeat(64),
+      MCP_PUBLIC_OPEN_DATA_ROOT_CID: `Qm${"b".repeat(44)}`,
+      MCP_PUBLIC_PLAN_CID: `Qm${"c".repeat(44)}`,
+      MCP_PUBLIC_PLAN_SHA256: "b".repeat(64),
+      MCP_PUBLIC_QUERY_TABLE_ROOT_CID: `Qm${"d".repeat(44)}`,
+      MCP_PUBLIC_CANDIDATE_DEMO_PLAN_ID: `demo_${"e".repeat(32)}`,
+      MCP_PUBLIC_CANDIDATE_DEMO_PLAN_SHA256: "c".repeat(64),
+      MCP_PUBLIC_CANDIDATE_SOURCE_PLAN_SHA256: "d".repeat(64),
+    };
+    expect(
+      loadMcpConfig({
+        ...environment,
+        MCP_PUBLIC_RESOLVER_POLICY: "candidate_filebase_delegated_v2",
+      }).provider,
+    ).toMatchObject({
+      resolverPolicy: "candidate_filebase_delegated_v2",
+    });
+    expect(() =>
+      loadMcpConfig({
+        ...environment,
+        MCP_PUBLIC_RESOLVER_POLICY: "caller-supplied-resolver",
+      }),
+    ).toThrow("MCP_PUBLIC_RESOLVER_POLICY");
+  });
+
   it("rejects arbitrary, missing, and fixture paths", async () => {
     const dataDir = path.resolve("data");
     await expect(

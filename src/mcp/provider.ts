@@ -47,6 +47,8 @@ export interface DatasetMetadata {
   plan: JsonObject;
   providerMode: McpProviderConfig["mode"];
   publication: {
+    candidateDemoPlanId: string | null;
+    candidateDemoPlanSha256: string | null;
     manifestCid: string;
     openDataIpns: string | null;
     openDataRootCid: string;
@@ -54,6 +56,10 @@ export interface DatasetMetadata {
     planSha256: string;
     queryTableIpns: string | null;
     queryTableRootCid: string;
+    resolverPolicy:
+      | "candidate_filebase_delegated_v2"
+      | "local_artifact_v1"
+      | "public_two_gateway_v1";
     scopeId: string;
     selectionHash: string;
     sourceSnapshotId: string | null;
@@ -470,6 +476,8 @@ export class LocalArtifactProvider implements OracleMcpProvider {
         plan: { sourceWatermark },
         providerMode: "local-artifact",
         publication: {
+          candidateDemoPlanId: null,
+          candidateDemoPlanSha256: null,
           manifestCid: manifestCid ?? "",
           openDataIpns: null,
           openDataRootCid: graph?.openDataRoot.expectedCid ?? "",
@@ -477,6 +485,7 @@ export class LocalArtifactProvider implements OracleMcpProvider {
           planSha256: publicationPlan.planSha256,
           queryTableIpns: null,
           queryTableRootCid: graph?.queryTableRoot.expectedCid ?? "",
+          resolverPolicy: "local_artifact_v1",
           scopeId: publicationPlan.coverage.scopeId,
           selectionHash:
             publicationPlan.coverage.selection.selectedRecordSha256,

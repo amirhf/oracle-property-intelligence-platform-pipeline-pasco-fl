@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 
 import { HeadBucketCommand, S3Client } from "@aws-sdk/client-s3";
 import { z } from "zod";
@@ -12,6 +13,10 @@ import {
   type PublicReadTransport,
 } from "../mcp/public-ipns-provider.js";
 import type { CandidateDemoPreflightConfig } from "./candidate-demo-config.js";
+import {
+  delegatedIpnsEvidenceSchema,
+  observeDelegatedIpnsRecord,
+} from "./delegated-ipns.js";
 
 const cidV0Schema = z.string().regex(/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/);
 const cidV1Schema = z.string().regex(/^b[a-z2-7]{20,120}$/);
@@ -164,6 +169,365 @@ export interface CandidateDemoResolutionObservation {
   resolverType: "control_plane" | "public_resolver";
   responseBytes: number;
   responseSha256: string;
+}
+
+const signedCheckpointEndpointObservationSchema = z.strictObject({
+  endpointType: z.enum(["filebase_names_control", "filebase_public_gateway"]),
+  httpStatus: z.number().int().min(100).max(599).nullable(),
+  latencyMs: z.number().int().min(0).max(120_000),
+  observedAt: z.string().datetime(),
+  observedCid: priorCidSchema.nullable(),
+  outcome: z.enum([
+    "resolved",
+    "unavailable",
+    "http_error",
+    "timeout",
+    "transport_error",
+    "redirect_rejected",
+    "response_too_large",
+    "malformed_response",
+  ]),
+  requestCount: z.literal(1),
+  responseBytes: z.number().int().min(0).max(65_536),
+  responseSha256: z.string().regex(/^[a-f0-9]{64}$/),
+});
+
+export const candidateSignedIpnsCheckpointSchema = z.strictObject({
+  approvalId: z.string().regex(/^demoapproval_[a-f0-9]{32}$/),
+  classification: z.enum([
+    "converged",
+    "propagation_pending",
+    "source_split",
+    "source_unavailable",
+    "signed_record_invalid",
+    "signed_record_expired",
+    "unexpected_cid",
+  ]),
+  delegated: delegatedIpnsEvidenceSchema,
+  demoPlanId: z.string().regex(/^demo_[a-f0-9]{32}$/),
+  demoPlanSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  domain: z.literal("query_table"),
+  evidenceSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  filebaseControl: signedCheckpointEndpointObservationSchema.extend({
+    endpointType: z.literal("filebase_names_control"),
+  }),
+  filebaseGateway: signedCheckpointEndpointObservationSchema.extend({
+    endpointType: z.literal("filebase_public_gateway"),
+  }),
+  intentId: z.string().regex(/^demointent_[a-f0-9]{32}$/),
+  networkKey: z.string().regex(/^k51[0-9a-z]{59}$/),
+  policyVersion: z.literal("candidate_signed_ipns_observation_v1"),
+  priorCid: priorCidSchema,
+  requestCount: z.number().int().min(3).max(4),
+  targetCid: cidV0Schema,
+});
+
+export type CandidateSignedIpnsCheckpoint = z.infer<
+  typeof candidateSignedIpnsCheckpointSchema
+>;
+
+export function validateCandidateSignedIpnsCheckpoint(
+  value: unknown,
+): CandidateSignedIpnsCheckpoint {
+  const evidence = candidateSignedIpnsCheckpointSchema.parse(value);
+  const { evidenceSha256: _evidenceSha256, ...withoutHash } = evidence;
+  if (canonicalJsonSha256(withoutHash) !== evidence.evidenceSha256) {
+    throw new Error("Candidate signed IPNS evidence hash is invalid");
+  }
+  return evidence;
+}
+
+type SignedCheckpointEndpointObservation = z.infer<
+  typeof signedCheckpointEndpointObservationSchema
+>;
+
+function boundedLatency(startedAt: number): number {
+  return Math.min(
+    120_000,
+    Math.max(0, Math.round(performance.now() - startedAt)),
+  );
+}
+
+function unavailableEndpointObservation(options: {
+  endpointType: SignedCheckpointEndpointObservation["endpointType"];
+  httpStatus: number | null;
+  latencyMs: number;
+  observedAt: string;
+  outcome: SignedCheckpointEndpointObservation["outcome"];
+  responseBytes?: number;
+  responseSha256?: string;
+}): SignedCheckpointEndpointObservation {
+  return signedCheckpointEndpointObservationSchema.parse({
+    ...options,
+    observedCid: null,
+    requestCount: 1,
+    responseBytes: options.responseBytes ?? 0,
+    responseSha256: options.responseSha256 ?? sha256(Buffer.alloc(0)),
+  });
+}
+
+async function observeFilebaseControlForSignedCheckpoint(options: {
+  config: CandidateDemoPreflightConfig;
+  fetchImpl: typeof fetch;
+}): Promise<SignedCheckpointEndpointObservation> {
+  const startedAt = performance.now();
+  const observedAt = new Date().toISOString();
+  let response: Response;
+  try {
+    response = await options.fetchImpl("https://api.filebase.io/v1/names", {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${options.config.apiToken}`,
+      },
+      method: "GET",
+      redirect: "error",
+      signal: timeoutSignal(options.config.limits.requestTimeoutMs),
+    });
+  } catch (error) {
+    const timeout =
+      error instanceof DOMException &&
+      (error.name === "AbortError" || error.name === "TimeoutError");
+    return unavailableEndpointObservation({
+      endpointType: "filebase_names_control",
+      httpStatus: null,
+      latencyMs: boundedLatency(startedAt),
+      observedAt,
+      outcome: timeout ? "timeout" : "transport_error",
+    });
+  }
+  let result: Awaited<ReturnType<typeof boundedJson>>;
+  try {
+    result = await boundedJson(response, 64 * 1024);
+  } catch (error) {
+    return unavailableEndpointObservation({
+      endpointType: "filebase_names_control",
+      httpStatus: response.status,
+      latencyMs: boundedLatency(startedAt),
+      observedAt,
+      outcome:
+        error instanceof Error && error.message.includes("exceeds")
+          ? "response_too_large"
+          : "malformed_response",
+    });
+  }
+  if (!response.ok) {
+    return unavailableEndpointObservation({
+      endpointType: "filebase_names_control",
+      httpStatus: response.status,
+      latencyMs: boundedLatency(startedAt),
+      observedAt,
+      outcome: "http_error",
+      responseBytes: result.bytes,
+      responseSha256: result.sha256,
+    });
+  }
+  const parsed = z.array(filebaseNameSchema).safeParse(result.value);
+  if (!parsed.success) {
+    return unavailableEndpointObservation({
+      endpointType: "filebase_names_control",
+      httpStatus: response.status,
+      latencyMs: boundedLatency(startedAt),
+      observedAt,
+      outcome: "malformed_response",
+      responseBytes: result.bytes,
+      responseSha256: result.sha256,
+    });
+  }
+  const target = options.config.targets.queryTable;
+  const name = parsed.data.find(
+    (entry) =>
+      entry.label === target.ipnsLabel &&
+      entry.network_key === target.ipnsNetworkKey,
+  );
+  if (!name) {
+    return unavailableEndpointObservation({
+      endpointType: "filebase_names_control",
+      httpStatus: response.status,
+      latencyMs: boundedLatency(startedAt),
+      observedAt,
+      outcome: "unavailable",
+      responseBytes: result.bytes,
+      responseSha256: result.sha256,
+    });
+  }
+  return signedCheckpointEndpointObservationSchema.parse({
+    endpointType: "filebase_names_control",
+    httpStatus: response.status,
+    latencyMs: boundedLatency(startedAt),
+    observedAt,
+    observedCid: name.cid,
+    outcome: "resolved",
+    requestCount: 1,
+    responseBytes: result.bytes,
+    responseSha256: result.sha256,
+  });
+}
+
+async function observeFilebaseGatewayForSignedCheckpoint(options: {
+  config: CandidateDemoPreflightConfig;
+  fetchImpl: typeof fetch;
+}): Promise<SignedCheckpointEndpointObservation> {
+  const startedAt = performance.now();
+  const observedAt = new Date().toISOString();
+  const identity = options.config.targets.queryTable.ipnsNetworkKey;
+  let response: Response;
+  try {
+    response = await options.fetchImpl(
+      new URL(`https://ipfs.filebase.io/ipns/${identity}`),
+      {
+        headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
+        method: "HEAD",
+        redirect: "manual",
+        signal: timeoutSignal(options.config.limits.requestTimeoutMs),
+      },
+    );
+  } catch (error) {
+    const timeout =
+      error instanceof DOMException &&
+      (error.name === "AbortError" || error.name === "TimeoutError");
+    return unavailableEndpointObservation({
+      endpointType: "filebase_public_gateway",
+      httpStatus: null,
+      latencyMs: boundedLatency(startedAt),
+      observedAt,
+      outcome: timeout ? "timeout" : "transport_error",
+    });
+  }
+  const observedCid = cidFromResponse(response);
+  if (observedCid) {
+    return signedCheckpointEndpointObservationSchema.parse({
+      endpointType: "filebase_public_gateway",
+      httpStatus: response.status,
+      latencyMs: boundedLatency(startedAt),
+      observedAt,
+      observedCid,
+      outcome: "resolved",
+      requestCount: 1,
+      responseBytes: 0,
+      responseSha256: sha256(Buffer.alloc(0)),
+    });
+  }
+  return unavailableEndpointObservation({
+    endpointType: "filebase_public_gateway",
+    httpStatus: response.status,
+    latencyMs: boundedLatency(startedAt),
+    observedAt,
+    outcome:
+      response.status >= 300 && response.status < 400
+        ? "redirect_rejected"
+        : response.status >= 400
+          ? "http_error"
+          : "unavailable",
+  });
+}
+
+function classifySignedCheckpoint(input: {
+  delegated: z.infer<typeof delegatedIpnsEvidenceSchema>;
+  filebaseControl: SignedCheckpointEndpointObservation;
+  filebaseGateway: SignedCheckpointEndpointObservation;
+  priorCid: string;
+  targetCid: string;
+}): CandidateSignedIpnsCheckpoint["classification"] {
+  const observed = [
+    input.filebaseControl.observedCid,
+    input.filebaseGateway.observedCid,
+    input.delegated.observedCid,
+  ].filter((entry): entry is string => entry !== null);
+  if (
+    observed.some(
+      (entry) => entry !== input.priorCid && entry !== input.targetCid,
+    ) ||
+    input.delegated.validationResult === "unexpected_cid"
+  ) {
+    return "unexpected_cid";
+  }
+  if (input.delegated.validationResult === "expired_record") {
+    return "signed_record_expired";
+  }
+  if (
+    !["valid_target", "valid_prior"].includes(input.delegated.validationResult)
+  ) {
+    return "signed_record_invalid";
+  }
+  if (input.delegated.validationResult === "valid_prior") {
+    return "propagation_pending";
+  }
+  if (
+    input.filebaseControl.outcome !== "resolved" ||
+    input.filebaseGateway.outcome !== "resolved"
+  ) {
+    return "source_unavailable";
+  }
+  if (
+    input.filebaseControl.observedCid === input.targetCid &&
+    input.filebaseGateway.observedCid === input.targetCid
+  ) {
+    return "converged";
+  }
+  return "source_split";
+}
+
+export async function observeCandidateSignedIpnsCheckpoint(options: {
+  approvalId: string;
+  config: CandidateDemoPreflightConfig;
+  demoPlanId: string;
+  demoPlanSha256: string;
+  expectedPriorCid: string;
+  expectedTargetCid: string;
+  fetchImpl?: typeof fetch;
+  intentId: string;
+}): Promise<CandidateSignedIpnsCheckpoint> {
+  if (options.config.enabled) {
+    throw new Error("Signed IPNS observation requires executor disabled");
+  }
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const [filebaseControl, filebaseGateway, delegated] = await Promise.all([
+    observeFilebaseControlForSignedCheckpoint({
+      config: options.config,
+      fetchImpl,
+    }),
+    observeFilebaseGatewayForSignedCheckpoint({
+      config: options.config,
+      fetchImpl,
+    }),
+    observeDelegatedIpnsRecord({
+      expectedPriorCid: options.expectedPriorCid,
+      expectedTargetCid: options.expectedTargetCid,
+      fetchImpl,
+      maxRetries: options.config.limits.maxRetries > 0 ? 1 : 0,
+      networkKey: options.config.targets.queryTable.ipnsNetworkKey,
+      timeoutMs: options.config.limits.requestTimeoutMs,
+    }),
+  ]);
+  const withoutHash = {
+    approvalId: options.approvalId,
+    classification: classifySignedCheckpoint({
+      delegated,
+      filebaseControl,
+      filebaseGateway,
+      priorCid: options.expectedPriorCid,
+      targetCid: options.expectedTargetCid,
+    }),
+    delegated,
+    demoPlanId: options.demoPlanId,
+    demoPlanSha256: options.demoPlanSha256,
+    domain: "query_table" as const,
+    filebaseControl,
+    filebaseGateway,
+    intentId: options.intentId,
+    networkKey: options.config.targets.queryTable.ipnsNetworkKey,
+    policyVersion: "candidate_signed_ipns_observation_v1" as const,
+    priorCid: options.expectedPriorCid,
+    requestCount:
+      filebaseControl.requestCount +
+      filebaseGateway.requestCount +
+      delegated.requestCount,
+    targetCid: options.expectedTargetCid,
+  };
+  return candidateSignedIpnsCheckpointSchema.parse({
+    ...withoutHash,
+    evidenceSha256: canonicalJsonSha256(withoutHash),
+  });
 }
 
 function cidFromResponse(response: Response): string | null {

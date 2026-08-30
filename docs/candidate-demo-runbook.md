@@ -10,15 +10,13 @@ assessment publication.
 ## Current bounded execution state
 
 The approved 25-property candidate plan has 34 provider-CID-verified object
-checkpoints totaling 178,045 bytes. Its open-data Names API control plane reports
-the approved target. The latest bounded observation also found the official
-Filebase gateway and dweb.link at the target while ipfs.io remained at the
-immutable prior. The durable plan therefore remains
-`manual_intervention_required`, and the existing open-data intent remains
-`update_ambiguous`, until a fresh policy-bound cycle is recorded. The query-table
-intent remains `prior_confirmed`; its IPNS identity has not been updated. The
-candidate executor is disabled. No completed IPNS publication, public read-plane
-verification, owner/canonical publication, or Vercel deployment is claimed.
+checkpoints totaling 178,045 bytes. The open-data intent was already verified.
+A bounded query-table observation found the approved target at the Filebase
+control plane and official public gateway. It
+also obtained the signed IPNS record from the compiled IPFS Delegated Routing
+V1 endpoint, validated its signature and k51 identity binding with the pinned
+IPNS library, and found the approved target. Only bounded metadata and the
+signed-record SHA-256 were persisted; the raw record was not stored.
 
 The controller-authorized `candidate_filebase_dweb_v1` policy is restricted to
 this exact candidate plan and approval. It requires the Filebase control plane,
@@ -26,6 +24,25 @@ official Filebase public gateway and dweb.link to report the approved target.
 ipfs.io is retained as immutable diagnostic evidence but does not block this
 candidate-only profile. The policy cannot authorize `authoritative_complete`,
 owner/canonical publication or any different plan, approval, identity or CID.
+
+The stricter `candidate_filebase_delegated_v2` policy is a separate recovery
+decision, not a modification of the approved plan or plan hash. It requires the
+Filebase control plane, official Filebase public gateway and a cryptographically
+valid delegated IPNS record to agree on the exact approved target. dweb.link and
+ipfs.io are diagnostic only. Its immutable authorization binds the plan ID and
+hash, original approval, query intent and k51 identity, prior and target CIDs,
+and one exact converged signed-evidence record. No such authorization has been
+reused outside that binding. The immutable human authorization
+allowed the existing query intent to move from `update_ambiguous` to
+`verified` and the candidate plan from `manual_intervention_required` to
+`completed` without another upload or IPNS mutation. The completion record
+states `remoteMutationPerformed=false`. Exact replay is idempotent.
+
+The candidate executor is disabled. A credential-free local public read plane
+has verified the official Filebase gateway, signed delegated records, immutable
+root and query-table CIDs, graph and Parquet bindings, explorer routes and all
+six MCP tools. Vercel deployment has not been performed. This policy is
+candidate-demo-only and grants no owner/canonical authority.
 
 The candidate flow has separate `oracle_candidate_demo_*` plan, approval,
 object-effect, IPNS-intent and event tables. It never updates the accepted
@@ -74,9 +91,13 @@ that pilot passes may a separate 25,000-sample plan be considered.
 
 For Vercel, create or link a candidate preview project, set only the public
 read-plane `MCP_*` values and `ORACLE_MCP_PROVIDER=public-ipns` in the Preview
-environment, and redeploy. Filebase write credentials do not belong in the
-hosted read-plane project. The preview must pass `/`, `/health`, `/mcp` and all
-explorer smoke checks before any production promotion is considered.
+environment, and redeploy. `MCP_PUBLIC_PLAN_SHA256` is the hash of the
+immutable plan artifact bytes;
+`MCP_PUBLIC_CANDIDATE_SOURCE_PLAN_SHA256` is the logical source plan's
+internal hash; and `MCP_PUBLIC_CANDIDATE_DEMO_PLAN_SHA256` is the separately
+approved candidate wrapper hash. Filebase write credentials do not belong in
+the hosted read-plane project. The preview must pass `/`, `/health`, `/mcp`
+and all explorer smoke checks before any production promotion is considered.
 
 The bounded candidate execution used candidate-controlled Filebase resources;
 it did not use or enable the real owner/canonical executor. Authenticated owner

@@ -69,7 +69,7 @@ try {
   );
   const searchRequest = {
     county: "pasco",
-    center: { kind: "place", text: "Dade City, FL" },
+    center: { kind: "coordinates", latitude: 28.3, longitude: -82.35 },
     radius: { value: 50, unit: "mi" },
     filters: {
       roofAge: {

@@ -58,6 +58,32 @@ describe("public IPNS Oracle provider", () => {
     expect(set.transport.reads).toContain(set.config.expectedQueryTableRootCid);
   }, 30_000);
 
+  it("binds a target-null source plan to one explicit candidate authorization", async () => {
+    const set = await syntheticPublicSet({ candidatePlanBindings: true });
+    const provider = await PublicIpnsProvider.create(
+      set.config,
+      contracts,
+      set.transport,
+    );
+    const metadata = await provider.getMetadata();
+    expect(metadata.publication).toMatchObject({
+      candidateDemoPlanId: `demo_${"d".repeat(32)}`,
+      candidateDemoPlanSha256: "2".repeat(64),
+      resolverPolicy: "candidate_filebase_delegated_v2",
+    });
+
+    await expect(
+      PublicIpnsProvider.create(
+        {
+          ...set.config,
+          candidateDemoSourcePlanSha256: "3".repeat(64),
+        },
+        contracts,
+        set.transport,
+      ),
+    ).rejects.toMatchObject({ code: "contract_mismatch" });
+  }, 30_000);
+
   it.each([
     ["missing", () => [], "ipns_missing"],
     [

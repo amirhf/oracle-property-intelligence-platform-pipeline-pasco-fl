@@ -12,6 +12,10 @@ import {
   validateCandidateDemoPlan,
   type CandidateDemoPlan,
 } from "../publication/candidate-demo.js";
+import {
+  validateCandidateSignedIpnsCheckpoint,
+  type CandidateSignedIpnsCheckpoint,
+} from "../publication/candidate-demo-preflight.js";
 import type {
   CandidateDemoExecutionJournal,
   CandidateUploadArtifact,
@@ -31,7 +35,12 @@ const identitySchema = z.strictObject({
 });
 export const CANDIDATE_FILEBASE_DWEB_POLICY =
   "candidate_filebase_dweb_v1" as const;
+export const CANDIDATE_FILEBASE_DELEGATED_POLICY =
+  "candidate_filebase_delegated_v2" as const;
 const candidateResolverPolicySchema = z.literal(CANDIDATE_FILEBASE_DWEB_POLICY);
+const candidateDelegatedPolicySchema = z.literal(
+  CANDIDATE_FILEBASE_DELEGATED_POLICY,
+);
 export const candidateDemoApprovalSchema = identitySchema.extend({
   approvedAt: z.string().datetime(),
   approverReference: z.string().regex(/^[a-z0-9][a-z0-9_-]{2,127}$/),
@@ -109,6 +118,707 @@ export interface CandidateResolverPolicyAuthorization {
   authorizedAt: string;
   authorizerReference: string;
   policyId: typeof CANDIDATE_FILEBASE_DWEB_POLICY;
+}
+
+export interface CandidateDelegatedPolicyAuthorization {
+  authorizationId: string;
+  authorizationSha256: string;
+  authorizedAt: string;
+  authorizerReference: string;
+  policyId: typeof CANDIDATE_FILEBASE_DELEGATED_POLICY;
+}
+
+export interface CandidateDelegatedPolicyBinding extends CandidateDelegatedPolicyAuthorization {
+  approvalId: string;
+  demoPlanId: string;
+  demoPlanSha256: string;
+  queryIntentId: string;
+  queryNetworkKey: string;
+  queryPriorCid: string;
+  queryTargetCid: string;
+  signedEvidenceId: string;
+  signedEvidenceSha256: string;
+}
+
+export interface CandidateDelegatedCompletionResult {
+  authorizationId: string;
+  completionId: string;
+  completionSha256: string;
+  remoteMutationPerformed: false;
+  state: CandidateDemoState;
+}
+
+export async function authorizeCandidateDelegatedResolverPolicy(
+  databaseUrl: string,
+  requestValue: {
+    approvalId: string;
+    authorizedAt: string;
+    authorizerReference: string;
+    demoPlanId: string;
+    demoPlanSha256: string;
+    policyId: typeof CANDIDATE_FILEBASE_DELEGATED_POLICY;
+    queryIntentId: string;
+    queryNetworkKey: string;
+    queryPriorCid: string;
+    queryTargetCid: string;
+    signedEvidenceId: string;
+    signedEvidenceSha256: string;
+  },
+): Promise<CandidateDelegatedPolicyAuthorization> {
+  const identity = parse(
+    identitySchema,
+    {
+      demoPlanId: requestValue.demoPlanId,
+      demoPlanSha256: requestValue.demoPlanSha256,
+    },
+    "candidate delegated resolver policy",
+  );
+  const policyId = candidateDelegatedPolicySchema.parse(requestValue.policyId);
+  const approvalId = z
+    .string()
+    .regex(/^demoapproval_[a-f0-9]{32}$/)
+    .parse(requestValue.approvalId);
+  const authorizedAt = z.string().datetime().parse(requestValue.authorizedAt);
+  const authorizerReference = z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9_-]{2,127}$/)
+    .parse(requestValue.authorizerReference);
+  const queryIntentId = z
+    .string()
+    .regex(/^demointent_[a-f0-9]{32}$/)
+    .parse(requestValue.queryIntentId);
+  const queryNetworkKey = z
+    .string()
+    .regex(/^k51[0-9a-z]{59}$/)
+    .parse(requestValue.queryNetworkKey);
+  const queryPriorCid = priorCidSchema.parse(requestValue.queryPriorCid);
+  const queryTargetCid = cidSchema.parse(requestValue.queryTargetCid);
+  const signedEvidenceId = z
+    .string()
+    .regex(/^demosignedobservation_[a-f0-9]{32}$/)
+    .parse(requestValue.signedEvidenceId);
+  const signedEvidenceSha256 = sha256Schema.parse(
+    requestValue.signedEvidenceSha256,
+  );
+  const authorization = {
+    approvalId,
+    authorizedAt,
+    authorizerReference,
+    demoPlanId: identity.demoPlanId,
+    demoPlanSha256: identity.demoPlanSha256,
+    diagnosticResolvers: ["dweb_link", "ipfs_io"],
+    ownerCanonicalAuthority: false,
+    policyId,
+    queryIntentId,
+    queryNetworkKey,
+    queryPriorCid,
+    queryTargetCid,
+    requiredAuthorities: [
+      "filebase_control",
+      "filebase_gateway",
+      "ipfs_delegated_signed_record",
+    ],
+    scope: "candidate_owned_non_authoritative_demo",
+    signedEvidenceId,
+    signedEvidenceSha256,
+  } as const;
+  const authorizationSha256 = canonicalJsonSha256(authorization);
+  const authorizationId = deterministicId("demodelegatedauthorization", [
+    "1.0.0",
+    policyId,
+    identity.demoPlanId,
+    identity.demoPlanSha256,
+    authorizationSha256,
+  ]);
+  const sql = postgres(databaseUrl, { max: 1 });
+  try {
+    return await sql.begin(async (transaction) => {
+      await lock(transaction);
+      await loadPlan(transaction, identity);
+      await transaction`
+        INSERT INTO oracle_candidate_demo_delegated_resolver_policies (
+          authorization_id, authorization_sha256, policy_id, demo_plan_id,
+          demo_plan_sha256, approval_id, query_intent_id, query_network_key,
+          query_prior_cid, query_target_cid, signed_evidence_id,
+          signed_evidence_sha256, authorizer_reference, authorized_at, scope,
+          required_authorities, diagnostic_resolvers,
+          owner_canonical_authority
+        ) VALUES (
+          ${authorizationId}, ${authorizationSha256}, ${policyId},
+          ${identity.demoPlanId}, ${identity.demoPlanSha256}, ${approvalId},
+          ${queryIntentId}, ${queryNetworkKey}, ${queryPriorCid},
+          ${queryTargetCid}, ${signedEvidenceId}, ${signedEvidenceSha256},
+          ${authorizerReference}, ${authorizedAt},
+          'candidate_owned_non_authoritative_demo',
+          ${[
+            "filebase_control",
+            "filebase_gateway",
+            "ipfs_delegated_signed_record",
+          ]},
+          ${["dweb_link", "ipfs_io"]}, false
+        )
+        ON CONFLICT (demo_plan_id, policy_id) DO NOTHING
+      `;
+      const rows = await transaction<
+        {
+          authorization_id: string;
+          authorization_sha256: string;
+          authorized_at: Date | string;
+          authorizer_reference: string;
+          signed_evidence_id: string;
+          signed_evidence_sha256: string;
+        }[]
+      >`
+        SELECT authorization_id, authorization_sha256, authorized_at,
+               authorizer_reference, signed_evidence_id,
+               signed_evidence_sha256
+        FROM oracle_candidate_demo_delegated_resolver_policies
+        WHERE demo_plan_id = ${identity.demoPlanId}
+          AND policy_id = ${policyId}
+      `;
+      const row = rows[0];
+      if (
+        !row ||
+        row.authorization_id !== authorizationId ||
+        row.authorization_sha256 !== authorizationSha256 ||
+        new Date(row.authorized_at).toISOString() !== authorizedAt ||
+        row.authorizer_reference !== authorizerReference ||
+        row.signed_evidence_id !== signedEvidenceId ||
+        row.signed_evidence_sha256 !== signedEvidenceSha256
+      ) {
+        throw new DurableConflictError(
+          "Candidate delegated resolver authorization replay conflict",
+        );
+      }
+      await recordEvent(
+        transaction,
+        identity.demoPlanId,
+        "candidate_delegated_resolver_policy_authorized",
+        {
+          authorizationId,
+          authorizationSha256,
+          policyId,
+          queryIntentId,
+          signedEvidenceId,
+          signedEvidenceSha256,
+        },
+      );
+      return {
+        authorizationId,
+        authorizationSha256,
+        authorizedAt,
+        authorizerReference,
+        policyId,
+      };
+    });
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
+}
+
+export async function loadCandidateDelegatedResolverPolicyAuthorization(
+  databaseUrl: string,
+  identityValue: unknown,
+): Promise<CandidateDelegatedPolicyBinding | null> {
+  const identity = parse(
+    identitySchema,
+    identityValue,
+    "candidate delegated resolver policy lookup",
+  );
+  const sql = postgres(databaseUrl, { max: 1 });
+  try {
+    const rows = await sql<
+      {
+        approval_id: string;
+        authorization_id: string;
+        authorization_sha256: string;
+        authorized_at: Date | string;
+        authorizer_reference: string;
+        demo_plan_id: string;
+        demo_plan_sha256: string;
+        policy_id: typeof CANDIDATE_FILEBASE_DELEGATED_POLICY;
+        query_intent_id: string;
+        query_network_key: string;
+        query_prior_cid: string;
+        query_target_cid: string;
+        signed_evidence_id: string;
+        signed_evidence_sha256: string;
+      }[]
+    >`
+      SELECT approval_id, authorization_id, authorization_sha256,
+             authorized_at, authorizer_reference, demo_plan_id,
+             demo_plan_sha256, policy_id, query_intent_id,
+             query_network_key, query_prior_cid, query_target_cid,
+             signed_evidence_id, signed_evidence_sha256
+      FROM oracle_candidate_demo_delegated_resolver_policies
+      WHERE demo_plan_id = ${identity.demoPlanId}
+        AND demo_plan_sha256 = ${identity.demoPlanSha256}
+        AND policy_id = ${CANDIDATE_FILEBASE_DELEGATED_POLICY}
+    `;
+    const row = rows[0];
+    return row
+      ? {
+          approvalId: row.approval_id,
+          authorizationId: row.authorization_id,
+          authorizationSha256: row.authorization_sha256,
+          authorizedAt: new Date(row.authorized_at).toISOString(),
+          authorizerReference: row.authorizer_reference,
+          demoPlanId: row.demo_plan_id,
+          demoPlanSha256: row.demo_plan_sha256,
+          policyId: row.policy_id,
+          queryIntentId: row.query_intent_id,
+          queryNetworkKey: row.query_network_key,
+          queryPriorCid: row.query_prior_cid,
+          queryTargetCid: row.query_target_cid,
+          signedEvidenceId: row.signed_evidence_id,
+          signedEvidenceSha256: row.signed_evidence_sha256,
+        }
+      : null;
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
+}
+
+export async function completeCandidateDemoWithDelegatedPolicy(
+  databaseUrl: string,
+  requestValue: {
+    authorizationId: string;
+    authorizationSha256: string;
+    demoPlanId: string;
+    demoPlanSha256: string;
+  },
+): Promise<CandidateDelegatedCompletionResult> {
+  const identity = parse(
+    identitySchema,
+    {
+      demoPlanId: requestValue.demoPlanId,
+      demoPlanSha256: requestValue.demoPlanSha256,
+    },
+    "candidate delegated completion",
+  );
+  const authorizationId = z
+    .string()
+    .regex(/^demodelegatedauthorization_[a-f0-9]{32}$/)
+    .parse(requestValue.authorizationId);
+  const authorizationSha256 = sha256Schema.parse(
+    requestValue.authorizationSha256,
+  );
+  const sql = postgres(databaseUrl, { max: 1 });
+  try {
+    return await sql.begin(async (transaction) => {
+      await lock(transaction);
+      const plan = await loadPlan(transaction, identity);
+      const current = await loadState(transaction, identity);
+      const authorizations = await transaction<
+        {
+          approval_id: string;
+          authorization_id: string;
+          authorization_sha256: string;
+          policy_id: typeof CANDIDATE_FILEBASE_DELEGATED_POLICY;
+          query_intent_id: string;
+          query_target_cid: string;
+          signed_evidence_id: string;
+          signed_evidence_sha256: string;
+        }[]
+      >`
+        SELECT approval_id, authorization_id, authorization_sha256,
+               policy_id, query_intent_id, query_target_cid,
+               signed_evidence_id, signed_evidence_sha256
+        FROM oracle_candidate_demo_delegated_resolver_policies
+        WHERE authorization_id = ${authorizationId}
+          AND authorization_sha256 = ${authorizationSha256}
+          AND demo_plan_id = ${identity.demoPlanId}
+          AND demo_plan_sha256 = ${identity.demoPlanSha256}
+          AND policy_id = ${CANDIDATE_FILEBASE_DELEGATED_POLICY}
+        FOR SHARE
+      `;
+      const authorization = authorizations[0];
+      if (!authorization || plan.coverageMode !== "sample") {
+        throw new DurableConflictError(
+          "Candidate delegated completion lacks the exact sample authorization",
+        );
+      }
+      const completion = {
+        approvalId: authorization.approval_id,
+        authorizationId,
+        authorizationSha256,
+        demoPlanId: identity.demoPlanId,
+        demoPlanSha256: identity.demoPlanSha256,
+        policyId: authorization.policy_id,
+        queryIntentId: authorization.query_intent_id,
+        queryTargetCid: authorization.query_target_cid,
+        remoteMutationPerformed: false,
+        scope: "candidate_owned_non_authoritative_demo",
+        signedEvidenceId: authorization.signed_evidence_id,
+        signedEvidenceSha256: authorization.signed_evidence_sha256,
+        version: "1.0.0",
+      } as const;
+      const completionSha256 = canonicalJsonSha256(completion);
+      const completionId = deterministicId("demodelegatedcompletion", [
+        completion.version,
+        completion.policyId,
+        completion.demoPlanId,
+        completion.authorizationId,
+        completionSha256,
+      ]);
+      const existing = await transaction<
+        {
+          completion_id: string;
+          completion_sha256: string;
+          remote_mutation_performed: boolean;
+        }[]
+      >`
+        SELECT completion_id, completion_sha256, remote_mutation_performed
+        FROM oracle_candidate_demo_delegated_completions
+        WHERE demo_plan_id = ${identity.demoPlanId}
+      `;
+      if (current.state === "completed") {
+        const row = existing[0];
+        if (
+          !row ||
+          row.completion_id !== completionId ||
+          row.completion_sha256 !== completionSha256 ||
+          row.remote_mutation_performed
+        ) {
+          throw new DurableConflictError(
+            "Candidate delegated completion replay conflict",
+          );
+        }
+        return {
+          authorizationId,
+          completionId,
+          completionSha256,
+          remoteMutationPerformed: false,
+          state: state(current),
+        };
+      }
+      if (current.state !== "manual_intervention_required") {
+        throw new DurableConflictError(
+          "Candidate delegated completion requires the preserved manual state",
+        );
+      }
+      const objects = await transaction<{ pending: number; total: number }[]>`
+        SELECT count(*)::int AS total,
+               count(*) FILTER (WHERE status IS DISTINCT FROM 'verified')::int AS pending
+        FROM oracle_candidate_demo_object_effects
+        WHERE demo_plan_id = ${identity.demoPlanId}
+      `;
+      if (objects[0]?.total !== plan.objectCount || objects[0]?.pending !== 0) {
+        throw new DurableConflictError(
+          "Candidate delegated completion requires every verified object effect",
+        );
+      }
+      await transaction`
+        INSERT INTO oracle_candidate_demo_delegated_completions (
+          completion_id, completion_sha256, policy_id, authorization_id,
+          authorization_sha256, demo_plan_id, demo_plan_sha256, approval_id,
+          query_intent_id, query_target_cid, signed_evidence_id,
+          signed_evidence_sha256, remote_mutation_performed, scope
+        ) VALUES (
+          ${completionId}, ${completionSha256}, ${completion.policyId},
+          ${authorizationId}, ${authorizationSha256}, ${identity.demoPlanId},
+          ${identity.demoPlanSha256}, ${completion.approvalId},
+          ${completion.queryIntentId}, ${completion.queryTargetCid},
+          ${completion.signedEvidenceId}, ${completion.signedEvidenceSha256},
+          false, ${completion.scope}
+        )
+        ON CONFLICT (demo_plan_id) DO NOTHING
+      `;
+      const stored = await transaction<
+        {
+          completion_id: string;
+          completion_sha256: string;
+          remote_mutation_performed: boolean;
+        }[]
+      >`
+        SELECT completion_id, completion_sha256, remote_mutation_performed
+        FROM oracle_candidate_demo_delegated_completions
+        WHERE demo_plan_id = ${identity.demoPlanId}
+      `;
+      if (
+        stored[0]?.completion_id !== completionId ||
+        stored[0]?.completion_sha256 !== completionSha256 ||
+        stored[0]?.remote_mutation_performed
+      ) {
+        throw new DurableConflictError(
+          "Candidate delegated completion replay conflict",
+        );
+      }
+      const updatedIntent = await transaction`
+        UPDATE oracle_candidate_demo_ipns_intents
+        SET state = 'verified', revision = revision + 1
+        WHERE intent_id = ${completion.queryIntentId}
+          AND demo_plan_id = ${identity.demoPlanId}
+          AND demo_plan_sha256 = ${identity.demoPlanSha256}
+          AND domain = 'query_table'
+          AND target_cid = ${completion.queryTargetCid}
+          AND state = 'update_ambiguous'
+        RETURNING intent_id
+      `;
+      if (updatedIntent.length !== 1) {
+        throw new DurableConflictError(
+          "Candidate delegated completion cannot verify the query intent",
+        );
+      }
+      await recordEvent(
+        transaction,
+        identity.demoPlanId,
+        "candidate_delegated_query_verified",
+        {
+          authorizationId,
+          completionId,
+          policyId: completion.policyId,
+          remoteMutationPerformed: false,
+          signedEvidenceId: completion.signedEvidenceId,
+        },
+      );
+      const updatedPlan = await transaction`
+        UPDATE oracle_candidate_demo_plans
+        SET state = 'completed', revision = revision + 1, updated_at = now()
+        WHERE demo_plan_id = ${identity.demoPlanId}
+          AND demo_plan_sha256 = ${identity.demoPlanSha256}
+          AND state = 'manual_intervention_required'
+        RETURNING revision
+      `;
+      if (updatedPlan.length !== 1) {
+        throw new DurableConflictError(
+          "Candidate delegated completion cannot advance the exact plan",
+        );
+      }
+      await recordEvent(
+        transaction,
+        identity.demoPlanId,
+        "candidate_demo_completed_delegated_v2",
+        {
+          authorizationId,
+          completionId,
+          completionSha256,
+          demoPlanSha256: identity.demoPlanSha256,
+          remoteMutationPerformed: false,
+        },
+      );
+      return {
+        authorizationId,
+        completionId,
+        completionSha256,
+        remoteMutationPerformed: false,
+        state: state({
+          ...current,
+          revision: Number(updatedPlan[0]?.revision),
+          state: "completed",
+        }),
+      };
+    });
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
+}
+
+export interface CandidateSignedIpnsObservationResult {
+  classification: CandidateSignedIpnsCheckpoint["classification"];
+  evidenceId: string;
+  evidenceSha256: string;
+  intentId: string;
+}
+
+export interface CandidateSignedIpnsBinding {
+  approvalId: string;
+  intentId: string;
+  intentState: string;
+  networkKey: string;
+  priorCid: string;
+  targetCid: string;
+}
+
+export async function loadCandidateSignedIpnsBinding(
+  databaseUrl: string,
+  identityValue: unknown,
+): Promise<CandidateSignedIpnsBinding> {
+  const identity = parse(
+    identitySchema,
+    identityValue,
+    "candidate signed IPNS binding",
+  );
+  const sql = postgres(databaseUrl, { max: 1 });
+  try {
+    const rows = await sql<
+      {
+        approval_id: string | null;
+        intent_id: string;
+        ipns_network_key: string;
+        prior_cid: string;
+        state: string;
+        target_cid: string;
+      }[]
+    >`
+      SELECT approval.approval_id, intent.intent_id, intent.ipns_network_key,
+             intent.prior_cid, intent.target_cid, intent.state
+      FROM oracle_candidate_demo_plans plan
+      JOIN oracle_candidate_demo_approvals approval
+        ON approval.demo_plan_id = plan.demo_plan_id
+       AND approval.demo_plan_sha256 = plan.demo_plan_sha256
+      JOIN oracle_candidate_demo_ipns_intents intent
+        ON intent.demo_plan_id = plan.demo_plan_id
+       AND intent.demo_plan_sha256 = plan.demo_plan_sha256
+       AND intent.domain = 'query_table'
+      WHERE plan.demo_plan_id = ${identity.demoPlanId}
+        AND plan.demo_plan_sha256 = ${identity.demoPlanSha256}
+        AND plan.coverage_mode = 'sample'
+        AND plan.state IN ('executing', 'manual_intervention_required')
+    `;
+    const row = rows[0];
+    if (!row || !row.approval_id) {
+      throw new DurableConflictError(
+        "Candidate signed IPNS binding is unavailable",
+      );
+    }
+    return {
+      approvalId: row.approval_id,
+      intentId: row.intent_id,
+      intentState: row.state,
+      networkKey: row.ipns_network_key,
+      priorCid: row.prior_cid,
+      targetCid: row.target_cid,
+    };
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
+}
+
+export async function recordCandidateSignedIpnsObservation(
+  databaseUrl: string,
+  evidenceValue: unknown,
+): Promise<CandidateSignedIpnsObservationResult> {
+  let evidence: CandidateSignedIpnsCheckpoint;
+  try {
+    evidence = validateCandidateSignedIpnsCheckpoint(evidenceValue);
+  } catch {
+    throw new DurableInputError(
+      "Candidate signed IPNS evidence failed strict validation",
+    );
+  }
+  const evidenceId = deterministicId("demosignedobservation", [
+    evidence.policyVersion,
+    evidence.demoPlanId,
+    evidence.demoPlanSha256,
+    evidence.intentId,
+    evidence.evidenceSha256,
+  ]);
+  const sql = postgres(databaseUrl, { max: 1 });
+  try {
+    return await sql.begin(async (transaction) => {
+      await lock(transaction);
+      await loadPlan(transaction, {
+        demoPlanId: evidence.demoPlanId,
+        demoPlanSha256: evidence.demoPlanSha256,
+      });
+      await transaction`
+        INSERT INTO oracle_candidate_demo_signed_ipns_observations (
+          evidence_id, demo_plan_id, demo_plan_sha256, approval_id,
+          intent_id, domain, network_key, prior_cid, target_cid,
+          policy_version, classification, request_count, evidence_sha256,
+          control_http_status, control_latency_ms, control_observed_at,
+          control_observed_cid, control_outcome, control_response_bytes,
+          control_response_sha256, gateway_http_status, gateway_latency_ms,
+          gateway_observed_at, gateway_observed_cid, gateway_outcome,
+          gateway_response_bytes, gateway_response_sha256,
+          delegated_http_status, delegated_latency_ms,
+          delegated_observed_at, delegated_observed_cid, delegated_outcome,
+          delegated_request_count, delegated_response_bytes,
+          delegated_response_sha256, delegated_sequence,
+          delegated_ttl_nanoseconds, delegated_validation_result,
+          delegated_validity
+        ) VALUES (
+          ${evidenceId}, ${evidence.demoPlanId}, ${evidence.demoPlanSha256},
+          ${evidence.approvalId}, ${evidence.intentId}, ${evidence.domain},
+          ${evidence.networkKey}, ${evidence.priorCid}, ${evidence.targetCid},
+          ${evidence.policyVersion}, ${evidence.classification},
+          ${evidence.requestCount}, ${evidence.evidenceSha256},
+          ${evidence.filebaseControl.httpStatus},
+          ${evidence.filebaseControl.latencyMs},
+          ${evidence.filebaseControl.observedAt},
+          ${evidence.filebaseControl.observedCid},
+          ${evidence.filebaseControl.outcome},
+          ${evidence.filebaseControl.responseBytes},
+          ${evidence.filebaseControl.responseSha256},
+          ${evidence.filebaseGateway.httpStatus},
+          ${evidence.filebaseGateway.latencyMs},
+          ${evidence.filebaseGateway.observedAt},
+          ${evidence.filebaseGateway.observedCid},
+          ${evidence.filebaseGateway.outcome},
+          ${evidence.filebaseGateway.responseBytes},
+          ${evidence.filebaseGateway.responseSha256},
+          ${evidence.delegated.httpStatus},
+          ${evidence.delegated.latencyMs}, ${evidence.delegated.observedAt},
+          ${evidence.delegated.observedCid}, ${evidence.delegated.outcome},
+          ${evidence.delegated.requestCount},
+          ${evidence.delegated.responseBytes},
+          ${evidence.delegated.responseSha256}, ${evidence.delegated.sequence},
+          ${evidence.delegated.ttlNanoseconds},
+          ${evidence.delegated.validationResult}, ${evidence.delegated.validity}
+        )
+        ON CONFLICT (intent_id, evidence_sha256) DO NOTHING
+      `;
+      const rows = await transaction<
+        {
+          approval_id: string;
+          classification: CandidateSignedIpnsCheckpoint["classification"];
+          demo_plan_id: string;
+          demo_plan_sha256: string;
+          evidence_id: string;
+          evidence_sha256: string;
+          intent_id: string;
+          network_key: string;
+          prior_cid: string;
+          target_cid: string;
+        }[]
+      >`
+        SELECT evidence_id, demo_plan_id, demo_plan_sha256, approval_id,
+               intent_id, network_key, prior_cid, target_cid,
+               classification, evidence_sha256
+        FROM oracle_candidate_demo_signed_ipns_observations
+        WHERE intent_id = ${evidence.intentId}
+          AND evidence_sha256 = ${evidence.evidenceSha256}
+      `;
+      const row = rows[0];
+      if (
+        !row ||
+        row.evidence_id !== evidenceId ||
+        row.demo_plan_id !== evidence.demoPlanId ||
+        row.demo_plan_sha256 !== evidence.demoPlanSha256 ||
+        row.approval_id !== evidence.approvalId ||
+        row.intent_id !== evidence.intentId ||
+        row.network_key !== evidence.networkKey ||
+        row.prior_cid !== evidence.priorCid ||
+        row.target_cid !== evidence.targetCid ||
+        row.classification !== evidence.classification
+      ) {
+        throw new DurableConflictError(
+          "Candidate signed IPNS evidence replay conflict",
+        );
+      }
+      await recordEvent(
+        transaction,
+        evidence.demoPlanId,
+        "candidate_signed_ipns_observation_recorded",
+        {
+          classification: evidence.classification,
+          evidenceId,
+          evidenceSha256: evidence.evidenceSha256,
+          intentId: evidence.intentId,
+          policyVersion: evidence.policyVersion,
+        },
+      );
+      return {
+        classification: evidence.classification,
+        evidenceId,
+        evidenceSha256: evidence.evidenceSha256,
+        intentId: evidence.intentId,
+      };
+    });
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
 }
 
 function validateCandidateResolutionObservations(

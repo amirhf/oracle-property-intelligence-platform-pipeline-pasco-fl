@@ -312,6 +312,7 @@ function inventoryObject(options: {
 
 export async function syntheticPublicSet(
   options: {
+    candidatePlanBindings?: boolean;
     fixtureProperty?: boolean;
     mcpHash?: string;
     omitParquetColumn?: string;
@@ -628,13 +629,13 @@ export async function syntheticPublicSet(
         bucket: "synthetic-open-data",
         bucketConfirmed: true,
         ipnsLabel: "synthetic-open-data",
-        ipnsNetworkKey: OPEN_IPNS,
+        ipnsNetworkKey: options.candidatePlanBindings ? null : OPEN_IPNS,
       },
       queryTable: {
         bucket: "synthetic-query-table",
         bucketConfirmed: true,
         ipnsLabel: "synthetic-query-table",
-        ipnsNetworkKey: QUERY_IPNS,
+        ipnsNetworkKey: options.candidatePlanBindings ? null : QUERY_IPNS,
       },
     },
     temporalFactLimitation: "Synthetic current facts only.",
@@ -643,6 +644,15 @@ export async function syntheticPublicSet(
   const planBytes = Buffer.from(publicationCanonicalJson(plan));
   const planIdentity = await storedObject(objects, planBytes);
   const config: PublicIpnsProviderConfig = {
+    candidateDemoPlanId: options.candidatePlanBindings
+      ? `demo_${"d".repeat(32)}`
+      : null,
+    candidateDemoPlanSha256: options.candidatePlanBindings
+      ? "2".repeat(64)
+      : null,
+    candidateDemoSourcePlanSha256: options.candidatePlanBindings
+      ? plan.planSha256
+      : null,
     environment: "test",
     expectedManifestCid: manifestIdentity.cid,
     expectedManifestSha256: manifestIdentity.sha256,
@@ -661,6 +671,9 @@ export async function syntheticPublicSet(
     mode: "public-ipns",
     openDataIpns: OPEN_IPNS,
     queryTableIpns: QUERY_IPNS,
+    resolverPolicy: options.candidatePlanBindings
+      ? "candidate_filebase_delegated_v2"
+      : "public_two_gateway_v1",
   };
   const transport = new MockPublicReadTransport(
     objects,

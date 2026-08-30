@@ -24,6 +24,9 @@ export interface LocalArtifactProviderConfig {
 }
 
 export interface PublicIpnsProviderConfig {
+  candidateDemoPlanId: string | null;
+  candidateDemoPlanSha256: string | null;
+  candidateDemoSourcePlanSha256: string | null;
   environment: RuntimeEnvironment;
   expectedManifestCid: string;
   expectedManifestSha256: string;
@@ -42,6 +45,7 @@ export interface PublicIpnsProviderConfig {
   mode: "public-ipns";
   openDataIpns: string;
   queryTableIpns: string;
+  resolverPolicy: "candidate_filebase_delegated_v2" | "public_two_gateway_v1";
 }
 
 export type McpProviderConfig =
@@ -112,7 +116,47 @@ function publicProvider(
 ): PublicIpnsProviderConfig {
   const openDataIpns = requireValue(environment, "MCP_OPEN_DATA_IPNS");
   const queryTableIpns = requireValue(environment, "MCP_QUERY_TABLE_IPNS");
+  const resolverPolicy =
+    environment.MCP_PUBLIC_RESOLVER_POLICY?.trim() || "public_two_gateway_v1";
+  if (
+    resolverPolicy !== "public_two_gateway_v1" &&
+    resolverPolicy !== "candidate_filebase_delegated_v2"
+  ) {
+    throw new Error(
+      "MCP_PUBLIC_RESOLVER_POLICY must be public_two_gateway_v1 or candidate_filebase_delegated_v2",
+    );
+  }
+  const candidateDemoPlanId =
+    environment.MCP_PUBLIC_CANDIDATE_DEMO_PLAN_ID?.trim() || null;
+  const candidateDemoPlanSha256 =
+    environment.MCP_PUBLIC_CANDIDATE_DEMO_PLAN_SHA256?.trim() || null;
+  const candidateDemoSourcePlanSha256 =
+    environment.MCP_PUBLIC_CANDIDATE_SOURCE_PLAN_SHA256?.trim() || null;
+  const candidateBindings = [
+    candidateDemoPlanId,
+    candidateDemoPlanSha256,
+    candidateDemoSourcePlanSha256,
+  ];
+  if (
+    resolverPolicy === "candidate_filebase_delegated_v2" &&
+    candidateBindings.some((value) => value === null)
+  ) {
+    throw new Error(
+      "Candidate delegated public reads require the exact candidate and source plan bindings",
+    );
+  }
+  if (
+    resolverPolicy === "public_two_gateway_v1" &&
+    candidateBindings.some((value) => value !== null)
+  ) {
+    throw new Error(
+      "Candidate plan bindings require candidate_filebase_delegated_v2",
+    );
+  }
   return {
+    candidateDemoPlanId,
+    candidateDemoPlanSha256,
+    candidateDemoSourcePlanSha256,
     environment: nodeEnvironment,
     expectedManifestCid: requireValue(environment, "MCP_PUBLIC_MANIFEST_CID"),
     expectedManifestSha256: requireValue(
@@ -164,6 +208,7 @@ function publicProvider(
     mode: "public-ipns",
     openDataIpns,
     queryTableIpns,
+    resolverPolicy,
   };
 }
 

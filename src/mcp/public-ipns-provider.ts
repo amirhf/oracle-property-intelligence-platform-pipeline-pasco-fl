@@ -14,6 +14,10 @@ import type {
 } from "./provider.js";
 import { CIDV0_PATTERN, verifyIpfsCid } from "../publication/ipfs-cid.js";
 import {
+  observeDelegatedIpnsRecord,
+  type DelegatedIpnsEvidence,
+} from "../publication/delegated-ipns.js";
+import {
   type PublicationArtifact,
   type PublicationPlan,
   validatePublicationPlan,
@@ -31,6 +35,7 @@ const PUBLIC_GATEWAYS = [
   { id: "ipfs_io", origin: "https://ipfs.io" },
   { id: "dweb_link", origin: "https://dweb.link" },
 ] as const;
+const FILEBASE_PUBLIC_GATEWAY_ORIGIN = "https://ipfs.filebase.io" as const;
 
 export type PublicReadErrorCode =
   | "artifact_invalid"
@@ -93,7 +98,11 @@ function combinedSignal(
 }
 
 function responseCid(headers: Headers, location: string | null): string | null {
-  const candidates = [headers.get("x-ipfs-roots"), location]
+  const candidates = [
+    headers.get("x-ipfs-roots"),
+    headers.get("x-ipfs-path"),
+    location,
+  ]
     .filter((value): value is string => value !== null)
     .flatMap((value) => value.split(/[\s,]+/));
   return (
@@ -297,6 +306,181 @@ export class HttpPublicReadTransport implements PublicReadTransport {
   }
 }
 
+function delegatedFailure(evidence: DelegatedIpnsEvidence): PublicReadError {
+  if (
+    evidence.validationResult === "valid_prior" ||
+    evidence.validationResult === "unexpected_cid"
+  ) {
+    return publicError(
+      "ipns_unexpected",
+      "Signed public IPNS record resolved to an unexpected CID",
+    );
+  }
+  if (evidence.validationResult === "expired_record") {
+    return publicError("ipns_stale", "Signed public IPNS record is expired");
+  }
+  if (evidence.validationResult === "redirect_rejected") {
+    return publicError(
+      "redirect_rejected",
+      "Signed public IPNS redirect was rejected",
+    );
+  }
+  if (evidence.validationResult === "timeout") {
+    return publicError("timeout", "Signed public IPNS resolution timed out");
+  }
+  return publicError(
+    "transport_unavailable",
+    "Signed public IPNS record could not be validated",
+  );
+}
+
+export class CandidateDelegatedPublicReadTransport implements PublicReadTransport {
+  readonly #artifactTransport: HttpPublicReadTransport;
+  readonly #expectedByIdentity: ReadonlyMap<string, string>;
+  readonly #fetchImplementation: typeof fetch;
+  readonly #limits: PublicIpnsProviderConfig["limits"];
+
+  constructor(
+    config: PublicIpnsProviderConfig,
+    fetchImplementation: typeof fetch = fetch,
+  ) {
+    if (config.resolverPolicy !== "candidate_filebase_delegated_v2") {
+      throw publicError(
+        "configuration_invalid",
+        "Candidate delegated transport requires its exact resolver policy",
+      );
+    }
+    this.#limits = config.limits;
+    this.#fetchImplementation = fetchImplementation;
+    this.#artifactTransport = new HttpPublicReadTransport(
+      config.limits,
+      fetchImplementation,
+    );
+    this.#expectedByIdentity = new Map([
+      [config.openDataIpns, config.expectedOpenDataRootCid],
+      [config.queryTableIpns, config.expectedQueryTableRootCid],
+    ]);
+  }
+
+  async readCid(
+    cid: string,
+    maximumBytes: number,
+    signal?: AbortSignal,
+  ): Promise<Uint8Array> {
+    return this.#artifactTransport.readCid(cid, maximumBytes, signal);
+  }
+
+  async resolveIpns(
+    identity: string,
+    signal?: AbortSignal,
+  ): Promise<readonly IpnsResolutionObservation[]> {
+    const expectedCid = this.#expectedByIdentity.get(identity);
+    if (!expectedCid) {
+      throw publicError(
+        "configuration_invalid",
+        "Candidate IPNS identity is not configured",
+      );
+    }
+    const [gateway, delegated] = await Promise.all([
+      this.#resolveFilebaseGateway(identity, signal),
+      observeDelegatedIpnsRecord({
+        expectedPriorCid: expectedCid,
+        expectedTargetCid: expectedCid,
+        fetchImpl: this.#fetchImplementation,
+        maxRetries: this.#limits.retries === 0 ? 0 : 1,
+        networkKey: identity,
+        timeoutMs: this.#limits.transportTimeoutMs,
+      }),
+    ]);
+    if (
+      delegated.validationResult !== "valid_target" ||
+      delegated.observedCid !== expectedCid
+    ) {
+      throw delegatedFailure(delegated);
+    }
+    return [
+      gateway,
+      {
+        cacheAgeSeconds: null,
+        cid: delegated.observedCid,
+        observedAt: delegated.observedAt,
+        resolver: "ipfs_delegated_signed_record",
+        status: "resolved",
+      },
+    ];
+  }
+
+  async #resolveFilebaseGateway(
+    identity: string,
+    signal?: AbortSignal,
+  ): Promise<IpnsResolutionObservation> {
+    const url = new URL(
+      `/ipns/${encodeURIComponent(identity)}`,
+      FILEBASE_PUBLIC_GATEWAY_ORIGIN,
+    );
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= this.#limits.retries; attempt += 1) {
+      try {
+        const response = await this.#fetchImplementation(url, {
+          method: "HEAD",
+          redirect: "manual",
+          signal: combinedSignal(signal, this.#limits.transportTimeoutMs),
+        });
+        if (response.status >= 400) {
+          lastError = publicError(
+            "transport_unavailable",
+            "Official Filebase gateway is unavailable",
+          );
+          continue;
+        }
+        const location = response.headers.get("location");
+        if (location) {
+          const redirect = new URL(location, url);
+          if (
+            redirect.origin !== FILEBASE_PUBLIC_GATEWAY_ORIGIN ||
+            !redirect.pathname.startsWith("/ipfs/") ||
+            redirect.username !== "" ||
+            redirect.password !== "" ||
+            redirect.search !== "" ||
+            redirect.hash !== ""
+          ) {
+            throw publicError(
+              "redirect_rejected",
+              "Official Filebase gateway redirect was rejected",
+            );
+          }
+        }
+        const cid = responseCid(response.headers, location);
+        return {
+          cacheAgeSeconds: null,
+          cid,
+          observedAt: new Date().toISOString(),
+          resolver: "filebase_public_gateway",
+          status: cid === null ? "unavailable" : "resolved",
+        };
+      } catch (error) {
+        if (error instanceof PublicReadError) throw error;
+        if (
+          error instanceof DOMException &&
+          (error.name === "AbortError" || error.name === "TimeoutError")
+        ) {
+          throw publicError(
+            "timeout",
+            "Official Filebase gateway resolution timed out",
+          );
+        }
+        lastError = error;
+      }
+    }
+    throw publicError(
+      "transport_unavailable",
+      lastError instanceof Error
+        ? "Official Filebase gateway resolution failed"
+        : "Official Filebase gateway is unavailable",
+    );
+  }
+}
+
 function record(value: unknown, label: string): JsonObject {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw publicError("artifact_invalid", `Published ${label} is invalid`);
@@ -384,6 +568,22 @@ function validateConfig(config: PublicIpnsProviderConfig): void {
     throw publicError(
       "configuration_invalid",
       "Public provider configuration is incomplete or invalid",
+    );
+  }
+  const candidateBindingsValid =
+    config.resolverPolicy === "candidate_filebase_delegated_v2" &&
+    /^demo_[a-f0-9]{32}$/.test(config.candidateDemoPlanId ?? "") &&
+    SHA256_PATTERN.test(config.candidateDemoPlanSha256 ?? "") &&
+    SHA256_PATTERN.test(config.candidateDemoSourcePlanSha256 ?? "");
+  const canonicalBindingsValid =
+    config.resolverPolicy === "public_two_gateway_v1" &&
+    config.candidateDemoPlanId === null &&
+    config.candidateDemoPlanSha256 === null &&
+    config.candidateDemoSourcePlanSha256 === null;
+  if (!candidateBindingsValid && !canonicalBindingsValid) {
+    throw publicError(
+      "configuration_invalid",
+      "Public resolver policy and plan bindings are inconsistent",
     );
   }
 }
@@ -716,20 +916,25 @@ export class PublicIpnsProvider implements OracleMcpProvider {
   static async create(
     config: PublicIpnsProviderConfig,
     contracts: McpContractRegistry,
-    transport: PublicReadTransport = new HttpPublicReadTransport(config.limits),
+    transport?: PublicReadTransport,
     signal?: AbortSignal,
   ): Promise<PublicIpnsProvider> {
     validateConfig(config);
+    const activeTransport =
+      transport ??
+      (config.resolverPolicy === "candidate_filebase_delegated_v2"
+        ? new CandidateDelegatedPublicReadTransport(config)
+        : new HttpPublicReadTransport(config.limits));
     await Promise.all([
       resolveExpected(
-        transport,
+        activeTransport,
         config.openDataIpns,
         config.expectedOpenDataRootCid,
         config.limits.maxCacheAgeSeconds,
         signal,
       ),
       resolveExpected(
-        transport,
+        activeTransport,
         config.queryTableIpns,
         config.expectedQueryTableRootCid,
         config.limits.maxCacheAgeSeconds,
@@ -737,7 +942,7 @@ export class PublicIpnsProvider implements OracleMcpProvider {
       ),
     ]);
 
-    const planBytes = await transport.readCid(
+    const planBytes = await activeTransport.readCid(
       config.expectedPlanCid,
       config.limits.maxJsonObjectBytes,
       signal,
@@ -756,6 +961,14 @@ export class PublicIpnsProvider implements OracleMcpProvider {
         "Published plan failed strict validation",
       );
     }
+    const directTargetBinding =
+      plan.targets.openData.ipnsNetworkKey === config.openDataIpns &&
+      plan.targets.queryTable.ipnsNetworkKey === config.queryTableIpns;
+    const candidateTargetBinding =
+      config.resolverPolicy === "candidate_filebase_delegated_v2" &&
+      plan.targets.openData.ipnsNetworkKey === null &&
+      plan.targets.queryTable.ipnsNetworkKey === null &&
+      plan.planSha256 === config.candidateDemoSourcePlanSha256;
     if (
       plan.version !== "1.1.0" ||
       plan.contracts.mcp.version !== MCP_CONTRACT_VERSION ||
@@ -766,8 +979,7 @@ export class PublicIpnsProvider implements OracleMcpProvider {
       plan.graph.openDataRoot.expectedCid !== config.expectedOpenDataRootCid ||
       plan.graph.queryTableRoot.expectedCid !==
         config.expectedQueryTableRootCid ||
-      plan.targets.openData.ipnsNetworkKey !== config.openDataIpns ||
-      plan.targets.queryTable.ipnsNetworkKey !== config.queryTableIpns ||
+      (!directTargetBinding && !candidateTargetBinding) ||
       !plan.fixtureExclusion.passed ||
       plan.fixtureExclusion.matches !== 0
     ) {
@@ -804,7 +1016,7 @@ export class PublicIpnsProvider implements OracleMcpProvider {
         provenanceBinding,
         summaryBinding,
       ].map(async (binding) => {
-        const bytes = await transport.readCid(
+        const bytes = await activeTransport.readCid(
           binding.expectedCid,
           config.limits.maxJsonObjectBytes,
           signal,
@@ -930,7 +1142,7 @@ export class PublicIpnsProvider implements OracleMcpProvider {
           "Published root shard reference is inconsistent",
         );
       }
-      const bytes = await transport.readCid(
+      const bytes = await activeTransport.readCid(
         shardCid,
         config.limits.maxJsonObjectBytes,
         signal,
@@ -980,7 +1192,7 @@ export class PublicIpnsProvider implements OracleMcpProvider {
       );
     }
 
-    const parquetBytes = await transport.readCid(
+    const parquetBytes = await activeTransport.readCid(
       queryBinding.expectedCid,
       config.limits.maxParquetBytes,
       signal,
@@ -1060,6 +1272,8 @@ export class PublicIpnsProvider implements OracleMcpProvider {
         },
         providerMode: "public-ipns",
         publication: {
+          candidateDemoPlanId: config.candidateDemoPlanId,
+          candidateDemoPlanSha256: config.candidateDemoPlanSha256,
           manifestCid: config.expectedManifestCid,
           openDataIpns: config.openDataIpns,
           openDataRootCid: config.expectedOpenDataRootCid,
@@ -1067,6 +1281,7 @@ export class PublicIpnsProvider implements OracleMcpProvider {
           planSha256: plan.planSha256,
           queryTableIpns: config.queryTableIpns,
           queryTableRootCid: config.expectedQueryTableRootCid,
+          resolverPolicy: config.resolverPolicy,
           scopeId: plan.coverage.scopeId,
           selectionHash: plan.coverage.selection.selectedRecordSha256,
           sourceSnapshotId: plan.coverage.sourceSnapshotId,
@@ -1078,7 +1293,7 @@ export class PublicIpnsProvider implements OracleMcpProvider {
       },
       provenanceArtifactUris,
       queryRows,
-      transport,
+      transport: activeTransport,
     });
   }
 

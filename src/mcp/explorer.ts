@@ -94,6 +94,16 @@ export async function explorerBootstrap(
     pipeline: data(pipeline),
     capabilities: data(capabilities),
     publication: {
+      candidateDemo:
+        metadata.publication.candidateDemoPlanId === null
+          ? null
+          : {
+              planId: metadata.publication.candidateDemoPlanId,
+              planSha256: metadata.publication.candidateDemoPlanSha256,
+              resolverPolicy: metadata.publication.resolverPolicy,
+              disclosure:
+                "Temporary candidate-owned Filebase demonstration of protocol compatibility. The buckets and IPNS identities are candidate-controlled and are not represented as Elephant-owned, owner-approved, authoritative-complete, or the final canonical assessment publication.",
+            },
       coverageMode: metadata.coverageMode,
       scopeId: metadata.publication.scopeId,
       sourceSnapshotId: metadata.publication.sourceSnapshotId,

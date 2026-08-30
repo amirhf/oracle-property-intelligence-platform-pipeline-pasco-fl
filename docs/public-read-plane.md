@@ -1,11 +1,15 @@
 # Oracle public read plane
 
-The hosted read plane has one validated source boundary. In production it
-resolves the configured open-data and query-table IPNS identities through two
-fixed public resolvers, requires an agreeing non-stale CID for each, and then
-verifies the immutable publication plan before admitting any dataset. It does
-not read PostgreSQL, `DATA_DIR`, fixtures, arbitrary URLs, filesystem paths or
-caller SQL.
+The hosted read plane has one validated source boundary. The default
+owner/canonical policy resolves the configured open-data and query-table IPNS
+identities through two fixed public resolvers and requires an agreeing
+non-stale CID for each. The closed candidate-only
+`candidate_filebase_delegated_v2` policy instead requires the official
+Filebase public gateway plus a signature-, identity-, sequence- and
+validity-checked record from the compiled IPFS Delegated Routing V1 origin.
+Both profiles then verify the immutable publication plan before admitting any
+dataset. The read plane does not read PostgreSQL, `DATA_DIR`, fixtures,
+arbitrary URLs, filesystem paths or caller SQL.
 
 The open-data name must resolve to the configured `index.json` CID. Traversal
 is fixed to `index.json -> shard -> canonical property`; every object is
@@ -31,12 +35,16 @@ coordinate state, `year_built_proxy`, null permit aggregates, coverage mode,
 freshness and publication references remain explicit. Sample and partial
 coverage are visibly labeled as not complete Pasco County coverage.
 
-Tests inject only synthetic bytes through the transport interface. They do not
-resolve IPNS or contact Filebase, IPFS gateways or hosting providers. The real
-HTTP transport remains unusable until the exact IPNS identities, root CIDs,
-manifest CID/hash and immutable plan CID/file hash from one published plan are
-provided. Hosting additionally requires the intended public runtime/project
-identity. None of those inputs authorizes publication or mutation.
+Automated tests inject only synthetic bytes through the transport interface.
+They do not resolve IPNS or contact Filebase, IPFS gateways or hosting
+providers. A separate bounded local smoke check exercised the real
+credential-free candidate identities and immutable artifacts. The HTTP
+transport remains fail-closed until the exact IPNS identities, root CIDs,
+manifest CID/hash and immutable plan CID/file hash from one validated
+publication are provided. Candidate mode additionally requires the exact
+candidate plan ID/hash and source-plan hash. Hosting requires the intended
+public runtime/project identity. None of those inputs authorizes publication or
+mutation.
 
 ## Candidate preview deployment
 
@@ -51,4 +59,5 @@ repository configuration.
 
 Temporary candidate-owned Filebase demonstration of protocol compatibility.
 The buckets and IPNS identities are candidate-controlled and are not represented
-as Elephant-owned, owner-approved, or the final canonical assessment publication.
+as Elephant-owned, owner-approved, authoritative-complete, or the final
+canonical assessment publication.
