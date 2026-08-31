@@ -10,6 +10,7 @@ import {
 } from "../../src/publication/graph.js";
 import {
   calculateIpfsCid,
+  calculateIpfsFileCid,
   IPFS_CID_PROFILE,
   IPFS_IMPORTER_OPTIONS,
 } from "../../src/publication/ipfs-cid.js";
@@ -159,6 +160,22 @@ describe("Elephant-compatible local IPFS graph", () => {
     }
   }, 30_000);
 
+  it("reproduces buffer CIDs through the bounded streamed-file importer", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "oracle-cid-"));
+    try {
+      for (const size of [262_143, 262_144, 262_145, 300_000]) {
+        const bytes = Buffer.alloc(size, 0x61);
+        const filePath = path.join(directory, `${size}.bin`);
+        await writeFile(filePath, bytes);
+        await expect(calculateIpfsFileCid(filePath)).resolves.toBe(
+          await calculateIpfsCid(bytes),
+        );
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("reproduces every child, shard, root and traversal edge", async () => {
     const first = await buildPublicationGraph({
       completedAt: timestamp,
@@ -250,3 +267,6 @@ describe("Elephant-compatible local IPFS graph", () => {
     ).rejects.toThrow("fixture property injection");
   });
 });
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";

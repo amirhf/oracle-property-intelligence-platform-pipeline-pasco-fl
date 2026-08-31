@@ -67,7 +67,7 @@ const require = createRequire(import.meta.url);
 const Ajv2020 = require("ajv/dist/2020.js") as typeof Ajv2020Class;
 const addFormats = require("ajv-formats") as FormatsPlugin;
 
-interface ExportPropertyRow {
+export interface ExportPropertyRow {
   acres: number | null;
   actual_year_built: number | null;
   assessed_value: number | null;
@@ -95,7 +95,7 @@ interface ExportPropertyRow {
   year_built: number | null;
 }
 
-interface ExportOwnerRow {
+export interface ExportOwnerRow {
   mailing_address_1: string | null;
   mailing_address_2: string | null;
   mailing_city: string | null;
@@ -107,7 +107,7 @@ interface ExportOwnerRow {
   property_id: string;
 }
 
-interface ExportRunRow {
+export interface ExportRunRow {
   as_of: Date | string;
   completed_at: Date | string;
   coverage_mode: "authoritative_complete" | "partial" | "sample";
@@ -121,7 +121,7 @@ interface ExportRunRow {
   workflow_id: string;
 }
 
-interface SnapshotRow {
+export interface SnapshotRow {
   coverage_metadata: unknown;
   manifest_sha256: string;
   previous_authoritative_snapshot_id: string | null;
@@ -189,7 +189,7 @@ export interface PublicationBuildOptions {
   publicationPlanRecorder?: typeof recordPublicationPlan;
 }
 
-interface ResolvedExportScope {
+export interface ResolvedExportScope {
   activeProperties: number;
   authoritativeBaseSnapshotId: string | null;
   authoritativeHeadSnapshotId: string | null;
@@ -299,7 +299,7 @@ function collectPropertyIds(value: unknown, result: Set<string>): void {
   for (const entry of Object.values(record)) collectPropertyIds(entry, result);
 }
 
-async function contractFixturePropertyIds(): Promise<Set<string>> {
+export async function contractFixturePropertyIds(): Promise<Set<string>> {
   const result = new Set<string>();
   const fixtureDir = path.resolve("contracts", "fixtures");
   for (const filename of (await readdir(fixtureDir)).sort()) {
@@ -455,7 +455,111 @@ export function unavailablePublicationFields() {
   } as const;
 }
 
-async function writeParquet(
+export function buildPublicationQueryRow(options: {
+  coverageMode: "authoritative_complete" | "partial" | "sample";
+  loadedAt: string;
+  observedAt: string;
+  owners: readonly ExportOwnerRow[];
+  property: ExportPropertyRow;
+  propertyCid: string;
+  propertyDocumentSha256: string;
+  runId: string;
+  scopeId: string;
+  selectionHash: string;
+  snapshotId: string | null;
+}): Record<string, unknown> {
+  const { property } = options;
+  const address = meaningfulSitusAddress({
+    city: property.site_city,
+    siteAddress: property.site_address,
+    zipCode: property.site_zip,
+  });
+  const primaryOwner = options.owners[0];
+  const ownerNames = options.owners
+    .flatMap((owner) => [owner.owner_name_1, owner.owner_name_2])
+    .filter(
+      (value): value is string =>
+        typeof value === "string" && value.trim().length > 0,
+    );
+  return {
+    property_id: property.property_id,
+    property_cid: options.propertyCid,
+    request_identifier: property.exact_folio,
+    parcel_identifier: property.exact_folio,
+    source_system: "pasco_appraiser",
+    county_name: "Pasco",
+    state_code: "FL",
+    address_street: address === null ? null : property.site_address || null,
+    address_city: address === null ? null : property.site_city || null,
+    address_zip: address === null ? null : property.site_zip,
+    latitude: property.latitude,
+    longitude: property.longitude,
+    lot_size_acre: property.acres,
+    lot_area_sqft: null,
+    exterior_wall_material: null,
+    roof_covering_material: property.roof_cover,
+    property_type: property.property_use_description,
+    property_usage_type:
+      property.property_use_description ?? property.property_use_code,
+    built_year: property.year_built,
+    livable_floor_area: property.heated_square_feet,
+    total_area: property.total_square_feet,
+    assessed_value: property.assessed_value,
+    market_value: property.market_value,
+    land_value: null,
+    avm_value: null,
+    owner_name: primaryOwner?.owner_name_1 ?? null,
+    owners_text: ownerNames.length > 0 ? ownerNames.join(" | ") : null,
+    owner_count: ownerNames.length > 0 ? options.owners.length : null,
+    owner_occupied: null,
+    last_sale_date: null,
+    last_sale_price: null,
+    subdivision: null,
+    has_permits: null,
+    permit_count: null,
+    has_sunbiz_tenant: null,
+    has_bbb_contractor: null,
+    hoa_flag: null,
+
+    parcel_id: property.parcel_id,
+    county: "pasco",
+    exact_folio: property.exact_folio,
+    site_address: address === null ? null : property.site_address,
+    site_city: address === null ? null : property.site_city,
+    site_zip: address === null ? null : property.site_zip,
+    property_use_code: property.property_use_code,
+    property_use_description: property.property_use_description,
+    acres: property.acres,
+    total_square_feet: property.total_square_feet,
+    heated_square_feet: property.heated_square_feet,
+    year_built: property.year_built,
+    roof_cover: property.roof_cover,
+    roof_structure: property.roof_structure,
+    roof_installation_date: null,
+    roof_installation_year: null,
+    roof_age_years: property.roof_age_years,
+    roof_age_basis: property.roof_basis,
+    roof_age_basis_quality: property.roof_basis_quality,
+    owner_name_1: primaryOwner?.owner_name_1 ?? null,
+    owner_name_2: primaryOwner?.owner_name_2 ?? null,
+    mailing_city: primaryOwner?.mailing_city ?? null,
+    mailing_state: primaryOwner?.mailing_state ?? null,
+    mailing_zip: primaryOwner?.mailing_zip ?? null,
+    ...unavailablePublicationFields(),
+    property_document_sha256: options.propertyDocumentSha256,
+    source_record_hash: property.source_record_hash,
+    coverage_mode: options.coverageMode,
+    coverage_scope_id: options.scopeId,
+    source_snapshot_id: options.snapshotId,
+    source_run_id: options.runId,
+    selection_hash: options.selectionHash,
+    observed_at: options.observedAt,
+    loaded_at: options.loadedAt,
+    published_at: null,
+  };
+}
+
+export async function writeParquet(
   parquetPath: string,
   ndjsonPath: string,
 ): Promise<void> {
@@ -581,7 +685,7 @@ export async function validateElephantQueryTableCompatibility(
   }
 }
 
-async function validateParquet(
+export async function validateParquet(
   parquetPath: string,
   expectedPropertyCids: ReadonlyMap<string, string>,
 ): Promise<{
@@ -684,7 +788,7 @@ function selectedRecordSha256(
     : sha256(JSON.stringify(sorted));
 }
 
-async function resolveExportScope(
+export async function resolveExportScope(
   sql: postgres.Sql,
   options: PublicationBuildOptions,
 ): Promise<ResolvedExportScope> {
@@ -1686,89 +1790,21 @@ export async function buildPublicationDryRun(
         propertyId: property.property_id,
         value: canonicalProperty,
       });
-      const primaryOwner = owners[0];
-      const ownerNames = owners
-        .flatMap((owner) => [owner.owner_name_1, owner.owner_name_2])
-        .filter(
-          (value): value is string =>
-            typeof value === "string" && value.trim().length > 0,
-        );
-      queryRows.push({
-        property_id: property.property_id,
-        property_cid: propertyCid,
-        request_identifier: property.exact_folio,
-        parcel_identifier: property.exact_folio,
-        source_system: "pasco_appraiser",
-        county_name: "Pasco",
-        state_code: "FL",
-        address_street: address === null ? null : property.site_address || null,
-        address_city: address === null ? null : property.site_city || null,
-        address_zip: address === null ? null : property.site_zip,
-        latitude: property.latitude,
-        longitude: property.longitude,
-        lot_size_acre: property.acres,
-        lot_area_sqft: null,
-        exterior_wall_material: null,
-        roof_covering_material: property.roof_cover,
-        property_type: property.property_use_description,
-        property_usage_type:
-          property.property_use_description ?? property.property_use_code,
-        built_year: property.year_built,
-        livable_floor_area: property.heated_square_feet,
-        total_area: property.total_square_feet,
-        assessed_value: property.assessed_value,
-        market_value: property.market_value,
-        land_value: null,
-        avm_value: null,
-        owner_name: primaryOwner?.owner_name_1 ?? null,
-        owners_text: ownerNames.length > 0 ? ownerNames.join(" | ") : null,
-        owner_count: ownerNames.length > 0 ? owners.length : null,
-        owner_occupied: null,
-        last_sale_date: null,
-        last_sale_price: null,
-        subdivision: null,
-        has_permits: null,
-        permit_count: null,
-        has_sunbiz_tenant: null,
-        has_bbb_contractor: null,
-        hoa_flag: null,
-
-        parcel_id: property.parcel_id,
-        county: "pasco",
-        exact_folio: property.exact_folio,
-        site_address: address === null ? null : property.site_address,
-        site_city: address === null ? null : property.site_city,
-        site_zip: address === null ? null : property.site_zip,
-        property_use_code: property.property_use_code,
-        property_use_description: property.property_use_description,
-        acres: property.acres,
-        total_square_feet: property.total_square_feet,
-        heated_square_feet: property.heated_square_feet,
-        year_built: property.year_built,
-        roof_cover: property.roof_cover,
-        roof_structure: property.roof_structure,
-        roof_installation_date: null,
-        roof_installation_year: null,
-        roof_age_years: property.roof_age_years,
-        roof_age_basis: property.roof_basis,
-        roof_age_basis_quality: property.roof_basis_quality,
-        owner_name_1: primaryOwner?.owner_name_1 ?? null,
-        owner_name_2: primaryOwner?.owner_name_2 ?? null,
-        mailing_city: primaryOwner?.mailing_city ?? null,
-        mailing_state: primaryOwner?.mailing_state ?? null,
-        mailing_zip: primaryOwner?.mailing_zip ?? null,
-        ...unavailablePublicationFields(),
-        property_document_sha256: propertyHash,
-        source_record_hash: property.source_record_hash,
-        coverage_mode: run.coverage_mode,
-        coverage_scope_id: scope.scopeId,
-        source_snapshot_id: run.snapshot_id,
-        source_run_id: run.run_id,
-        selection_hash: scope.selectedRecordSha256,
-        observed_at: projectionCore ? parcelObservedAt : observedAt,
-        loaded_at: loadedAt,
-        published_at: null,
-      });
+      queryRows.push(
+        buildPublicationQueryRow({
+          coverageMode: run.coverage_mode,
+          loadedAt,
+          observedAt: projectionCore ? parcelObservedAt : observedAt,
+          owners,
+          property,
+          propertyCid,
+          propertyDocumentSha256: propertyHash,
+          runId: run.run_id,
+          scopeId: scope.scopeId,
+          selectionHash: scope.selectedRecordSha256,
+          snapshotId: run.snapshot_id,
+        }),
+      );
     }
 
     const graph = await buildPublicationGraph({

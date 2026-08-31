@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { createReadStream } from "node:fs";
 
 const require = createRequire(import.meta.url);
 
@@ -6,7 +7,19 @@ interface IpfsOnlyHashModule {
   of(content: Uint8Array, options: Record<string, unknown>): Promise<string>;
 }
 
+interface UnixfsImporterModule {
+  importer(
+    source: Array<{ content: AsyncIterable<Uint8Array> }>,
+    block: {
+      get(cid: unknown): Promise<never>;
+      put(block: unknown): Promise<never>;
+    },
+    options: Record<string, unknown>,
+  ): AsyncIterable<{ cid: { toString(): string } }>;
+}
+
 const ipfsOnlyHash = require("ipfs-only-hash") as IpfsOnlyHashModule;
+const unixfsImporter = require("ipfs-unixfs-importer") as UnixfsImporterModule;
 
 export const IPFS_CID_PROFILE = Object.freeze({
   cidVersion: 0 as const,
@@ -52,6 +65,29 @@ export async function calculateIpfsCid(
   const cid = await ipfsOnlyHash.of(content, IPFS_IMPORTER_OPTIONS);
   if (!CIDV0_PATTERN.test(cid)) {
     throw new Error(`Local UnixFS hashing returned an invalid CIDv0 (${cid})`);
+  }
+  return cid;
+}
+
+export async function calculateIpfsFileCid(filePath: string): Promise<string> {
+  const block = {
+    get: async (): Promise<never> => {
+      throw new Error("Unexpected block read during only-hash import");
+    },
+    put: async (): Promise<never> => {
+      throw new Error("Unexpected block write during only-hash import");
+    },
+  };
+  let cid: string | null = null;
+  for await (const result of unixfsImporter.importer(
+    [{ content: createReadStream(filePath) }],
+    block,
+    IPFS_IMPORTER_OPTIONS,
+  )) {
+    cid = result.cid.toString();
+  }
+  if (cid === null || !CIDV0_PATTERN.test(cid)) {
+    throw new Error("Local streamed UnixFS hashing returned an invalid CIDv0");
   }
   return cid;
 }
