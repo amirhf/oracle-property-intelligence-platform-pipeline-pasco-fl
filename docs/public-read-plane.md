@@ -28,6 +28,17 @@ The public endpoints are read-only:
 - `/explorer/api/bootstrap`, `/explorer/api/search` and
   `/explorer/api/property` expose bounded explorer views.
 
+The hosted handler also applies a bounded 60-request/60-second, per-IP
+instance-local guard and caps its in-memory client map at 4,096 entries. This
+is defense in depth only: Vercel Function instances do not share memory, so it
+is not represented as a globally reliable production rate limit. Before the
+full authoritative read plane is enabled, configure a Vercel Firewall rate
+limit for this project over `/mcp` and `/explorer/api/*`, keyed by source IP,
+at 60 requests per 60 seconds with a deny response for excess traffic. Keep
+`/health` and the static explorer shell outside that data-route rule. Record
+the rule ID and deployed project scope during the separately authorized hosted
+configuration checkpoint; this repository does not mutate firewall state.
+
 The explorer executes the frozen MCP search/property operations and renders a
 privacy-reduced projection. It does not render owner names, public mailing
 values, phone/email values or contractor identities. Availability, evidence,

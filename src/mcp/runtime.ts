@@ -16,6 +16,7 @@ import type {
   OracleMcpProvider,
   QueryPropertyRow,
 } from "./provider.js";
+import { PublicReadError } from "./public-ipns-provider.js";
 import { projectPublicOwnership } from "./ownership.js";
 
 type ErrorCode =
@@ -80,6 +81,28 @@ interface SearchCandidate {
   distanceMeters: number;
   matchReasons: string[];
   row: QueryPropertyRow;
+}
+
+const PROPERTY_HYDRATION_CONCURRENCY = 8;
+
+async function mapWithConcurrency<Input, Output>(
+  values: readonly Input[],
+  concurrency: number,
+  project: (value: Input) => Promise<Output>,
+): Promise<Output[]> {
+  const output = new Array<Output>(values.length);
+  let cursor = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+      for (;;) {
+        const index = cursor;
+        cursor += 1;
+        if (index >= values.length) return;
+        output[index] = await project(values[index]!);
+      }
+    }),
+  );
+  return output;
 }
 
 class RuntimeFailure extends Error {
@@ -581,10 +604,17 @@ function candidateReasons(
     if (matches) reasons.push("roof_age");
   }
   if (filters.permit) {
-    conditions.push(false);
-  }
-  if (filters.ownership) {
-    conditions.push(false);
+    const count = row.openRoofingPermitCount;
+    const maximumDays = row.maximumOpenRoofingPermitDays;
+    const countMatches =
+      (!filters.permit.openOnly && !filters.permit.roofingOnly) ||
+      (count !== null && count > 0);
+    const durationMatches =
+      filters.permit.minOpenDays === undefined ||
+      (maximumDays !== null && maximumDays >= filters.permit.minOpenDays);
+    const matches = countMatches && durationMatches;
+    conditions.push(matches);
+    if (matches) reasons.push("permit");
   }
   if (filters.freshness) {
     const observedMatches =
@@ -701,6 +731,35 @@ function timeoutFailure(): RuntimeFailure {
   );
 }
 
+function isDeadlineReason(error: unknown): boolean {
+  return (
+    (error instanceof DOMException && error.name === "TimeoutError") ||
+    (error instanceof Error && error.message === "request_deadline")
+  );
+}
+
+function coverageUnavailable(
+  coverage: "ownership" | "permits",
+): RuntimeFailure {
+  return new RuntimeFailure(
+    "data_unavailable",
+    `${coverage === "permits" ? "Permit" : "Ownership"} filter coverage is unavailable for this dataset.`,
+    false,
+    coverage === "permits" ? "pasco-permits" : "pasco-ownership",
+    { coverage, type: "coverage_unavailable" },
+  );
+}
+
+function publicReadFailure(error: PublicReadError): RuntimeFailure {
+  return new RuntimeFailure(
+    error.retryable ? "dependency_unavailable" : "data_unavailable",
+    "The validated public-data publication could not satisfy the request.",
+    error.retryable,
+    "public-publication",
+    { publicReadCode: error.code, type: "public_read_failure" },
+  );
+}
+
 export class OracleMcpRuntime {
   constructor(
     readonly provider: OracleMcpProvider,
@@ -730,6 +789,7 @@ export class OracleMcpRuntime {
     const controller = new AbortController();
     const abort = () => controller.abort(externalSignal?.reason);
     externalSignal?.addEventListener("abort", abort, { once: true });
+    if (externalSignal?.aborted) abort();
     const timeout = setTimeout(
       () => controller.abort(timeoutFailure()),
       this.limits.requestTimeoutMs,
@@ -781,17 +841,35 @@ export class OracleMcpRuntime {
       const failure =
         error instanceof RuntimeFailure
           ? error
-          : new RuntimeFailure(
-              "data_unavailable",
-              "The configured public-data publication could not satisfy the request.",
-              false,
-              "local-publication",
-            );
+          : isDeadlineReason(error)
+            ? timeoutFailure()
+            : error instanceof PublicReadError
+              ? publicReadFailure(error)
+              : new RuntimeFailure(
+                  "data_unavailable",
+                  "The configured public-data publication could not satisfy the request.",
+                  false,
+                  "local-publication",
+                );
       return this.#checkedError(tool, argumentsValue, failure);
     } finally {
       clearTimeout(timeout);
       externalSignal?.removeEventListener("abort", abort);
     }
+  }
+
+  responseSizeFailure(
+    tool: McpToolName,
+    argumentsValue: unknown,
+  ): ToolExecutionResult {
+    return this.#checkedError(
+      tool,
+      argumentsValue,
+      new RuntimeFailure(
+        "data_unavailable",
+        "The bounded MCP response-size limit was exceeded.",
+      ),
+    );
   }
 
   async #executeValidated(
@@ -882,6 +960,20 @@ export class OracleMcpRuntime {
     metadata: DatasetMetadata,
     signal: AbortSignal,
   ): Promise<JsonObject> {
+    if (
+      metadata.permitCoverage === "unavailable" &&
+      (argumentsValue.filters.permit !== undefined ||
+        argumentsValue.sort === "permit_open_days_desc")
+    ) {
+      throw coverageUnavailable("permits");
+    }
+    if (argumentsValue.filters.ownership !== undefined) {
+      // The frozen query contract accepts ownership filters, but this
+      // publication has neither ownership-duration nor owner-area query facts.
+      // An explicit coverage failure is truthful; an empty success would imply
+      // that the filter was evaluated against complete data.
+      throw coverageUnavailable("ownership");
+    }
     const rows = await this.provider.getQueryRows(signal);
     const center = resolveCenter(argumentsValue.center, rows, metadata);
     const radiusMeters =
@@ -907,8 +999,10 @@ export class OracleMcpRuntime {
       ? decodeCursor(argumentsValue.page.cursor, fingerprint, candidates.length)
       : 0;
     const page = candidates.slice(offset, offset + argumentsValue.page.limit);
-    const opportunities = await Promise.all(
-      page.map(async (candidate) => {
+    const opportunities = await mapWithConcurrency(
+      page,
+      PROPERTY_HYDRATION_CONCURRENCY,
+      async (candidate) => {
         const canonical = await this.provider.getCanonicalProperty(
           candidate.row.propertyId,
           signal,
@@ -940,7 +1034,7 @@ export class OracleMcpRuntime {
           ),
           matchReasons: candidate.matchReasons,
         };
-      }),
+      },
     );
     const nextOffset = offset + page.length;
     const nextCursor =

@@ -47,6 +47,32 @@ type RetryDelay = (milliseconds: number) => Promise<void>;
 const defaultRetryDelay: RetryDelay = (milliseconds) =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw signal.reason ?? new Error("Operation aborted");
+}
+
+async function retryDelay(
+  delay: RetryDelay,
+  milliseconds: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  throwIfAborted(signal);
+  if (!signal) {
+    await delay(milliseconds);
+    return;
+  }
+  await Promise.race([
+    delay(milliseconds),
+    new Promise<never>((_, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => reject(signal.reason ?? new Error("Operation aborted")),
+        { once: true },
+      );
+    }),
+  ]);
+}
+
 export type PublicReadErrorCode =
   | "artifact_invalid"
   | "artifact_too_large"
@@ -214,6 +240,7 @@ export class HttpPublicReadTransport implements PublicReadTransport {
     identity: string,
     signal?: AbortSignal,
   ): Promise<readonly IpnsResolutionObservation[]> {
+    throwIfAborted(signal);
     return Promise.all(
       this.#gateways.map(async (gateway) => {
         const response = await this.#requestWithRetry(
@@ -252,6 +279,7 @@ export class HttpPublicReadTransport implements PublicReadTransport {
     let lastError: unknown;
     for (const gateway of this.#gateways) {
       for (let attempt = 0; attempt <= this.limits.retries; attempt += 1) {
+        throwIfAborted(signal);
         try {
           const response = await this.#request(
             new URL(`/ipfs/${cid}`, gateway.origin),
@@ -261,6 +289,7 @@ export class HttpPublicReadTransport implements PublicReadTransport {
           );
           return await boundedBody(response, maximumBytes);
         } catch (error) {
+          throwIfAborted(signal);
           const failure = isAbortError(error)
             ? publicError("timeout", "Public read timed out", true)
             : error;
@@ -269,7 +298,11 @@ export class HttpPublicReadTransport implements PublicReadTransport {
             throw failure;
           }
           if (attempt < this.limits.retries) {
-            await this.#retryDelay(RETRY_BACKOFF_MS * (attempt + 1));
+            await retryDelay(
+              this.#retryDelay,
+              RETRY_BACKOFF_MS * (attempt + 1),
+              signal,
+            );
           }
         }
       }
@@ -289,15 +322,21 @@ export class HttpPublicReadTransport implements PublicReadTransport {
   ): Promise<Response> {
     let lastError: unknown;
     for (let attempt = 0; attempt <= this.limits.retries; attempt += 1) {
+      throwIfAborted(signal);
       try {
         return await this.#request(initial, method, kind, signal);
       } catch (error) {
+        throwIfAborted(signal);
         lastError = error;
         if (!(error instanceof PublicReadError) || !error.retryable) {
           throw error;
         }
         if (attempt < this.limits.retries) {
-          await this.#retryDelay(RETRY_BACKOFF_MS * (attempt + 1));
+          await retryDelay(
+            this.#retryDelay,
+            RETRY_BACKOFF_MS * (attempt + 1),
+            signal,
+          );
         }
       }
     }
@@ -315,6 +354,7 @@ export class HttpPublicReadTransport implements PublicReadTransport {
     kind: "ipfs" | "ipns",
     signal?: AbortSignal,
   ): Promise<Response> {
+    throwIfAborted(signal);
     let current = initial;
     for (
       let redirectCount = 0;
@@ -329,6 +369,7 @@ export class HttpPublicReadTransport implements PublicReadTransport {
           signal: combinedSignal(signal, this.limits.transportTimeoutMs),
         });
       } catch (error) {
+        throwIfAborted(signal);
         if (isAbortError(error)) {
           throw publicError("timeout", "Public read timed out", true);
         }
@@ -390,7 +431,29 @@ function delegatedFailure(evidence: DelegatedIpnsEvidence): PublicReadError {
     );
   }
   if (evidence.validationResult === "timeout") {
-    return publicError("timeout", "Signed public IPNS resolution timed out");
+    return publicError(
+      "timeout",
+      "Signed public IPNS resolution timed out",
+      true,
+    );
+  }
+  if (evidence.validationResult === "transport_error") {
+    return publicError(
+      "transport_unavailable",
+      "Signed public IPNS transport is unavailable",
+      true,
+    );
+  }
+  if (
+    evidence.validationResult === "http_error" &&
+    evidence.httpStatus !== null &&
+    [500, 502, 503, 504].includes(evidence.httpStatus)
+  ) {
+    return publicError(
+      "transport_unavailable",
+      "Signed public IPNS service is unavailable",
+      true,
+    );
   }
   return publicError(
     "transport_unavailable",
@@ -458,8 +521,11 @@ export class CandidateDelegatedPublicReadTransport implements PublicReadTranspor
         expectedPriorCid: expectedCid,
         expectedTargetCid: expectedCid,
         fetchImpl: this.#fetchImplementation,
-        maxRetries: this.#limits.retries === 0 ? 0 : 1,
+        maxRetries: this.#limits.retries,
         networkKey: identity,
+        retryDelay: (delayMs, retrySignal) =>
+          retryDelay(this.#retryDelay, delayMs, retrySignal),
+        ...(signal ? { signal } : {}),
         timeoutMs: this.#limits.transportTimeoutMs,
       }),
     ]);
@@ -491,6 +557,7 @@ export class CandidateDelegatedPublicReadTransport implements PublicReadTranspor
     );
     let lastError: unknown;
     for (let attempt = 0; attempt <= this.#limits.retries; attempt += 1) {
+      throwIfAborted(signal);
       try {
         const response = await this.#fetchImplementation(url, {
           method: "HEAD",
@@ -507,7 +574,11 @@ export class CandidateDelegatedPublicReadTransport implements PublicReadTranspor
           if (!retryable) throw error;
           lastError = error;
           if (attempt < this.#limits.retries) {
-            await this.#retryDelay(RETRY_BACKOFF_MS * (attempt + 1));
+            await retryDelay(
+              this.#retryDelay,
+              RETRY_BACKOFF_MS * (attempt + 1),
+              signal,
+            );
           }
           continue;
         }
@@ -537,11 +608,16 @@ export class CandidateDelegatedPublicReadTransport implements PublicReadTranspor
           status: cid === null ? "unavailable" : "resolved",
         };
       } catch (error) {
+        throwIfAborted(signal);
         if (error instanceof PublicReadError) {
           if (!error.retryable) throw error;
           lastError = error;
           if (attempt < this.#limits.retries) {
-            await this.#retryDelay(RETRY_BACKOFF_MS * (attempt + 1));
+            await retryDelay(
+              this.#retryDelay,
+              RETRY_BACKOFF_MS * (attempt + 1),
+              signal,
+            );
           }
           continue;
         }
@@ -559,7 +635,11 @@ export class CandidateDelegatedPublicReadTransport implements PublicReadTranspor
           );
         }
         if (attempt < this.#limits.retries) {
-          await this.#retryDelay(RETRY_BACKOFF_MS * (attempt + 1));
+          await retryDelay(
+            this.#retryDelay,
+            RETRY_BACKOFF_MS * (attempt + 1),
+            signal,
+          );
         }
       }
     }

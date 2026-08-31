@@ -257,3 +257,15 @@ export function loadMcpConfig(
     provider,
   };
 }
+
+export function loadMcpRequestTimeoutMs(
+  environment: NodeJS.ProcessEnv = process.env,
+): number {
+  return integer(
+    environment,
+    "MCP_REQUEST_TIMEOUT_MS",
+    DEFAULT_REQUEST_TIMEOUT_MS,
+    100,
+    30_000,
+  );
+}

@@ -163,4 +163,19 @@ describe("Vercel recoverable initialization", () => {
       /authorization|bearer|conspicuous-secret|response-body/i,
     );
   });
+
+  it("starts the request deadline while a shared cold initialization is pending", async () => {
+    const pending = deferred<HostedRequestHandler>();
+    const handler = createHostedOracleEntrypoint({
+      diagnosticSink: () => undefined,
+      initialize: async () => pending.promise,
+      requestTimeoutMs: 10,
+    });
+    const startedAt = performance.now();
+    const response = await invoke(handler, "POST", "/mcp");
+    expect(response.status).toBe(503);
+    expect(performance.now() - startedAt).toBeLessThan(500);
+    pending.resolve(initializedHandler);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
 });

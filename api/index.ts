@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-import { loadMcpConfig } from "../src/mcp/config.js";
+import { loadMcpConfig, loadMcpRequestTimeoutMs } from "../src/mcp/config.js";
 import {
   MCP_CONTRACT_VERSION,
   MCP_SCHEMA_SHA256,
@@ -9,6 +9,7 @@ import {
   MCP_SERVICE_VERSION,
 } from "../src/mcp/constants.js";
 import { McpContractRegistry } from "../src/mcp/contracts.js";
+import { hostedClientKey, HostedRateLimitGuard } from "../src/mcp/admission.js";
 import {
   RecoverableHostedInitializer,
   type HostedInitializationContext,
@@ -21,6 +22,7 @@ import { createOracleMcpRequestHandler } from "../src/mcp/server.js";
 export type HostedRequestHandler = (
   request: IncomingMessage,
   response: ServerResponse,
+  signal?: AbortSignal,
 ) => Promise<void>;
 
 type HostedHandlerInitializer = (
@@ -83,11 +85,14 @@ function defaultDiagnosticSink(event: HostedInitializationDiagnostic): void {
 
 export function createHostedOracleEntrypoint(
   options: {
+    admission?: HostedRateLimitGuard;
     diagnosticSink?: (event: HostedInitializationDiagnostic) => void;
     initialize?: HostedHandlerInitializer;
     now?: () => number;
+    requestTimeoutMs?: number;
   } = {},
 ): HostedRequestHandler {
+  const admission = options.admission ?? new HostedRateLimitGuard();
   const initializer = new RecoverableHostedInitializer({
     diagnosticSink: options.diagnosticSink ?? defaultDiagnosticSink,
     initialize: options.initialize ?? initialize,
@@ -109,9 +114,45 @@ export function createHostedOracleEntrypoint(
       return;
     }
 
+    if (!admission.allow(hostedClientKey(request))) {
+      writeJson(response, 429, {
+        error: "Oracle public read rate limit exceeded",
+      });
+      return;
+    }
+
+    let requestTimeoutMs: number;
     try {
-      const initializedHandler = await initializer.get(correlationId(request));
-      await initializedHandler(request, response);
+      requestTimeoutMs =
+        options.requestTimeoutMs ?? loadMcpRequestTimeoutMs(process.env);
+    } catch {
+      writeJson(response, 503, {
+        error: "Validated public publication unavailable",
+      });
+      return;
+    }
+    const deadline = new AbortController();
+    const timer = setTimeout(
+      () =>
+        deadline.abort(
+          new DOMException("Request deadline exceeded", "TimeoutError"),
+        ),
+      requestTimeoutMs,
+    );
+    timer.unref();
+    const deadlineFailure = new Promise<never>((_resolve, reject) => {
+      deadline.signal.addEventListener(
+        "abort",
+        () => reject(deadline.signal.reason),
+        { once: true },
+      );
+    });
+    try {
+      const initializedHandler = await Promise.race([
+        initializer.get(correlationId(request)),
+        deadlineFailure,
+      ]);
+      await initializedHandler(request, response, deadline.signal);
     } catch {
       if (!response.headersSent) {
         writeJson(response, 503, {
@@ -120,6 +161,8 @@ export function createHostedOracleEntrypoint(
       } else if (!response.writableEnded) {
         response.end();
       }
+    } finally {
+      clearTimeout(timer);
     }
   };
 }

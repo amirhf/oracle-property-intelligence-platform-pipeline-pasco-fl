@@ -225,6 +225,26 @@ describe("signed IPNS delegated-routing observation", () => {
       requestCount: 2,
       validationResult: "valid_target",
     });
+
+    let threeAttempts = 0;
+    const exhausted = await observeDelegatedIpnsRecord({
+      expectedPriorCid: priorCid,
+      expectedTargetCid: targetCid,
+      fetchImpl: async () => {
+        threeAttempts += 1;
+        return new Response(null, { status: 503 });
+      },
+      maxRetries: 2,
+      networkKey: signed.networkKey,
+      retryDelay: async () => undefined,
+      timeoutMs: 1_000,
+    });
+    expect(exhausted).toMatchObject({
+      httpStatus: 503,
+      requestCount: 3,
+      validationResult: "http_error",
+    });
+    expect(threeAttempts).toBe(3);
   });
 
   it("requires control plane, official gateway, and signed record agreement", async () => {

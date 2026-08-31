@@ -44,7 +44,7 @@ export const delegatedIpnsEvidenceSchema = z.strictObject({
     "expired_record",
     "unexpected_cid",
   ]),
-  requestCount: z.number().int().min(1).max(2),
+  requestCount: z.number().int().min(1).max(3),
   responseBytes: z.number().int().min(0).max(MAX_SIGNED_IPNS_RECORD_BYTES),
   responseSha256: sha256Schema,
   schemaVersion: z.literal(DELEGATED_IPNS_POLICY_VERSION),
@@ -81,9 +81,34 @@ interface ObserveDelegatedIpnsOptions {
   expectedPriorCid: string;
   expectedTargetCid: string;
   fetchImpl?: typeof fetch;
-  maxRetries: 0 | 1;
+  maxRetries: number;
   networkKey: string;
+  retryDelay?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
+  signal?: AbortSignal;
   timeoutMs: number;
+}
+
+async function defaultRetryDelay(
+  delayMs: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal?.aborted) {
+    throw signal.reason ?? new Error("Operation aborted");
+  }
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => signal?.removeEventListener("abort", abort);
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, delayMs);
+    const abort = () => {
+      clearTimeout(timer);
+      cleanup();
+      reject(signal?.reason ?? new Error("Operation aborted"));
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    timer.unref();
+  });
 }
 
 function elapsed(startedAt: number): number {
@@ -206,7 +231,7 @@ export async function observeDelegatedIpnsRecord(
     .max(30_000)
     .parse(options.timeoutMs);
   const maxRetries = z
-    .union([z.literal(0), z.literal(1)])
+    .union([z.literal(0), z.literal(1), z.literal(2)])
     .parse(options.maxRetries);
   const identity = parseNetworkKey(networkKey);
   if (identity.multihash.code !== 0 && identity.multihash.code !== 0x12) {
@@ -225,6 +250,9 @@ export async function observeDelegatedIpnsRecord(
   let requestCount = 0;
 
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    if (options.signal?.aborted) {
+      throw options.signal.reason ?? new Error("Operation aborted");
+    }
     requestCount += 1;
     let response: Response;
     try {
@@ -232,13 +260,24 @@ export async function observeDelegatedIpnsRecord(
         headers: { Accept: DELEGATED_IPNS_MEDIA_TYPE },
         method: "GET",
         redirect: "manual",
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: options.signal
+          ? AbortSignal.any([options.signal, AbortSignal.timeout(timeoutMs)])
+          : AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
+      if (options.signal?.aborted) {
+        throw options.signal.reason ?? new Error("Operation aborted");
+      }
       const timeout =
         error instanceof DOMException &&
         (error.name === "AbortError" || error.name === "TimeoutError");
-      if (attempt < maxRetries) continue;
+      if (attempt < maxRetries) {
+        await (options.retryDelay ?? defaultRetryDelay)(
+          50 * (attempt + 1),
+          options.signal,
+        );
+        continue;
+      }
       return emptyEvidence(startedAt, observedAt, requestCount, {
         httpStatus: null,
         outcome: timeout ? "timeout" : "transport_error",
@@ -265,6 +304,10 @@ export async function observeDelegatedIpnsRecord(
         attempt < maxRetries &&
         [500, 502, 503, 504].includes(response.status)
       ) {
+        await (options.retryDelay ?? defaultRetryDelay)(
+          50 * (attempt + 1),
+          options.signal,
+        );
         continue;
       }
       return emptyEvidence(startedAt, observedAt, requestCount, {

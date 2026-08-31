@@ -40,6 +40,8 @@ function isToolName(value: string): value is McpToolName {
 export function createProtocolServer(
   runtime: OracleMcpRuntime,
   contracts: McpContractRegistry,
+  limits: McpLimits,
+  requestSignal?: AbortSignal,
 ): Server {
   const server = new Server(
     { name: MCP_SERVICE_NAME, version: MCP_SERVICE_VERSION },
@@ -77,40 +79,95 @@ export function createProtocolServer(
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const { name, arguments: argumentsValue = {} } = request.params;
     if (!isToolName(name)) throw new Error("Unknown MCP tool");
-    const execution = await runtime.execute(name, argumentsValue, extra.signal);
-    const result: CallToolResult = {
-      content: [{ type: "text", text: JSON.stringify(execution.result) }],
-      ...(execution.isError
+    const signal = requestSignal
+      ? AbortSignal.any([extra.signal, requestSignal])
+      : extra.signal;
+    let execution = await runtime.execute(name, argumentsValue, signal);
+    const toCallToolResult = (value: typeof execution): CallToolResult => ({
+      content: [{ type: "text", text: JSON.stringify(value.result) }],
+      ...(value.isError
         ? { isError: true }
-        : { structuredContent: execution.result }),
-    };
+        : { structuredContent: value.result }),
+    });
+    let result = toCallToolResult(execution);
+    const serializedBytes = () =>
+      Buffer.byteLength(
+        JSON.stringify({ id: extra.requestId, jsonrpc: "2.0", result }),
+      );
+    if (serializedBytes() > limits.maxResponseBytes) {
+      execution = runtime.responseSizeFailure(name, argumentsValue);
+      result = toCallToolResult(execution);
+    }
+    if (serializedBytes() > limits.maxResponseBytes) {
+      throw new Error("Bounded MCP error envelope exceeds response limit");
+    }
     return result;
   });
 
   return server;
 }
 
+class RequestBodyError extends Error {
+  constructor(
+    readonly code: "invalid_json" | "request_deadline" | "request_too_large",
+  ) {
+    super(code);
+  }
+}
+
 async function readBoundedJson(
   request: IncomingMessage,
   maximumBytes: number,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const declared = Number(request.headers["content-length"] ?? 0);
   if (Number.isFinite(declared) && declared > maximumBytes) {
-    throw new Error("request_too_large");
+    throw new RequestBodyError("request_too_large");
   }
-  const chunks: Buffer[] = [];
-  let bytes = 0;
-  for await (const chunk of request) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    bytes += buffer.length;
-    if (bytes <= maximumBytes) chunks.push(buffer);
-  }
-  if (bytes > maximumBytes) throw new Error("request_too_large");
-  if (bytes === 0) throw new Error("invalid_json");
+  if (signal?.aborted) throw new RequestBodyError("request_deadline");
+  const body = await new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let settled = false;
+    const cleanup = () => {
+      request.off("data", onData);
+      request.off("end", onEnd);
+      request.off("error", onError);
+      request.off("aborted", onAborted);
+      signal?.removeEventListener("abort", onDeadline);
+    };
+    const finish = (error?: RequestBodyError) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      request.pause();
+      if (error) reject(error);
+      else resolve(Buffer.concat(chunks));
+    };
+    const onData = (chunk: Buffer | string) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buffer.byteLength;
+      if (bytes > maximumBytes) {
+        finish(new RequestBodyError("request_too_large"));
+        return;
+      }
+      chunks.push(buffer);
+    };
+    const onEnd = () => finish();
+    const onError = () => finish(new RequestBodyError("invalid_json"));
+    const onAborted = () => finish(new RequestBodyError("invalid_json"));
+    const onDeadline = () => finish(new RequestBodyError("request_deadline"));
+    request.on("data", onData);
+    request.once("end", onEnd);
+    request.once("error", onError);
+    request.once("aborted", onAborted);
+    signal?.addEventListener("abort", onDeadline, { once: true });
+  });
+  if (body.byteLength === 0) throw new RequestBodyError("invalid_json");
   try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    return JSON.parse(body.toString("utf8"));
   } catch {
-    throw new Error("invalid_json");
+    throw new RequestBodyError("invalid_json");
   }
 }
 
@@ -167,20 +224,40 @@ async function handleMcpRequest(
   runtime: OracleMcpRuntime,
   contracts: McpContractRegistry,
   limits: McpLimits,
+  signal: AbortSignal,
 ): Promise<void> {
   let parsedBody: unknown;
   try {
-    parsedBody = await readBoundedJson(request, limits.maxRequestBytes);
+    parsedBody = await readBoundedJson(request, limits.maxRequestBytes, signal);
   } catch (error) {
-    const tooLarge =
-      error instanceof Error && error.message === "request_too_large";
-    jsonResponse(response, tooLarge ? 413 : 400, {
-      error: tooLarge ? "Request body exceeds the limit" : "Invalid JSON body",
+    const code =
+      error instanceof RequestBodyError ? error.code : "invalid_json";
+    jsonResponse(
+      response,
+      code === "request_too_large"
+        ? 413
+        : code === "request_deadline"
+          ? 408
+          : 400,
+      {
+        error:
+          code === "request_too_large"
+            ? "Request body exceeds the limit"
+            : code === "request_deadline"
+              ? "Request deadline exceeded"
+              : "Invalid JSON body",
+      },
+    );
+    return;
+  }
+  if (Array.isArray(parsedBody)) {
+    jsonResponse(response, 400, {
+      error: "JSON-RPC batches are not supported",
     });
     return;
   }
 
-  const server = createProtocolServer(runtime, contracts);
+  const server = createProtocolServer(runtime, contracts, limits, signal);
   const transport = new StreamableHTTPServerTransport({
     enableJsonResponse: true,
   });
@@ -209,8 +286,12 @@ export function createOracleMcpRequestHandler(options: {
   limits: McpLimits;
   providerMode: "local-artifact" | "public-ipns";
   runtime: OracleMcpRuntime;
-}): (request: IncomingMessage, response: ServerResponse) => Promise<void> {
-  return async (request, response) => {
+}): (
+  request: IncomingMessage,
+  response: ServerResponse,
+  externalSignal?: AbortSignal,
+) => Promise<void> {
+  return async (request, response, externalSignal) => {
     const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
 
     if (request.method === "GET" && pathname === "/") {
@@ -228,56 +309,86 @@ export function createOracleMcpRequestHandler(options: {
       });
       return;
     }
-    if (request.method === "GET" && pathname === "/explorer/api/bootstrap") {
-      try {
-        explorerJsonResponse(
-          response,
-          await explorerBootstrap(options.runtime),
-          options.limits.maxResponseBytes,
-        );
-      } catch {
-        jsonResponse(response, 503, {
-          error: "Validated explorer metadata is unavailable",
-        });
-      }
-      return;
-    }
-    if (
-      request.method === "POST" &&
-      (pathname === "/explorer/api/search" ||
-        pathname === "/explorer/api/property")
-    ) {
-      let body: unknown;
-      try {
-        body = await readBoundedJson(request, options.limits.maxRequestBytes);
-      } catch (error) {
-        const tooLarge =
-          error instanceof Error && error.message === "request_too_large";
-        jsonResponse(response, tooLarge ? 413 : 400, {
-          error: tooLarge
-            ? "Request body exceeds the limit"
-            : "Invalid JSON body",
-        });
-        return;
-      }
-      const result =
-        pathname === "/explorer/api/search"
-          ? await explorerSearch(options.runtime, body)
-          : await explorerProperty(options.runtime, body);
-      explorerJsonResponse(response, result, options.limits.maxResponseBytes);
-      return;
-    }
-    if (request.method !== "POST" || pathname !== "/mcp") {
+    const dataRoute =
+      (request.method === "GET" && pathname === "/explorer/api/bootstrap") ||
+      (request.method === "POST" &&
+        (pathname === "/explorer/api/search" ||
+          pathname === "/explorer/api/property" ||
+          pathname === "/mcp"));
+    if (!dataRoute) {
       jsonResponse(response, 404, { error: "Not found" });
       return;
     }
+    const deadline = new AbortController();
+    const timer = setTimeout(
+      () =>
+        deadline.abort(
+          new DOMException("Request deadline exceeded", "TimeoutError"),
+        ),
+      options.limits.requestTimeoutMs,
+    );
+    timer.unref();
+    const requestSignal = externalSignal
+      ? AbortSignal.any([externalSignal, deadline.signal])
+      : deadline.signal;
     try {
+      if (request.method === "GET") {
+        try {
+          explorerJsonResponse(
+            response,
+            await explorerBootstrap(options.runtime, requestSignal),
+            options.limits.maxResponseBytes,
+          );
+        } catch {
+          jsonResponse(response, 503, {
+            error: "Validated explorer metadata is unavailable",
+          });
+        }
+        return;
+      }
+      if (pathname !== "/mcp") {
+        let body: unknown;
+        try {
+          body = await readBoundedJson(
+            request,
+            options.limits.maxRequestBytes,
+            requestSignal,
+          );
+        } catch (error) {
+          const code =
+            error instanceof RequestBodyError ? error.code : "invalid_json";
+          jsonResponse(
+            response,
+            code === "request_too_large"
+              ? 413
+              : code === "request_deadline"
+                ? 408
+                : 400,
+            {
+              error:
+                code === "request_too_large"
+                  ? "Request body exceeds the limit"
+                  : code === "request_deadline"
+                    ? "Request deadline exceeded"
+                    : "Invalid JSON body",
+            },
+          );
+          return;
+        }
+        const result =
+          pathname === "/explorer/api/search"
+            ? await explorerSearch(options.runtime, body, requestSignal)
+            : await explorerProperty(options.runtime, body, requestSignal);
+        explorerJsonResponse(response, result, options.limits.maxResponseBytes);
+        return;
+      }
       await handleMcpRequest(
         request,
         response,
         options.runtime,
         options.contracts,
         options.limits,
+        requestSignal,
       );
     } catch {
       if (!response.headersSent) {
@@ -287,6 +398,8 @@ export function createOracleMcpRequestHandler(options: {
       } else if (!response.writableEnded) {
         response.end();
       }
+    } finally {
+      clearTimeout(timer);
     }
   };
 }

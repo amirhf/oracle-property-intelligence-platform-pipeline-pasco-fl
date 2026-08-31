@@ -6,6 +6,7 @@ import {
   MCP_TOOL_NAMES,
 } from "../../src/mcp/constants.js";
 import type { OracleMcpProvider } from "../../src/mcp/provider.js";
+import { PublicReadError } from "../../src/mcp/public-ipns-provider.js";
 import { haversineMeters, OracleMcpRuntime } from "../../src/mcp/runtime.js";
 import { coordinatesSearch, realMcpHarness } from "../helpers/mcp-real.js";
 
@@ -362,6 +363,55 @@ describe("Oracle MCP v1.2.0 runtime", () => {
     );
   });
 
+  it.each([
+    [
+      "permit filter",
+      { permit: { openOnly: true } },
+      "distance_asc",
+      "permits",
+    ],
+    ["permit sort", {}, "permit_open_days_desc", "permits"],
+    [
+      "ownership duration",
+      { ownership: { operator: "gte", years: 5 } },
+      "distance_asc",
+      "ownership",
+    ],
+    [
+      "ownership area",
+      { ownership: { ownerArea: "out_of_state" } },
+      "distance_asc",
+      "ownership",
+    ],
+  ] as const)(
+    "returns typed coverage_unavailable for an unsupported %s",
+    async (_name, filter, sort, coverage) => {
+      const { provider, runtime } = await realMcpHarness();
+      const center = (await provider.getQueryRows()).find(
+        (row) => row.latitude !== null && row.longitude !== null,
+      )!;
+      const request = coordinatesSearch({
+        latitude: center.latitude!,
+        longitude: center.longitude!,
+      }) as ReturnType<typeof coordinatesSearch> & {
+        filters: Record<string, unknown>;
+        sort: string;
+      };
+      Object.assign(request.filters, filter);
+      request.sort = sort;
+      const response = await runtime.execute(
+        "prism_v1_search_roofing_opportunities",
+        request,
+      );
+      expect(response.isError).toBe(true);
+      expect(response.result.error).toMatchObject({
+        code: "data_unavailable",
+        details: { coverage, type: "coverage_unavailable" },
+        retryable: false,
+      });
+    },
+  );
+
   it("rejects malformed identifiers, cursor tampering, bounds, SQL, paths, and extra fields", async () => {
     const { provider, runtime } = await realMcpHarness();
     for (const argumentsValue of [
@@ -470,5 +520,78 @@ describe("Oracle MCP v1.2.0 runtime", () => {
     expect(
       (ownershipBound.result.error as Record<string, unknown>).message,
     ).toContain("response-size");
+  });
+
+  it("preserves bounded public-read classification without exposing provider detail", async () => {
+    const { contracts, provider } = await realMcpHarness();
+    const unavailable: OracleMcpProvider = {
+      getCanonicalProperty: (...argumentsValue) =>
+        provider.getCanonicalProperty(...argumentsValue),
+      getMetadata: async () => {
+        throw new PublicReadError(
+          "timeout",
+          "authorization=Bearer conspicuous-secret response-body",
+          true,
+        );
+      },
+      getPermit: (...argumentsValue) => provider.getPermit(...argumentsValue),
+      getQueryRows: (...argumentsValue) =>
+        provider.getQueryRows(...argumentsValue),
+    };
+    const response = await new OracleMcpRuntime(unavailable, contracts, {
+      maxRequestBytes: 65_536,
+      maxResponseBytes: 2 * 1024 * 1024,
+      requestTimeoutMs: 10_000,
+    }).execute("prism_v1_get_service_info", {});
+    expect(response.result.error).toMatchObject({
+      code: "dependency_unavailable",
+      details: { publicReadCode: "timeout", type: "public_read_failure" },
+      retryable: true,
+    });
+    expect(JSON.stringify(response)).not.toMatch(
+      /authorization|bearer|conspicuous-secret|response-body/i,
+    );
+  });
+
+  it("bounds concurrent canonical-property hydration", async () => {
+    const { contracts, provider } = await realMcpHarness();
+    const rows = await provider.getQueryRows();
+    const center = rows.find(
+      (row) => row.latitude !== null && row.longitude !== null,
+    )!;
+    let active = 0;
+    let peak = 0;
+    const bounded: OracleMcpProvider = {
+      getCanonicalProperty: async (...argumentsValue) => {
+        active += 1;
+        peak = Math.max(peak, active);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        try {
+          return await provider.getCanonicalProperty(...argumentsValue);
+        } finally {
+          active -= 1;
+        }
+      },
+      getMetadata: (...argumentsValue) =>
+        provider.getMetadata(...argumentsValue),
+      getPermit: (...argumentsValue) => provider.getPermit(...argumentsValue),
+      getQueryRows: (...argumentsValue) =>
+        provider.getQueryRows(...argumentsValue),
+    };
+    const response = await new OracleMcpRuntime(bounded, contracts, {
+      maxRequestBytes: 65_536,
+      maxResponseBytes: 2 * 1024 * 1024,
+      requestTimeoutMs: 10_000,
+    }).execute(
+      "prism_v1_search_roofing_opportunities",
+      coordinatesSearch({
+        latitude: center.latitude!,
+        limit: 100,
+        longitude: center.longitude!,
+      }),
+    );
+    expect(response.isError).toBe(false);
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(8);
   });
 });

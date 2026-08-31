@@ -47,11 +47,20 @@ import {
   type GraphPropertyInput,
 } from "./graph.js";
 import { calculateIpfsCid, IPFS_CID_PROFILE } from "./ipfs-cid.js";
+import {
+  buildMaterializedCanonicalProperty,
+  meaningfulSitusAddress,
+  type MaterializedPublicationFact,
+} from "./canonical-property.js";
 
 const CONTRACT_VERSION = "1.0.0";
 const APPRAISER_ARTIFACT_URI = "artifact://pasco/appraiser/2026-08-23";
 const GIS_ARTIFACT_URI = "artifact://pasco/gis/countywide-25000";
 const APPRAISER_URL = "https://ftp01.pascopa.com/real_estate/parcel.zip";
+const BUILDING_URL = "https://ftp01.pascopa.com/real_estate/building.zip";
+const OWNERS_URL = "https://ftp01.pascopa.com/real_estate/owners.zip";
+const SITE_ADDRESSES_URL =
+  "https://ftp01.pascopa.com/real_estate/site_addresses.zip";
 const GIS_URL =
   "https://pascogis.pascocountyfl.net/giswebmm/rest/services/PascoMapper/Parcels/MapServer/7";
 const require = createRequire(import.meta.url);
@@ -78,8 +87,8 @@ interface ExportPropertyRow {
   roof_basis_quality: string | null;
   roof_cover: string | null;
   roof_structure: string | null;
-  site_address: string;
-  site_city: string;
+  site_address: string | null;
+  site_city: string | null;
   site_zip: string | null;
   source_record_hash: string;
   total_square_feet: number | null;
@@ -118,6 +127,16 @@ interface SnapshotRow {
   previous_authoritative_snapshot_id: string | null;
   snapshot_id: string;
   source_objects: unknown;
+}
+
+interface MaterializedCoreBinding {
+  payload: {
+    parcel: unknown;
+    siteAddress: unknown;
+  };
+  sourceRunId: string;
+  sourceSnapshotId: string;
+  versionId: string;
 }
 
 interface ManifestEntry {
@@ -537,8 +556,7 @@ export async function validateElephantQueryTableCompatibility(
     const unavailable = await connection.runAndReadAll(`
       SELECT count(*)::BIGINT AS fabricated
       FROM properties
-      WHERE assessed_value IS NOT NULL OR market_value IS NOT NULL
-         OR land_value IS NOT NULL OR avm_value IS NOT NULL
+      WHERE land_value IS NOT NULL OR avm_value IS NOT NULL
          OR owner_occupied IS NOT NULL OR last_sale_date IS NOT NULL
          OR last_sale_price IS NOT NULL OR subdivision IS NOT NULL
          OR has_permits IS NOT NULL OR permit_count IS NOT NULL
@@ -1015,6 +1033,11 @@ export async function buildPublicationDryRun(
     const loadedAt = iso(run.completed_at);
     let projectionOwnerRows: ExportOwnerRow[] | null = null;
     let projectionAvailabilityComplete = false;
+    const projectionCoreByProperty = new Map<string, MaterializedCoreBinding>();
+    const projectionFactsByProperty = new Map<
+      string,
+      MaterializedPublicationFact[]
+    >();
     let properties: ExportPropertyRow[];
     if (scope.materializationId) {
       const coreRows = await sql<
@@ -1022,11 +1045,16 @@ export async function buildPublicationDryRun(
           parcel_identifier: string;
           payload: unknown;
           property_id: string;
+          source_run_id: string;
           source_record_sha256: string;
+          source_snapshot_id: string;
+          version_id: string;
         }[]
       >`
         SELECT membership.property_id, version.parcel_identifier,
-               version.payload, version.source_record_sha256
+               version.payload, version.source_record_sha256,
+               version.source_run_id, version.source_snapshot_id,
+               version.version_id
         FROM oracle_projection_materialized_properties membership
         JOIN oracle_property_versions version
           ON version.version_id = membership.property_version_id
@@ -1037,15 +1065,21 @@ export async function buildPublicationDryRun(
       const factRows = await sql<
         {
           fact_type: string;
+          evidence_refs: unknown;
+          fact_version_id: string;
           natural_key: string;
           payload: unknown;
           property_id: string;
+          source_run_id: string;
           source_record_sha256: string;
+          source_snapshot_id: string;
         }[]
       >`
         SELECT membership.property_id, membership.fact_type,
                membership.natural_key, version.payload,
-               version.source_record_sha256
+               version.source_record_sha256, version.source_run_id,
+               version.source_snapshot_id, version.evidence_refs,
+               version.version_id AS fact_version_id
         FROM oracle_projection_materialized_facts membership
         JOIN oracle_child_fact_versions version
           ON version.version_id = membership.fact_version_id
@@ -1059,6 +1093,19 @@ export async function buildPublicationDryRun(
         const facts = factsByProperty.get(fact.property_id) ?? [];
         facts.push(fact);
         factsByProperty.set(fact.property_id, facts);
+        const publicationFacts =
+          projectionFactsByProperty.get(fact.property_id) ?? [];
+        publicationFacts.push({
+          evidenceRefs: fact.evidence_refs,
+          factType: fact.fact_type,
+          naturalKey: fact.natural_key,
+          payload: fact.payload,
+          sourceRecordHash: fact.source_record_sha256,
+          sourceRunId: fact.source_run_id,
+          sourceSnapshotId: fact.source_snapshot_id,
+          versionId: fact.fact_version_id,
+        });
+        projectionFactsByProperty.set(fact.property_id, publicationFacts);
       }
       const owners: ExportOwnerRow[] = [];
       properties = coreRows.map((row) => {
@@ -1082,6 +1129,15 @@ export async function buildPublicationDryRun(
           yearBuilt: number | null;
         };
         const facts = factsByProperty.get(row.property_id) ?? [];
+        projectionCoreByProperty.set(row.property_id, {
+          payload: {
+            parcel: payload.parcel,
+            siteAddress: payload.siteAddress,
+          },
+          sourceRunId: row.source_run_id,
+          sourceSnapshotId: row.source_snapshot_id,
+          versionId: row.version_id,
+        });
         const coordinate = facts.find(
           (fact) => fact.fact_type === "coordinate",
         );
@@ -1149,8 +1205,8 @@ export async function buildPublicationDryRun(
           roof_basis_quality: roofPayload?.basisQuality ?? null,
           roof_cover: buildingPayload?.roofCover ?? null,
           roof_structure: buildingPayload?.roofStructure ?? null,
-          site_address: payload.siteAddress?.siteAddress ?? "",
-          site_city: payload.siteAddress?.city ?? "",
+          site_address: payload.siteAddress?.siteAddress ?? null,
+          site_city: payload.siteAddress?.city ?? null,
           site_zip: payload.siteAddress?.zipCode ?? null,
           source_record_hash: row.source_record_sha256,
           total_square_feet: payload.totalSquareFeet,
@@ -1339,11 +1395,18 @@ export async function buildPublicationDryRun(
             !Array.isArray(value),
         )
       : [];
-    const sourceUrl = (sourceSystem: string, fallback: string) => {
+    const sourceUrl = (
+      sourceSystem: string,
+      fallback: string,
+      expectedBasename?: string,
+    ) => {
       const value = snapshotSourceObjects.find(
         (object) =>
           object.sourceSystem === sourceSystem &&
           object.stage === "downloaded_source" &&
+          (expectedBasename === undefined ||
+            (typeof object.relativePath === "string" &&
+              object.relativePath.endsWith(`/${expectedBasename}`))) &&
           typeof object.sourceIdentifier === "string",
       )?.sourceIdentifier;
       return typeof value === "string" && value.startsWith("https://")
@@ -1356,11 +1419,43 @@ export async function buildPublicationDryRun(
     const gisArtifactUri = scope.snapshot
       ? `artifact://pasco/snapshot/${scope.snapshot.snapshot_id}/pasco_gis`
       : GIS_ARTIFACT_URI;
-    const appraiserSourceUrl = sourceUrl("pasco_appraiser", APPRAISER_URL);
+    const appraiserSourceUrl = sourceUrl(
+      "pasco_appraiser",
+      APPRAISER_URL,
+      "parcel.zip",
+    );
+    const buildingSourceUrl = sourceUrl(
+      "pasco_appraiser",
+      BUILDING_URL,
+      "building.zip",
+    );
+    const ownersSourceUrl = sourceUrl(
+      "pasco_appraiser",
+      OWNERS_URL,
+      "owners.zip",
+    );
+    const siteAddressSourceUrl = sourceUrl(
+      "pasco_appraiser",
+      SITE_ADDRESSES_URL,
+      "site_addresses.zip",
+    );
     const gisSourceUrl = sourceUrl("pasco_gis", GIS_URL);
     const observedAt =
       scope.coverage?.sourceObservationWindow.start ??
       "2026-08-23T00:00:00.000Z";
+    const parcelObservedAt = (() => {
+      const object = snapshotSourceObjects.find(
+        (object) =>
+          object.sourceSystem === "pasco_appraiser" &&
+          object.stage === "downloaded_source" &&
+          typeof object.relativePath === "string" &&
+          object.relativePath.endsWith("/parcel.zip"),
+      );
+      const value = object?.observedAt ?? object?.lastModified;
+      return typeof value === "string" && Number.isFinite(Date.parse(value))
+        ? new Date(value).toISOString()
+        : observedAt;
+    })();
 
     const canonicalSchema = JSON.parse(
       await readFile(
@@ -1398,14 +1493,11 @@ export async function buildPublicationDryRun(
         "pasco_gis",
       ]);
       const owners = ownersByProperty.get(property.property_id) ?? [];
-      const address = [
-        property.site_address,
-        property.site_city,
-        "FL",
-        property.site_zip,
-      ]
-        .filter(Boolean)
-        .join(", ");
+      const address = meaningfulSitusAddress({
+        city: property.site_city,
+        siteAddress: property.site_address,
+        zipCode: property.site_zip,
+      });
       const evidence = [
         {
           evidenceId: appraiserEvidenceId,
@@ -1438,98 +1530,138 @@ export async function buildPublicationDryRun(
             ]
           : []),
       ];
-      const canonicalProperty = {
-        entityType: "property",
-        contractVersion: CONTRACT_VERSION,
-        propertyId: property.property_id,
-        parcelId: property.parcel_id,
-        county: "pasco",
-        sourceSystem: "pasco_appraiser",
-        folio: available(property.exact_folio, "raw", [appraiserEvidenceId]),
-        parcelIdentifier: available(property.exact_folio, "raw", [
-          appraiserEvidenceId,
-        ]),
-        situsAddress: available(address, "normalized", [appraiserEvidenceId]),
-        coordinates:
-          property.latitude === null || property.longitude === null
-            ? unavailable("normalized", "not_provided_by_source", [
-                appraiserEvidenceId,
-              ])
-            : available(
-                {
-                  latitude: property.latitude,
-                  longitude: property.longitude,
-                  crs: "EPSG:4326",
-                },
-                "normalized",
-                [gisEvidenceId],
-              ),
-        yearBuilt:
-          property.year_built === null
-            ? unavailable("raw", "not_provided_by_source", [
-                appraiserEvidenceId,
-              ])
-            : available(property.year_built, "raw", [appraiserEvidenceId]),
-        roofInstallationDate: unavailable("raw", "not_provided_by_source", [
-          appraiserEvidenceId,
-        ]),
-        roofInstallationYear: unavailable("raw", "not_provided_by_source", [
-          appraiserEvidenceId,
-        ]),
-        roofAgeSignal:
-          property.roof_age_years === null ||
-          property.roof_basis === null ||
-          property.roof_basis_quality === null
-            ? unavailable("derived", "not_provided_by_source", [
-                appraiserEvidenceId,
-              ])
-            : available(
-                {
-                  ageYears: property.roof_age_years,
-                  precision: "year",
-                  basis: property.roof_basis,
-                  basisQuality: property.roof_basis_quality,
-                  asOf,
-                },
-                "derived",
-                [appraiserEvidenceId],
-                {
-                  rule: "year_difference_proxy",
-                  ruleVersion: CONTRACT_VERSION,
-                  asOf,
-                  inputs: ["property.yearBuilt"],
-                },
-              ),
-        ownership:
-          owners.length > 0
-            ? available(
-                owners.map((owner) => ({
-                  ownerName1: owner.owner_name_1,
-                  ownerName2: owner.owner_name_2,
-                  mailingAddress1: owner.mailing_address_1,
-                  mailingAddress2: owner.mailing_address_2,
-                  mailingCity: owner.mailing_city,
-                  mailingState: owner.mailing_state,
-                  mailingZip: owner.mailing_zip,
-                  mailingCountry: owner.mailing_country,
-                })),
-                "raw",
-                [appraiserEvidenceId],
-              )
-            : unavailable("raw", "not_provided_by_source", [
-                appraiserEvidenceId,
-              ]),
-        permits: [],
-        evidence,
-        freshness: {
-          observedAt,
-          retrievedAt: asOf,
-          loadedAt,
-          publishedAt: null,
-          computedAt: asOf,
-          sourceCadence: "weekly appraiser working roll",
-        },
-      };
+      const projectionCore = projectionCoreByProperty.get(property.property_id);
+      const canonicalProperty = projectionCore
+        ? buildMaterializedCanonicalProperty({
+            allowedSnapshotIds: new Set(scope.predecessorChainSnapshotIds),
+            asOf,
+            core: projectionCore,
+            facts: projectionFactsByProperty.get(property.property_id) ?? [],
+            loadedAt,
+            parcelObservedAt,
+            property: {
+              exactFolio: property.exact_folio,
+              latitude: property.latitude,
+              longitude: property.longitude,
+              parcelId: property.parcel_id,
+              propertyId: property.property_id,
+              siteAddress: property.site_address,
+              siteCity: property.site_city,
+              siteZip: property.site_zip,
+              yearBuilt: property.year_built,
+            },
+            roofSignal: {
+              ageYears: property.roof_age_years,
+              basis: property.roof_basis,
+              basisQuality: property.roof_basis_quality,
+            },
+            sources: {
+              appraiserBuildingUrl: buildingSourceUrl,
+              appraiserOwnersUrl: ownersSourceUrl,
+              appraiserParcelUrl: appraiserSourceUrl,
+              appraiserSiteAddressUrl: siteAddressSourceUrl,
+              snapshotId: scope.snapshot!.snapshot_id,
+            },
+          })
+        : {
+            entityType: "property",
+            contractVersion: CONTRACT_VERSION,
+            propertyId: property.property_id,
+            parcelId: property.parcel_id,
+            county: "pasco",
+            sourceSystem: "pasco_appraiser",
+            folio: available(property.exact_folio, "raw", [
+              appraiserEvidenceId,
+            ]),
+            parcelIdentifier: available(property.exact_folio, "raw", [
+              appraiserEvidenceId,
+            ]),
+            situsAddress:
+              address === null
+                ? unavailable("normalized", "not_provided_by_source", [
+                    appraiserEvidenceId,
+                  ])
+                : available(address, "normalized", [appraiserEvidenceId]),
+            coordinates:
+              property.latitude === null || property.longitude === null
+                ? unavailable("normalized", "not_provided_by_source", [
+                    appraiserEvidenceId,
+                  ])
+                : available(
+                    {
+                      latitude: property.latitude,
+                      longitude: property.longitude,
+                      crs: "EPSG:4326",
+                    },
+                    "normalized",
+                    [gisEvidenceId],
+                  ),
+            yearBuilt:
+              property.year_built === null
+                ? unavailable("raw", "not_provided_by_source", [
+                    appraiserEvidenceId,
+                  ])
+                : available(property.year_built, "raw", [appraiserEvidenceId]),
+            roofInstallationDate: unavailable("raw", "not_provided_by_source", [
+              appraiserEvidenceId,
+            ]),
+            roofInstallationYear: unavailable("raw", "not_provided_by_source", [
+              appraiserEvidenceId,
+            ]),
+            roofAgeSignal:
+              property.roof_age_years === null ||
+              property.roof_basis === null ||
+              property.roof_basis_quality === null
+                ? unavailable("derived", "not_provided_by_source", [
+                    appraiserEvidenceId,
+                  ])
+                : available(
+                    {
+                      ageYears: property.roof_age_years,
+                      precision: "year",
+                      basis: property.roof_basis,
+                      basisQuality: property.roof_basis_quality,
+                      asOf,
+                    },
+                    "derived",
+                    [appraiserEvidenceId],
+                    {
+                      rule: "year_difference_proxy",
+                      ruleVersion: CONTRACT_VERSION,
+                      asOf,
+                      inputs: ["property.yearBuilt"],
+                    },
+                  ),
+            ownership:
+              owners.length > 0
+                ? available(
+                    owners.map((owner) => ({
+                      ownerName1: owner.owner_name_1,
+                      ownerName2: owner.owner_name_2,
+                      mailingAddress1: owner.mailing_address_1,
+                      mailingAddress2: owner.mailing_address_2,
+                      mailingCity: owner.mailing_city,
+                      mailingState: owner.mailing_state,
+                      mailingZip: owner.mailing_zip,
+                      mailingCountry: owner.mailing_country,
+                    })),
+                    "raw",
+                    [appraiserEvidenceId],
+                  )
+                : unavailable("raw", "not_provided_by_source", [
+                    appraiserEvidenceId,
+                  ]),
+            permits: [],
+            evidence,
+            freshness: {
+              observedAt,
+              retrievedAt: asOf,
+              loadedAt,
+              publishedAt: null,
+              computedAt: asOf,
+              sourceCadence: "weekly appraiser working roll",
+            },
+          };
       if (!validateProperty(canonicalProperty)) {
         throw new Error(
           `Canonical property validation failed at ${JSON.stringify(validateProperty.errors?.map((error: ErrorObject) => error.instancePath))}`,
@@ -1569,9 +1701,9 @@ export async function buildPublicationDryRun(
         source_system: "pasco_appraiser",
         county_name: "Pasco",
         state_code: "FL",
-        address_street: property.site_address || null,
-        address_city: property.site_city || null,
-        address_zip: property.site_zip,
+        address_street: address === null ? null : property.site_address || null,
+        address_city: address === null ? null : property.site_city || null,
+        address_zip: address === null ? null : property.site_zip,
         latitude: property.latitude,
         longitude: property.longitude,
         lot_size_acre: property.acres,
@@ -1604,9 +1736,9 @@ export async function buildPublicationDryRun(
         parcel_id: property.parcel_id,
         county: "pasco",
         exact_folio: property.exact_folio,
-        site_address: property.site_address,
-        site_city: property.site_city,
-        site_zip: property.site_zip,
+        site_address: address === null ? null : property.site_address,
+        site_city: address === null ? null : property.site_city,
+        site_zip: address === null ? null : property.site_zip,
         property_use_code: property.property_use_code,
         property_use_description: property.property_use_description,
         acres: property.acres,
@@ -1633,7 +1765,7 @@ export async function buildPublicationDryRun(
         source_snapshot_id: run.snapshot_id,
         source_run_id: run.run_id,
         selection_hash: scope.selectedRecordSha256,
-        observed_at: observedAt,
+        observed_at: projectionCore ? parcelObservedAt : observedAt,
         loaded_at: loadedAt,
         published_at: null,
       });
