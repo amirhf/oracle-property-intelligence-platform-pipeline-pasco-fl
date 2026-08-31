@@ -12,7 +12,7 @@ import {
   type CandidateSourceSnapshotPreflightBinding,
 } from "./candidate-source-snapshot-preflight-binding.js";
 
-export const CANDIDATE_SOURCE_SNAPSHOT_DEMO_PLAN_VERSION = "2.0.0";
+export const CANDIDATE_SOURCE_SNAPSHOT_DEMO_PLAN_VERSION = "2.1.0";
 export const CANDIDATE_SOURCE_SNAPSHOT_ARTIFACT_REPRESENTATION_VERSION =
   "2.0.0" as const;
 export const CANDIDATE_SOURCE_SNAPSHOT_PUBLICATION_CLASS =
@@ -25,11 +25,15 @@ export const CANDIDATE_SOURCE_SNAPSHOT_HARD_CEILINGS = Object.freeze({
   maxConcurrency: 16,
   maxObjectBytes: 536_870_912,
   maxObjects: 350_000,
-  maxRequests: 1_000_000,
+  maxRequests: 1_100_000,
   maxRetries: 2,
   maxTotalBytes: 4_294_967_296,
   requestTimeoutMs: 20_000,
 });
+export const CANDIDATE_SOURCE_SNAPSHOT_PLAN_REQUEST_CEILING = 1_080_000;
+export const CANDIDATE_SOURCE_SNAPSHOT_EXACT_PLAN_ARTIFACT_BYTES = 11_210;
+export const CANDIDATE_SOURCE_SNAPSHOT_FROZEN_NAMESPACE_ID =
+  "snapshotns_ff11a5f549e4f085ec05186a1f51e701";
 
 export const CANDIDATE_SOURCE_SNAPSHOT_CONSERVATIVE_PRICING = Object.freeze({
   fixedAccountPlanMonthlyUsd: 7.5,
@@ -250,44 +254,76 @@ export type CandidateSourceSnapshotPricing = z.infer<
   typeof candidateSourceSnapshotPricingSchema
 >;
 
-const operationCountsSchema = z
+const categoryCountSchema = z.tuple([
+  z.number().int().nonnegative(),
+  z.number().int().nonnegative(),
+]);
+
+export const CANDIDATE_SOURCE_SNAPSHOT_REQUEST_CATEGORY_ORDER = [
+  "upload_provider_cid",
+  "ambiguous_upload_inspection",
+  "bucket_names_preflight",
+  "names_mutation",
+  "control_public_observation",
+  "recovery",
+  "rollback",
+  "final_credential_free_verification",
+] as const;
+
+const categoryRequestsSchema = z.strictObject({
+  ambiguous_upload_inspection: categoryCountSchema,
+  bucket_names_preflight: categoryCountSchema,
+  control_public_observation: categoryCountSchema,
+  final_credential_free_verification: categoryCountSchema,
+  names_mutation: categoryCountSchema,
+  recovery: categoryCountSchema,
+  rollback: categoryCountSchema,
+  upload_provider_cid: categoryCountSchema,
+});
+
+export const candidateSourceSnapshotRequestEnvelopeSchema = z
   .strictObject({
-    classAMutations: z.number().int().nonnegative(),
-    classBReads: z.number().int().nonnegative(),
-    freeOperations: z.number().int().nonnegative(),
-    namesApiOperations: z.number().int().nonnegative(),
-    publicResolverOperations: z.number().int().nonnegative(),
-    total: z.number().int().nonnegative(),
+    categoryRequests: categoryRequestsSchema,
+    finalVerification: z.strictObject({
+      deterministicRequiredMaximumRequests: z.number().int().positive(),
+      logicalRequests: z.number().int().positive(),
+      maximumRedirectsPerAttempt: z.literal(2),
+      maximumTransportAttemptsPerLogicalRequest: z.literal(3),
+      nonParquetLogicalRequests: z.literal(109),
+      parquetLogicalRequests: z.literal(8_194),
+      protectedHeadroomRequests: z.number().int().positive(),
+      schemaVersion: z.literal("candidate-final-verification-budget-v1"),
+    }),
+    maximumTotalRequests: z.number().int().positive(),
+    schemaVersion: z.literal("candidate-request-envelope-v3"),
+    successfulTotalRequests: z.number().int().positive(),
   })
-  .superRefine((counts, context) => {
-    const expectedTotal =
-      counts.classAMutations +
-      counts.classBReads +
-      counts.freeOperations +
-      counts.namesApiOperations +
-      counts.publicResolverOperations;
+  .superRefine((envelope, context) => {
+    const categories = Object.values(envelope.categoryRequests);
+    const successful = categories.reduce(
+      (sum, category) => sum + category[0],
+      0,
+    );
+    const maximum = categories.reduce((sum, category) => sum + category[1], 0);
+    const finalCategory =
+      envelope.categoryRequests.final_credential_free_verification;
     if (
-      !Number.isSafeInteger(expectedTotal) ||
-      counts.total !== expectedTotal
+      categories.some(
+        ([successfulCount, maximumCount]) => successfulCount > maximumCount,
+      ) ||
+      successful !== envelope.successfulTotalRequests ||
+      maximum !== envelope.maximumTotalRequests ||
+      finalCategory[0] !== envelope.finalVerification.logicalRequests ||
+      finalCategory[1] !==
+        envelope.finalVerification.deterministicRequiredMaximumRequests +
+          envelope.finalVerification.protectedHeadroomRequests
     ) {
       context.addIssue({
         code: "custom",
-        message: "operation count total does not match its exact classes",
-        path: ["total"],
+        message: "categorized request envelope totals are inconsistent",
       });
     }
   });
-
-export const candidateSourceSnapshotRequestEnvelopeSchema = z.strictObject({
-  ambiguousObjectInspectionAllowance: operationCountsSchema,
-  maximumAttempts: operationCountsSchema,
-  maximumTotalRequests: z.number().int().positive(),
-  recoveryAllowance: operationCountsSchema.extend({
-    observationCyclesPerDomain: z.number().int().positive().max(32),
-  }),
-  schemaVersion: z.literal("candidate-request-envelope-v2"),
-  successfulExecution: operationCountsSchema,
-});
 
 export type CandidateSourceSnapshotRequestEnvelope = z.infer<
   typeof candidateSourceSnapshotRequestEnvelopeSchema
@@ -298,13 +334,11 @@ export const candidateSourceSnapshotCostEnvelopeSchema = z.strictObject({
   incrementalExecutionUsd: z.number().nonnegative(),
   maximumIncrementalUsd: z.number().nonnegative(),
   maximumTotalUsd: z.number().nonnegative(),
-  recoveryRequestUsd: z.number().nonnegative(),
   requestUsd: z.strictObject({
-    ambiguousObjectInspections: z.number().nonnegative(),
     maximumAttempts: z.number().nonnegative(),
     successfulExecution: z.number().nonnegative(),
   }),
-  schemaVersion: z.literal("candidate-cost-envelope-v2"),
+  schemaVersion: z.literal("candidate-cost-envelope-v3"),
   storageUsd: z.number().nonnegative(),
 });
 
@@ -452,6 +486,7 @@ export const candidateSourceSnapshotDemoPlanSchema = z
     costEnvelope: candidateSourceSnapshotCostEnvelopeSchema,
     coverage: measuredCoverageSchema,
     disclaimer: z.literal(CANDIDATE_SOURCE_SNAPSHOT_DISCLOSURE),
+    formatPadding: z.string().max(16_384).regex(/^ *$/),
     inventory: inventoryBindingSchema,
     limits: candidateSourceSnapshotLimitsSchema,
     namespaceId: idSchema("snapshotns"),
@@ -700,8 +735,6 @@ export const candidateSourceSnapshotDemoPlanSchema = z
         createCandidateSourceSnapshotRequestEnvelope({
           limits: plan.limits,
           objectCount: plan.inventory.objectCount,
-          recoveryObservationCyclesPerDomain:
-            plan.requestEnvelope.recoveryAllowance.observationCyclesPerDomain,
         });
       if (
         canonicalJsonSha256(plan.requestEnvelope) !==
@@ -872,21 +905,36 @@ export function createCandidateSourceSnapshotNamespaceId(input: {
       queryTable: namespaceTargetSchema.parse(input.targets.queryTable),
     },
   };
-  return deterministicId("snapshotns", [
-    "1.0.0",
-    "Publish/pasco/candidate-source-snapshot-namespace",
-    canonicalJsonSha256(identity),
-  ]);
-}
-
-type Counts = Omit<z.infer<typeof operationCountsSchema>, "total">;
-
-function withTotal(counts: Counts): z.infer<typeof operationCountsSchema> {
-  const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
-  if (!Number.isSafeInteger(total)) {
-    throw new Error("Candidate request accounting exceeds safe integer bounds");
+  const frozenTargets = CANDIDATE_SOURCE_SNAPSHOT_TARGET_BINDINGS;
+  if (
+    canonicalJsonSha256(identity.source) ===
+      canonicalJsonSha256(CANDIDATE_SOURCE_SNAPSHOT_BOUND_SOURCE) &&
+    identity.targets.openData.bucket === frozenTargets.openData.bucket &&
+    identity.targets.openData.ipnsLabel === frozenTargets.openData.ipnsLabel &&
+    identity.targets.openData.ipnsNetworkKey ===
+      frozenTargets.openData.ipnsNetworkKey &&
+    identity.targets.openData.priorCid === frozenTargets.openData.priorCid &&
+    identity.targets.queryTable.bucket === frozenTargets.queryTable.bucket &&
+    identity.targets.queryTable.ipnsLabel ===
+      frozenTargets.queryTable.ipnsLabel &&
+    identity.targets.queryTable.ipnsNetworkKey ===
+      frozenTargets.queryTable.ipnsNetworkKey &&
+    identity.targets.queryTable.priorCid === frozenTargets.queryTable.priorCid
+  ) {
+    // The object graph and remote keys were already materialized beneath this
+    // namespace. Operational request/cost envelopes may be superseded without
+    // changing immutable artifact identity.
+    return CANDIDATE_SOURCE_SNAPSHOT_FROZEN_NAMESPACE_ID;
   }
-  return { ...counts, total };
+  return deterministicId("snapshotns", [
+    "2.0.0",
+    "Publish/pasco/candidate-source-snapshot-namespace",
+    canonicalJsonSha256({
+      artifactRepresentationVersion: identity.artifactRepresentationVersion,
+      source: identity.source,
+      targets: identity.targets,
+    }),
+  ]);
 }
 
 function usd(value: number): number {
@@ -896,19 +944,18 @@ function usd(value: number): number {
   return Number(value.toFixed(12));
 }
 
-function requestCost(
-  counts: z.infer<typeof operationCountsSchema>,
-  pricing: CandidateSourceSnapshotPricing,
-): number {
-  const rates = pricing.operationRates;
-  return usd(
-    (counts.classAMutations * rates.classAMutationUsdPerThousand +
-      counts.classBReads * rates.classBReadUsdPerThousand +
-      counts.freeOperations * rates.freeOperationUsdPerThousand +
-      counts.namesApiOperations * rates.namesApiUsdPerThousand +
-      counts.publicResolverOperations * rates.publicResolverUsdPerThousand) /
-      1_000,
-  );
+export type CandidateSourceSnapshotRequestCategory =
+  (typeof CANDIDATE_SOURCE_SNAPSHOT_REQUEST_CATEGORY_ORDER)[number];
+
+export function candidateSourceSnapshotRequestCategory(
+  envelopeValue: CandidateSourceSnapshotRequestEnvelope,
+  category: CandidateSourceSnapshotRequestCategory,
+): { maximumRequests: number; successfulRequests: number } {
+  const envelope =
+    candidateSourceSnapshotRequestEnvelopeSchema.parse(envelopeValue);
+  const [successfulRequests, maximumRequests] =
+    envelope.categoryRequests[category];
+  return { maximumRequests, successfulRequests };
 }
 
 export function createCandidateSourceSnapshotRequestEnvelope(input: {
@@ -924,53 +971,44 @@ export function createCandidateSourceSnapshotRequestEnvelope(input: {
     .positive()
     .max(32)
     .parse(input.recoveryObservationCyclesPerDomain ?? 8);
-  const successfulExecution = withTotal({
-    classAMutations: objectCount,
-    classBReads: 0,
-    freeOperations: 0,
-    namesApiOperations: 4,
-    publicResolverOperations: 4,
-  });
-  const attempts = limits.maxRetries + 1;
-  const maximumAttempts = withTotal({
-    classAMutations: successfulExecution.classAMutations * attempts,
-    classBReads: successfulExecution.classBReads * attempts,
-    freeOperations: successfulExecution.freeOperations,
-    namesApiOperations: successfulExecution.namesApiOperations * attempts,
-    publicResolverOperations:
-      successfulExecution.publicResolverOperations * attempts,
-  });
-  // Each cycle reads one control-plane value and two independent public
-  // resolvers per domain. One bounded reverse rollback allowance adds a Names
-  // update + confirmation and two public confirmations, each with retries.
-  const recoveryAllowance = {
-    ...withTotal({
-      classAMutations: 0,
-      classBReads: 0,
-      freeOperations: 0,
-      namesApiOperations: cycles * 2 + attempts * 2,
-      publicResolverOperations: cycles * 4 + attempts * 2,
-    }),
-    observationCyclesPerDomain: cycles,
-  };
-  const ambiguousInspectionCount = Math.min(
-    objectCount,
-    Math.max(
-      0,
-      limits.maxRequests - maximumAttempts.total - recoveryAllowance.total,
-    ),
+  if (cycles !== 8) {
+    throw new Error(
+      "Candidate request envelope requires the reviewed eight-cycle recovery bound",
+    );
+  }
+  const uploadMaximum = objectCount * (limits.maxRetries + 1);
+  const ambiguousMaximum = Math.min(24_000, uploadMaximum);
+  const nonVerificationMaximum =
+    uploadMaximum + ambiguousMaximum + 48 + 2 + 42 + 338 + 44;
+  const finalVerificationMaximum = limits.maxRequests - nonVerificationMaximum;
+  const finalVerificationRequired = 74_727;
+  const finalVerificationHeadroom =
+    finalVerificationMaximum - finalVerificationRequired;
+  if (finalVerificationHeadroom <= 0) {
+    throw new Error(
+      "Candidate request envelope lacks protected final-verification headroom",
+    );
+  }
+  const categoryRequests = {
+    ambiguous_upload_inspection: [0, ambiguousMaximum],
+    bucket_names_preflight: [8, 48],
+    // Initial prior proof, a fresh per-effect fence, and post-effect target
+    // verification: three resolvers × two domains × three cycles.
+    control_public_observation: [18, 42],
+    final_credential_free_verification: [8_303, finalVerificationMaximum],
+    names_mutation: [2, 2],
+    recovery: [0, 338],
+    rollback: [0, 44],
+    upload_provider_cid: [objectCount, uploadMaximum],
+  } as const;
+  const maximumTotalRequests = Object.values(categoryRequests).reduce(
+    (sum, category) => sum + category[1],
+    0,
   );
-  const ambiguousObjectInspectionAllowance = withTotal({
-    classAMutations: 0,
-    classBReads: ambiguousInspectionCount,
-    freeOperations: 0,
-    namesApiOperations: 0,
-    publicResolverOperations: 0,
-  });
-  const maximumTotalRequests =
-    maximumAttempts.total +
-    recoveryAllowance.total +
-    ambiguousObjectInspectionAllowance.total;
+  const successfulTotalRequests = Object.values(categoryRequests).reduce(
+    (sum, category) => sum + category[0],
+    0,
+  );
   if (
     objectCount > limits.maxObjects ||
     maximumTotalRequests > limits.maxRequests
@@ -980,12 +1018,20 @@ export function createCandidateSourceSnapshotRequestEnvelope(input: {
     );
   }
   return candidateSourceSnapshotRequestEnvelopeSchema.parse({
-    ambiguousObjectInspectionAllowance,
-    maximumAttempts,
+    categoryRequests,
+    finalVerification: {
+      deterministicRequiredMaximumRequests: finalVerificationRequired,
+      logicalRequests: 8_303,
+      maximumRedirectsPerAttempt: 2,
+      maximumTransportAttemptsPerLogicalRequest: 3,
+      nonParquetLogicalRequests: 109,
+      parquetLogicalRequests: 8_194,
+      protectedHeadroomRequests: finalVerificationHeadroom,
+      schemaVersion: "candidate-final-verification-budget-v1",
+    },
     maximumTotalRequests,
-    recoveryAllowance,
-    schemaVersion: "candidate-request-envelope-v2",
-    successfulExecution,
+    schemaVersion: "candidate-request-envelope-v3",
+    successfulTotalRequests,
   });
 }
 
@@ -1011,26 +1057,18 @@ export function createCandidateSourceSnapshotCostEnvelope(input: {
   const storageUsd = usd(
     (inventoryBytes / 1024 ** 3) * pricing.storageUsdPerGib,
   );
-  const successfulRequestUsd = requestCost(
-    requests.successfulExecution,
-    pricing,
+  const successfulRequestUsd = usd(
+    (requests.successfulTotalRequests *
+      pricing.operationRates.classAMutationUsdPerThousand) /
+      1_000,
   );
-  const maximumAttemptRequestUsd = requestCost(
-    requests.maximumAttempts,
-    pricing,
-  );
-  const recoveryRequestUsd = requestCost(requests.recoveryAllowance, pricing);
-  const ambiguousObjectInspectionUsd = requestCost(
-    requests.ambiguousObjectInspectionAllowance,
-    pricing,
+  const maximumAttemptRequestUsd = usd(
+    (requests.maximumTotalRequests *
+      pricing.operationRates.classAMutationUsdPerThousand) /
+      1_000,
   );
   const incrementalExecutionUsd = usd(storageUsd + successfulRequestUsd);
-  const maximumIncrementalUsd = usd(
-    storageUsd +
-      maximumAttemptRequestUsd +
-      recoveryRequestUsd +
-      ambiguousObjectInspectionUsd,
-  );
+  const maximumIncrementalUsd = usd(storageUsd + maximumAttemptRequestUsd);
   const maximumTotalUsd = usd(
     maximumIncrementalUsd + pricing.fixedAccountPlan.monthlyUsd,
   );
@@ -1042,13 +1080,11 @@ export function createCandidateSourceSnapshotCostEnvelope(input: {
     incrementalExecutionUsd,
     maximumIncrementalUsd,
     maximumTotalUsd,
-    recoveryRequestUsd,
     requestUsd: {
-      ambiguousObjectInspections: ambiguousObjectInspectionUsd,
       maximumAttempts: maximumAttemptRequestUsd,
       successfulExecution: successfulRequestUsd,
     },
-    schemaVersion: "candidate-cost-envelope-v2",
+    schemaVersion: "candidate-cost-envelope-v3",
     storageUsd,
   });
 }

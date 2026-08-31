@@ -2460,7 +2460,7 @@ export class PublicIpnsProvider implements OracleMcpProvider {
       sha256: config.expectedPlanSha256,
     });
     const planValue = parseJson(planBytes, "plan");
-    if (planValue.version === "2.0.0") {
+    if (planValue.version === "2.1.0") {
       const initialized = await initializeCandidateSourceSnapshot({
         config,
         ...(onStage ? { onStage } : {}),

@@ -2,6 +2,7 @@ import {
   validateCandidateSourceSnapshotDemoPlan,
   type CandidateSourceSnapshotDemoPlan,
 } from "./candidate-source-snapshot-demo.js";
+import { sha256 } from "../lib/hash.js";
 
 export type CandidateSourceSnapshotIpnsDomain = "open_data" | "query_table";
 
@@ -14,6 +15,7 @@ export interface CandidateSourceSnapshotIpnsIntent {
   domain: CandidateSourceSnapshotIpnsDomain;
   intentId: string;
   mutationAttemptCount: number;
+  rollbackAttemptCount: number;
   planId: string;
   planSha256: string;
   priorCid: string;
@@ -21,13 +23,17 @@ export interface CandidateSourceSnapshotIpnsIntent {
   rollbackPosition: 1 | 2;
   state: string;
   targetCid: string;
+  updateAttemptCount: number;
   uploadClosureId: string;
 }
 
 export interface CandidateSourceSnapshotIpnsReplayAuthorization {
   authorizationId: string;
   authorizationSha256: string;
+  authorizationStatement: string;
   authorizedAttempt: number;
+  authorizedAt: string;
+  authorizerReference: string;
   domain: CandidateSourceSnapshotIpnsDomain;
   intentId: string;
   planId: string;
@@ -57,7 +63,7 @@ export interface CandidateSourceSnapshotIpnsMutationCommand {
 
 export interface CandidateSourceSnapshotIpnsRollbackCommand {
   action: "rollback";
-  attemptNumber: 1;
+  attemptNumber: 1 | 2 | 3;
   authorizationId: string;
   authorizationSha256: string;
   commandId: string;
@@ -72,13 +78,55 @@ export interface CandidateSourceSnapshotIpnsRollbackCommand {
 export interface CandidateSourceSnapshotIpnsRollbackAuthorization {
   authorizationId: string;
   authorizationSha256: string;
-  authorizedAttempt: 1;
+  authorizationStatement: string;
+  authorizedAttempt: 1 | 2 | 3;
+  authorizedAt: string;
+  authorizerReference: string;
   domain: "open_data";
   intentId: string;
   planId: string;
   planSha256: string;
   priorCid: string;
   targetCid: string;
+}
+
+type CandidateSourceSnapshotIpnsRetryAuthorization =
+  | CandidateSourceSnapshotIpnsReplayAuthorization
+  | CandidateSourceSnapshotIpnsRollbackAuthorization;
+
+export function renderCandidateSourceSnapshotIpnsRetryAuthorizationStatement(
+  authorization: Pick<
+    CandidateSourceSnapshotIpnsRetryAuthorization,
+    | "authorizedAttempt"
+    | "domain"
+    | "intentId"
+    | "planId"
+    | "planSha256"
+    | "priorCid"
+    | "targetCid"
+  >,
+  direction: "rollback" | "update",
+): string {
+  return `I authorize candidate source-snapshot IPNS ${direction} attempt ${authorization.authorizedAttempt} for plan ${authorization.planId}, SHA-256 ${authorization.planSha256}, domain ${authorization.domain}, intent ${authorization.intentId}, immutable prior ${authorization.priorCid}, and approved target ${authorization.targetCid}.`;
+}
+
+function authorizationEnvelopeIsExact(
+  authorization: CandidateSourceSnapshotIpnsRetryAuthorization,
+  direction: "rollback" | "update",
+): boolean {
+  const authorizedAt = new Date(authorization.authorizedAt);
+  const statement =
+    renderCandidateSourceSnapshotIpnsRetryAuthorizationStatement(
+      authorization,
+      direction,
+    );
+  return (
+    /^[a-z0-9][a-z0-9_-]{2,127}$/.test(authorization.authorizerReference) &&
+    !Number.isNaN(authorizedAt.valueOf()) &&
+    authorizedAt.toISOString() === authorization.authorizedAt &&
+    authorization.authorizationStatement === statement &&
+    authorization.authorizationSha256 === sha256(statement)
+  );
 }
 
 export type CandidateSourceSnapshotIpnsCommand =
@@ -91,6 +139,9 @@ export interface CandidateSourceSnapshotIpnsDurableAuthorization {
 }
 
 export interface CandidateSourceSnapshotIpnsBoundary {
+  observeIdentity(
+    domain: CandidateSourceSnapshotIpnsDomain,
+  ): Promise<CandidateSourceSnapshotIpnsObservation>;
   mutateAndObserve(
     command: CandidateSourceSnapshotIpnsMutationCommand,
   ): Promise<CandidateSourceSnapshotIpnsObservation>;
@@ -100,6 +151,9 @@ export interface CandidateSourceSnapshotIpnsBoundary {
 }
 
 export interface CandidateSourceSnapshotIpnsJournal {
+  beforeFreshnessObservation(
+    command: CandidateSourceSnapshotIpnsCommand,
+  ): Promise<void>;
   beforeMutation(
     command: CandidateSourceSnapshotIpnsMutationCommand,
   ): Promise<CandidateSourceSnapshotIpnsDurableAuthorization | null>;
@@ -112,6 +166,10 @@ export interface CandidateSourceSnapshotIpnsJournal {
   markVerified(
     command: CandidateSourceSnapshotIpnsMutationCommand,
   ): Promise<void>;
+  recordFreshnessObservation(input: {
+    command: CandidateSourceSnapshotIpnsCommand;
+    observation: Required<CandidateSourceSnapshotIpnsObservation>;
+  }): Promise<void>;
   recordObservation(input: {
     command: CandidateSourceSnapshotIpnsCommand;
     observation: Required<CandidateSourceSnapshotIpnsObservation>;
@@ -180,17 +238,28 @@ function validateIntents(
       intent.cutoverPosition !== cutoverPosition ||
       intent.rollbackPosition !== rollbackPosition ||
       intent.intentId.length === 0 ||
-      intent.state !== "prior_confirmed" ||
+      ![
+        "prior_confirmed",
+        "verified",
+        ...(intent.domain === "open_data" ? ["rollback_ambiguous"] : []),
+        ...(intent.domain === "query_table"
+          ? ["update_failed_prior_confirmed", "rolled_back"]
+          : []),
+      ].includes(intent.state) ||
       intent.planId !== plan.planId ||
       intent.planSha256 !== plan.planSha256 ||
       intent.priorCid !== target.priorCid ||
       intent.targetCid !== target.targetCid ||
       !Number.isInteger(intent.mutationAttemptCount) ||
-      intent.mutationAttemptCount < 0
+      intent.mutationAttemptCount < 0 ||
+      !Number.isInteger(intent.updateAttemptCount) ||
+      intent.updateAttemptCount < 0 ||
+      !Number.isInteger(intent.rollbackAttemptCount) ||
+      intent.rollbackAttemptCount < 0 ||
+      intent.mutationAttemptCount !==
+        intent.updateAttemptCount + intent.rollbackAttemptCount
     ) {
-      throw new Error(
-        "Cutover intent is not the exact prior-confirmed plan intent",
-      );
+      throw new Error("Cutover intent is not an exact recoverable plan intent");
     }
     byDomain.set(intent.domain, intent);
   }
@@ -198,6 +267,23 @@ function validateIntents(
   const queryTable = byDomain.get("query_table");
   if (!openData || !queryTable) {
     throw new Error("Cutover requires both publication domains");
+  }
+  if (queryTable.state === "verified" && openData.state !== "verified") {
+    throw new Error(
+      "Query-table verification cannot precede open-data verification",
+    );
+  }
+  if (
+    openData.state === "rollback_ambiguous" &&
+    ![
+      "prior_confirmed",
+      "update_failed_prior_confirmed",
+      "rolled_back",
+    ].includes(queryTable.state)
+  ) {
+    throw new Error(
+      "Open-data rollback recovery requires conclusive query-table non-mutation",
+    );
   }
   return { open_data: openData, query_table: queryTable };
 }
@@ -209,9 +295,11 @@ function validateRollbackAuthorization(
 ): CandidateSourceSnapshotIpnsRollbackAuthorization | null {
   if (!authorization) return null;
   if (
+    !authorizationEnvelopeIsExact(authorization, "rollback") ||
     !/^snapshotdemoreplay_[a-f0-9]{32}$/.test(authorization.authorizationId) ||
     !/^[a-f0-9]{64}$/.test(authorization.authorizationSha256) ||
-    authorization.authorizedAttempt !== 1 ||
+    authorization.authorizedAttempt !== intent.rollbackAttemptCount + 1 ||
+    authorization.authorizedAttempt > 3 ||
     authorization.domain !== "open_data" ||
     authorization.intentId !== intent.intentId ||
     authorization.planId !== plan.planId ||
@@ -235,7 +323,8 @@ function validateReplayAuthorizations(
   CandidateSourceSnapshotIpnsReplayAuthorization
 > {
   const expected = Object.values(intents).filter(
-    (intent) => intent.mutationAttemptCount > 0,
+    (intent) =>
+      intent.state === "prior_confirmed" && intent.updateAttemptCount > 0,
   );
   if (authorizations.length !== expected.length) {
     throw new Error(
@@ -250,13 +339,14 @@ function validateReplayAuthorizations(
   for (const authorization of authorizations) {
     const intent = intents[authorization.domain];
     if (
+      !authorizationEnvelopeIsExact(authorization, "update") ||
       seenDomains.has(authorization.domain) ||
       !/^snapshotdemoreplay_[a-f0-9]{32}$/.test(
         authorization.authorizationId,
       ) ||
       !/^[a-f0-9]{64}$/.test(authorization.authorizationSha256) ||
-      intent.mutationAttemptCount === 0 ||
-      authorization.authorizedAttempt !== intent.mutationAttemptCount + 1 ||
+      intent.updateAttemptCount === 0 ||
+      authorization.authorizedAttempt !== intent.updateAttemptCount + 1 ||
       authorization.intentId !== intent.intentId ||
       authorization.planId !== plan.planId ||
       authorization.planSha256 !== plan.planSha256 ||
@@ -278,7 +368,7 @@ function mutationCommand(
   intent: CandidateSourceSnapshotIpnsIntent,
   authorization: CandidateSourceSnapshotIpnsReplayAuthorization | undefined,
 ): CandidateSourceSnapshotIpnsMutationCommand {
-  const attemptNumber = intent.mutationAttemptCount + 1;
+  const attemptNumber = intent.updateAttemptCount + 1;
   return {
     action: "mutate",
     attemptNumber,
@@ -301,10 +391,10 @@ function rollbackCommand(
 ): CandidateSourceSnapshotIpnsRollbackCommand {
   return {
     action: "rollback",
-    attemptNumber: 1,
+    attemptNumber: authorization.authorizedAttempt,
     authorizationId: authorization.authorizationId,
     authorizationSha256: authorization.authorizationSha256,
-    commandId: `${plan.planId}:${intent.intentId}:rollback:1`,
+    commandId: `${plan.planId}:${intent.intentId}:rollback:${authorization.authorizedAttempt}`,
     domain: "open_data",
     intentId: intent.intentId,
     planId: plan.planId,
@@ -396,6 +486,20 @@ async function mutate(
   boundary: CandidateSourceSnapshotIpnsBoundary,
   journal: CandidateSourceSnapshotIpnsJournal,
 ): Promise<Required<CandidateSourceSnapshotIpnsObservation>> {
+  await journal.beforeFreshnessObservation(command);
+  const freshness = validateObservation(
+    await boundary.observeIdentity(command.domain),
+    command,
+  );
+  if (freshness.classification === "target" && command.attemptNumber === 1) {
+    throw new Error(
+      "IPNS target freshness requires a prior terminal update attempt",
+    );
+  }
+  await journal.recordFreshnessObservation({ command, observation: freshness });
+  if (freshness.classification !== "prior") {
+    return freshness;
+  }
   requireJournalAuthorization(command, await journal.beforeMutation(command));
   const observation = validateObservation(
     await boundary.mutateAndObserve(command),
@@ -404,6 +508,32 @@ async function mutate(
   await journal.recordObservation({ command, observation });
   if (observation.classification === "target") {
     await journal.markVerified(command);
+  }
+  return observation;
+}
+
+async function executeRollback(
+  command: CandidateSourceSnapshotIpnsRollbackCommand,
+  boundary: CandidateSourceSnapshotIpnsBoundary,
+  journal: CandidateSourceSnapshotIpnsJournal,
+): Promise<Required<CandidateSourceSnapshotIpnsObservation>> {
+  await journal.beforeFreshnessObservation(command);
+  const freshness = validateObservation(
+    await boundary.observeIdentity(command.domain),
+    command,
+  );
+  await journal.recordFreshnessObservation({ command, observation: freshness });
+  if (freshness.classification !== "target") {
+    return freshness;
+  }
+  requireJournalAuthorization(command, await journal.beforeRollback(command));
+  const observation = validateObservation(
+    await boundary.rollbackAndObserve(command),
+    command,
+  );
+  await journal.recordObservation({ command, observation });
+  if (observation.classification === "prior") {
+    await journal.markRolledBack(command);
   }
   return observation;
 }
@@ -429,6 +559,45 @@ export async function executeCandidateSourceSnapshotIpnsController(input: {
     input.approvalId,
     input.uploadClosureId,
   );
+  if (intents.open_data.state === "rollback_ambiguous") {
+    const rollbackAuthorization = validateRollbackAuthorization(
+      plan,
+      intents.open_data,
+      input.rollbackAuthorization,
+    );
+    if (!rollbackAuthorization) {
+      throw new Error(
+        "Ambiguous rollback recovery requires exact durable rollback authorization",
+      );
+    }
+    const command = rollbackCommand(
+      plan,
+      intents.open_data,
+      rollbackAuthorization,
+    );
+    const observation = await executeRollback(
+      command,
+      input.boundary,
+      input.journal,
+    );
+    if (observation.classification === "prior") {
+      return {
+        openData: "target",
+        planId: plan.planId,
+        planSha256: plan.planSha256,
+        queryTable: "prior",
+        reason: "query_table_prior_observed",
+        rollback: "prior",
+        status: "rolled_back",
+      };
+    }
+    return stoppedResult(plan, {
+      openData: "target",
+      queryTable: "prior",
+      reason: `rollback_${observation.classification === "target" ? "target_observed" : observation.classification}`,
+      rollback: observation.classification,
+    });
+  }
   const replayAuthorizations = validateReplayAuthorizations(
     plan,
     intents,
@@ -440,11 +609,13 @@ export async function executeCandidateSourceSnapshotIpnsController(input: {
     intents.open_data,
     replayAuthorizations.get("open_data"),
   );
-  const openObservation = await mutate(
-    openCommand,
-    input.boundary,
-    input.journal,
-  );
+  const openObservation =
+    intents.open_data.state === "verified"
+      ? ({
+          classification: "target",
+          observedCid: intents.open_data.targetCid,
+        } as const)
+      : await mutate(openCommand, input.boundary, input.journal);
   if (openObservation.classification !== "target") {
     return stoppedResult(plan, {
       openData: openObservation.classification,
@@ -459,11 +630,13 @@ export async function executeCandidateSourceSnapshotIpnsController(input: {
     intents.query_table,
     replayAuthorizations.get("query_table"),
   );
-  const queryObservation = await mutate(
-    queryCommand,
-    input.boundary,
-    input.journal,
-  );
+  const queryObservation =
+    intents.query_table.state === "verified"
+      ? ({
+          classification: "target",
+          observedCid: intents.query_table.targetCid,
+        } as const)
+      : await mutate(queryCommand, input.boundary, input.journal);
   if (queryObservation.classification === "target") {
     return {
       openData: "target",
@@ -503,20 +676,12 @@ export async function executeCandidateSourceSnapshotIpnsController(input: {
     intents.open_data,
     rollbackAuthorization,
   );
-  requireJournalAuthorization(
+  const rollbackObservation = await executeRollback(
     rollback,
-    await input.journal.beforeRollback(rollback),
+    input.boundary,
+    input.journal,
   );
-  const rollbackObservation = validateObservation(
-    await input.boundary.rollbackAndObserve(rollback),
-    rollback,
-  );
-  await input.journal.recordObservation({
-    command: rollback,
-    observation: rollbackObservation,
-  });
   if (rollbackObservation.classification === "prior") {
-    await input.journal.markRolledBack(rollback);
     return {
       openData: "target",
       planId: plan.planId,

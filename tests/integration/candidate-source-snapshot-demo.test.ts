@@ -11,7 +11,10 @@ import {
 } from "../../src/db/candidate-source-snapshot-demo.js";
 import { renderCandidateSourceSnapshotAuthorizationStatement } from "../../src/db/candidate-source-snapshot-approval.js";
 import { runMigrations } from "../../src/db/migrations.js";
-import { syntheticCandidateSourceSnapshotDemo } from "../helpers/candidate-source-snapshot-demo.js";
+import {
+  recordSuccessfulCandidateSourceSnapshotPreflight,
+  syntheticCandidateSourceSnapshotDemo,
+} from "../helpers/candidate-source-snapshot-demo.js";
 
 const adminDatabaseUrl =
   process.env.ORACLE_TEST_DATABASE_URL ??
@@ -26,7 +29,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(databaseUrl)).toHaveLength(28);
+  expect(await runMigrations(databaseUrl)).toHaveLength(30);
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });
 
@@ -128,7 +131,7 @@ describe("candidate source-snapshot v2 durability", () => {
           )
         `,
       ).rejects.toThrow(
-        "not bound to the exact authorization and confirmed immutable plan",
+        "requires the exact v2.1 category authorization binding and statement",
       );
     } finally {
       await sql.end({ timeout: 5 });
@@ -190,6 +193,10 @@ describe("candidate source-snapshot v2 durability", () => {
         planId: fixture.plan.planId,
         planSha256: fixture.plan.planSha256,
       });
+      await recordSuccessfulCandidateSourceSnapshotPreflight(
+        databaseUrl,
+        fixture.plan,
+      );
       const approval = await approveCandidateSourceSnapshotDemoPlan(
         databaseUrl,
         {
@@ -199,7 +206,9 @@ describe("candidate source-snapshot v2 durability", () => {
             renderCandidateSourceSnapshotAuthorizationStatement(
               fixture.plan,
               fixture.exactUpload,
+              "1".repeat(40),
             ),
+          implementationCommitSha: "1".repeat(40),
           planId: fixture.plan.planId,
           planSha256: fixture.plan.planSha256,
         },
@@ -207,6 +216,7 @@ describe("candidate source-snapshot v2 durability", () => {
       await beginCandidateSourceSnapshotDemoExecution(databaseUrl, {
         approvalId: approval.approvalId,
         executorEnabled: true,
+        implementationCommitSha: "1".repeat(40),
         planId: fixture.plan.planId,
         planSha256: fixture.plan.planSha256,
       });
@@ -252,8 +262,8 @@ describe("candidate source-snapshot v2 durability", () => {
       expect(inspectionReplay).toMatchObject({
         accounting: {
           classAMutationCount: 1,
-          classBReadCount: 1,
-          requestCount: 2,
+          classBReadCount: 3,
+          requestCount: 10,
         },
         attempt: inspection.attempt,
         replayedResult: null,

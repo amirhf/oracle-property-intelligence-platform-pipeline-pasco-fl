@@ -1,11 +1,23 @@
 import path from "node:path";
 
 import {
-  loadCandidateSourceSnapshotDemoExecutionAdmission,
+  approveCandidateSourceSnapshotDemoPlan,
+  beginCandidateSourceSnapshotDemoExecution,
+  confirmCandidateSourceSnapshotDemoCapacity,
+  createCandidateSourceSnapshotDemoIpnsIntents,
   loadCandidateSourceSnapshotDemoPlan,
   PostgresCandidateSourceSnapshotUploadJournal,
-  type CandidateSourceSnapshotDurableState,
+  recordCandidateSourceSnapshotIpnsRetryAuthorization,
+  recordCandidateSourceSnapshotDemoPlan,
 } from "../db/candidate-source-snapshot-demo.js";
+import {
+  completeCandidateSourceSnapshotDemoPlan,
+  loadCompletedCandidateSourceSnapshotDemoReplay,
+  recordCandidateSourceSnapshotUploadClosure,
+  type CandidateSourceSnapshotUploadClosure,
+} from "../db/candidate-source-snapshot-completion.js";
+import { createCandidateSourceSnapshotApprovalIdentity } from "../db/candidate-source-snapshot-approval.js";
+import { recordCompatibleCandidateSourceSnapshotPlanDerivation } from "../db/candidate-source-snapshot-plan-derivation.js";
 import {
   buildCandidateSourceSnapshotDemo,
   CANDIDATE_SOURCE_SNAPSHOT_BOUND_COMPACT_MANIFEST,
@@ -33,10 +45,21 @@ import {
   type CandidateSourceSnapshotUploadRecord,
 } from "./candidate-source-snapshot-controls.js";
 import {
-  assertCandidateSourceSnapshotIpnsAdmission,
   executeCandidateSourceSnapshotUploads,
   type CandidateSourceSnapshotUploadSummary,
+  type CandidateSourceSnapshotUploadTransport,
 } from "./candidate-source-snapshot-upload.js";
+import {
+  executeCandidateSourceSnapshotIpnsController,
+  type CandidateSourceSnapshotIpnsBoundary,
+  type CandidateSourceSnapshotIpnsControllerResult,
+  type CandidateSourceSnapshotIpnsIntent,
+  type CandidateSourceSnapshotIpnsJournal,
+  type CandidateSourceSnapshotIpnsReplayAuthorization,
+  type CandidateSourceSnapshotIpnsRollbackAuthorization,
+} from "./candidate-source-snapshot-ipns-controller.js";
+import { candidateSourceSnapshotRemoteRuntimeFactory } from "./candidate-source-snapshot-remote-runtime.js";
+import type { EnabledCandidateSourceSnapshotExecutionConfig } from "./candidate-source-snapshot-executor-config.js";
 
 function uploadObject(
   record: CandidateSourceSnapshotUploadRecord,
@@ -140,9 +163,8 @@ export interface CandidateSourceSnapshotIpnsCutoverBoundary {
 }
 
 /**
- * Closed cutover ordering for Session 2. Ambiguous/unexpected observations are
- * never overwritten. A definite second-domain failure rolls back the already
- * verified first domain in reverse order.
+ * Fail-closed compatibility shim. Session 2 IPNS effects are reachable only
+ * through executeCandidateSourceSnapshotSession2 and its durable controller.
  */
 export async function executeCandidateSourceSnapshotIpnsCutover(input: {
   boundary: CandidateSourceSnapshotIpnsCutoverBoundary;
@@ -158,32 +180,10 @@ export async function executeCandidateSourceSnapshotIpnsCutover(input: {
   openData: CandidateSourceSnapshotCutoverResult;
   queryTable: CandidateSourceSnapshotCutoverResult | "not_attempted";
 }> {
-  assertCandidateSourceSnapshotIpnsAdmission(input);
-  const openData = await input.boundary.mutateAndVerify(
-    "open_data",
-    input.plan.targets.openData.targetCid,
+  void input;
+  throw new Error(
+    "Legacy candidate IPNS cutover is disabled; use the durable Session 2 executor",
   );
-  if (openData !== "verified") {
-    return { openData, queryTable: "not_attempted" };
-  }
-  const queryTable = await input.boundary.mutateAndVerify(
-    "query_table",
-    input.plan.targets.queryTable.targetCid,
-  );
-  if (queryTable === "prior_confirmed_failure") {
-    const rollback = await input.boundary.rollbackAndVerify(
-      "open_data",
-      input.plan.targets.openData.priorCid,
-    );
-    if (rollback !== "verified") {
-      throw new Error(
-        "Candidate reverse rollback did not verify the prior CID",
-      );
-    }
-  }
-  // Ambiguous and unexpected-CID states intentionally receive no rollback or
-  // follow-up mutation; durable recovery must classify them first.
-  return { openData, queryTable };
 }
 
 export type CandidateSourceSnapshotSession2Result =
@@ -193,102 +193,384 @@ export type CandidateSourceSnapshotSession2Result =
       status: "executor_disabled";
     }
   | {
-      durableState: CandidateSourceSnapshotDurableState;
+      cutover: CandidateSourceSnapshotIpnsControllerResult;
+      executorEnabled: false;
       planId: string;
       planSha256: string;
-      status: "uploads_verified_ipns_requires_exact_intents";
+      status: "recovery_required";
       summary: CandidateSourceSnapshotUploadSummary;
+      uploadClosure: CandidateSourceSnapshotUploadClosure;
+    }
+  | {
+      completedRevision: number;
+      cutover: CandidateSourceSnapshotIpnsControllerResult;
+      executorEnabled: false;
+      planId: string;
+      planSha256: string;
+      status: "completed";
+      summary: CandidateSourceSnapshotUploadSummary;
+      uploadClosure: CandidateSourceSnapshotUploadClosure;
     };
 
+export interface CandidateSourceSnapshotSession2Authorization {
+  approvedAt: string;
+  approverReference: string;
+  authorizationStatement: string;
+  confirmedAt: string;
+  confirmedPlanName: "Filebase Pro" | "Filebase Pro or better";
+  confirmerReference: string;
+  intendedAt: string;
+  implementationCommitSha: string;
+  replayAuthorizations?: readonly CandidateSourceSnapshotIpnsReplayAuthorization[];
+  rollbackAuthorization?: CandidateSourceSnapshotIpnsRollbackAuthorization;
+}
+
 /**
- * Production-shaped entry point. It reloads the exact durable plan and refuses
- * to arm transport unless durable approval/execution admission already exists.
- * IPNS remains a separate exact-intent cutover through the function above.
+ * Network-shaped dependencies are created only after the process-scoped
+ * executor flag, exact plan, exact authorization bytes, and local capacity
+ * record have all been validated. This interface intentionally contains no
+ * default/mock implementation: the production composition root must provide
+ * the durable request gate, evidence sink, and closed Filebase/IPNS boundary.
+ */
+export interface CandidateSourceSnapshotSession2RemoteRuntime {
+  readonly boundary: CandidateSourceSnapshotIpnsBoundary;
+  readonly journal: CandidateSourceSnapshotIpnsJournal;
+  close(): Promise<void>;
+  prepareIntents(input: {
+    createInitialIntents: () => ReturnType<
+      typeof createCandidateSourceSnapshotDemoIpnsIntents
+    >;
+    intendedAt: string;
+    plan: CandidateSourceSnapshotDemoPlan;
+    rollbackAuthorization?: CandidateSourceSnapshotIpnsRollbackAuthorization;
+    uploadClosure: CandidateSourceSnapshotUploadClosure;
+  }): Promise<readonly CandidateSourceSnapshotIpnsIntent[]>;
+  readOnlyPreflight(): Promise<void>;
+  recordFinalVerification(input: {
+    approvalId: string;
+    localSource: CandidateSourceSnapshotLocalObjectSource;
+    plan: CandidateSourceSnapshotDemoPlan;
+    uploadClosure: CandidateSourceSnapshotUploadClosure;
+  }): Promise<void>;
+}
+
+export type CandidateSourceSnapshotSession2RemoteRuntimeFactory = (input: {
+  config: EnabledCandidateSourceSnapshotExecutionConfig;
+  databaseUrl: string;
+  plan: CandidateSourceSnapshotDemoPlan;
+}) => CandidateSourceSnapshotSession2RemoteRuntime;
+
+export interface CandidateSourceSnapshotSession2Dependencies {
+  confirmCapacity: typeof confirmCandidateSourceSnapshotDemoCapacity;
+  loadCompletedReplay: typeof loadCompletedCandidateSourceSnapshotDemoReplay;
+  prepareBundle: typeof prepareCandidateSourceSnapshotExecutionBundle;
+  recordPlan: typeof recordCandidateSourceSnapshotDemoPlan;
+  recordPlanDerivation: typeof recordCompatibleCandidateSourceSnapshotPlanDerivation;
+  remoteRuntimeFactory?: CandidateSourceSnapshotSession2RemoteRuntimeFactory;
+  uploadTransportFactory: (input: {
+    bundle: CandidateSourceSnapshotExecutionBundle;
+    config: EnabledCandidateSourceSnapshotExecutionConfig;
+    journal: PostgresCandidateSourceSnapshotUploadJournal;
+    s3Executor?: CandidateSourceSnapshotS3CommandExecutor;
+  }) => CandidateSourceSnapshotUploadTransport;
+}
+
+const defaultSession2Dependencies: CandidateSourceSnapshotSession2Dependencies =
+  {
+    confirmCapacity: confirmCandidateSourceSnapshotDemoCapacity,
+    loadCompletedReplay: loadCompletedCandidateSourceSnapshotDemoReplay,
+    prepareBundle: prepareCandidateSourceSnapshotExecutionBundle,
+    recordPlan: recordCandidateSourceSnapshotDemoPlan,
+    recordPlanDerivation: recordCompatibleCandidateSourceSnapshotPlanDerivation,
+    remoteRuntimeFactory: candidateSourceSnapshotRemoteRuntimeFactory,
+    uploadTransportFactory: ({ bundle, config, s3Executor }) =>
+      new RealCandidateSourceSnapshotFilebaseTransport({
+        config,
+        ...(s3Executor ? { executor: s3Executor } : {}),
+        source: bundle.localSource,
+      }),
+  };
+
+/**
+ * One fail-closed production entry point for exact authorization replay,
+ * resumable uploads, closed IPNS cutover, remote verification, and completion.
+ * A disabled executor returns before either remote adapter factory is called.
  */
 export async function executeCandidateSourceSnapshotSession2(input: {
+  authorization?: CandidateSourceSnapshotSession2Authorization;
   databaseUrl: string;
+  dependencies?: Partial<CandidateSourceSnapshotSession2Dependencies>;
   descriptor: CandidateSourceSnapshotBuildDescriptor;
   environment: NodeJS.ProcessEnv;
   s3Executor?: CandidateSourceSnapshotS3CommandExecutor;
 }): Promise<CandidateSourceSnapshotSession2Result> {
-  const bundle = await prepareCandidateSourceSnapshotExecutionBundle(
-    input.descriptor,
-  );
+  // Consume the process-scoped opt-in before any local preparation or config
+  // parsing can fail. Only the private copy may authorize this invocation;
+  // callers always observe the executor disabled on every exit path.
+  const executionEnvironment = { ...input.environment };
+  input.environment.CANDIDATE_DEMO_REMOTE_EXECUTOR_ENABLED = "false";
+  const dependencies: CandidateSourceSnapshotSession2Dependencies = {
+    ...defaultSession2Dependencies,
+    ...input.dependencies,
+  };
+  const bundle = await dependencies.prepareBundle(input.descriptor);
   const identity = {
     planId: bundle.build.plan.planId,
     planSha256: bundle.build.plan.planSha256,
   };
   const config = loadCandidateSourceSnapshotExecutionConfig(
-    input.environment,
+    executionEnvironment,
     bundle.build.plan,
   );
   if (!config.enabled) {
     return { ...identity, status: "executor_disabled" };
   }
-  const durable = await loadCandidateSourceSnapshotDemoPlan(
-    input.databaseUrl,
-    identity,
-  );
-  if (
-    durable.plan.planId !== bundle.build.plan.planId ||
-    durable.plan.planSha256 !== bundle.build.plan.planSha256 ||
-    durable.exactUpload.exactObjectCount !== bundle.build.exactObjectCount ||
-    durable.exactUpload.exactTotalBytes !== bundle.build.exactTotalBytes
-  ) {
+  if (!input.authorization) {
     throw new Error(
-      "Durable candidate plan differs from local immutable inputs",
+      "Candidate execution requires the exact human authorization input",
     );
   }
-  const admission = await loadCandidateSourceSnapshotDemoExecutionAdmission(
+  if (!dependencies.remoteRuntimeFactory) {
+    throw new Error(
+      "Candidate production IPNS runtime is unavailable; no remote effect was attempted",
+    );
+  }
+  const approvalIdentity = createCandidateSourceSnapshotApprovalIdentity({
+    approvedAt: input.authorization.approvedAt,
+    approverReference: input.authorization.approverReference,
+    exactUpload: createCandidateSourceSnapshotExactUploadBinding({
+      plan: bundle.build.plan,
+      planArtifact: bundle.build.planArtifact,
+    }),
+    implementationCommitSha: input.authorization.implementationCommitSha,
+    plan: bundle.build.plan,
+    statement: input.authorization.authorizationStatement,
+  });
+  if (approvalIdentity.approvalId !== config.approvalId) {
+    throw new Error(
+      "Configured approval ID does not match the exact authorization bytes",
+    );
+  }
+  const exactUpload = createCandidateSourceSnapshotExactUploadBinding({
+    plan: bundle.build.plan,
+    planArtifact: bundle.build.planArtifact,
+  });
+  await dependencies.recordPlan(input.databaseUrl, {
+    exactUpload,
+    objects: bundle.createObjects(),
+    plan: bundle.build.plan,
+  });
+  await dependencies.recordPlanDerivation(input.databaseUrl, {
+    derivedPlanId: bundle.build.plan.planId,
+    derivedPlanSha256: bundle.build.plan.planSha256,
+  });
+  await dependencies.confirmCapacity(input.databaseUrl, {
+    confirmedAt: input.authorization.confirmedAt,
+    confirmedPlanName: input.authorization.confirmedPlanName,
+    confirmerReference: input.authorization.confirmerReference,
+    ...identity,
+  });
+  const completedReplay = await dependencies.loadCompletedReplay(
     input.databaseUrl,
     {
-      approvalId: config.approvalId,
+      approvalId: approvalIdentity.approvalId,
+      implementationCommitSha: input.authorization.implementationCommitSha,
       ...identity,
     },
   );
-  if (
-    admission.state.state !== "executing" ||
-    admission.state.approvalCount !== 1 ||
-    admission.approval.approvalId !== config.approvalId ||
-    admission.capacityConfirmation.confirmedPlanName !==
-      "Filebase Pro or better" ||
-    admission.plan.planId !== durable.plan.planId ||
-    admission.plan.planSha256 !== durable.plan.planSha256 ||
-    admission.exactUpload.exactObjectCount !==
-      durable.exactUpload.exactObjectCount ||
-    admission.exactUpload.exactTotalBytes !==
-      durable.exactUpload.exactTotalBytes
-  ) {
-    throw new Error(
-      "Candidate execution requires the exact durable approval and executing state",
-    );
+  if (completedReplay) {
+    return {
+      ...completedReplay,
+      executorEnabled: false,
+      ...identity,
+      status: "completed",
+    };
   }
-  const journal = new PostgresCandidateSourceSnapshotUploadJournal(
-    input.databaseUrl,
-  );
-  const transport = new RealCandidateSourceSnapshotFilebaseTransport({
+  const remote = dependencies.remoteRuntimeFactory({
     config,
-    ...(input.s3Executor ? { executor: input.s3Executor } : {}),
-    source: bundle.localSource,
+    databaseUrl: input.databaseUrl,
+    plan: bundle.build.plan,
   });
-  const summary = await executeCandidateSourceSnapshotUploads({
-    backoff: async (attemptSequence) => {
-      await new Promise((resolve) =>
-        setTimeout(resolve, Math.min(1_000, attemptSequence * 250)),
+  try {
+    // This bounded, read-only preflight precedes durable approval and every
+    // upload/mutation. Any failure leaves the plan unapproved.
+    await remote.readOnlyPreflight();
+    const approval = await approveCandidateSourceSnapshotDemoPlan(
+      input.databaseUrl,
+      {
+        approvedAt: input.authorization.approvedAt,
+        approverReference: input.authorization.approverReference,
+        authorizationStatement: input.authorization.authorizationStatement,
+        implementationCommitSha: input.authorization.implementationCommitSha,
+        ...identity,
+      },
+    );
+    if (
+      approval.approvalId !== approvalIdentity.approvalId ||
+      approval.approvalSha256 !== approvalIdentity.approvalSha256
+    ) {
+      throw new Error(
+        "Durable approval replay differs from exact authorization",
       );
-    },
-    executorEnabled: true,
-    journal,
-    objects: bundle.createObjects(),
-    plan: admission.plan,
-    transport,
-    verifyLocalObject: async (object) =>
-      await bundle.localSource.verify(object),
-  });
-  return {
-    durableState: admission.state,
-    ...identity,
-    status: "uploads_verified_ipns_requires_exact_intents",
-    summary,
-  };
+    }
+    await beginCandidateSourceSnapshotDemoExecution(input.databaseUrl, {
+      approvalId: approval.approvalId,
+      executorEnabled: true,
+      implementationCommitSha: input.authorization.implementationCommitSha,
+      ...identity,
+    });
+    const durable = await loadCandidateSourceSnapshotDemoPlan(
+      input.databaseUrl,
+      identity,
+    );
+    if (
+      durable.plan.planId !== bundle.build.plan.planId ||
+      durable.plan.planSha256 !== bundle.build.plan.planSha256 ||
+      durable.exactUpload.exactObjectCount !== bundle.build.exactObjectCount ||
+      durable.exactUpload.exactTotalBytes !== bundle.build.exactTotalBytes
+    ) {
+      throw new Error(
+        "Durable candidate plan differs from local immutable inputs",
+      );
+    }
+    if (
+      durable.state.state !== "executing" ||
+      durable.state.approvalCount !== 1 ||
+      durable.plan.planId !== bundle.build.plan.planId ||
+      durable.plan.planSha256 !== bundle.build.plan.planSha256
+    ) {
+      throw new Error(
+        "Candidate execution requires the exact durable approval and executing state",
+      );
+    }
+    const journal = new PostgresCandidateSourceSnapshotUploadJournal(
+      input.databaseUrl,
+    );
+    const transport = dependencies.uploadTransportFactory({
+      bundle,
+      config,
+      journal,
+      ...(input.s3Executor ? { s3Executor: input.s3Executor } : {}),
+    });
+    const summary = await executeCandidateSourceSnapshotUploads({
+      backoff: async (attemptSequence) => {
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(1_000, attemptSequence * 250)),
+        );
+      },
+      executorEnabled: true,
+      journal,
+      objects: bundle.createObjects(),
+      plan: durable.plan,
+      transport,
+      verifyLocalObject: async (object) =>
+        await bundle.localSource.verify(object),
+    });
+    const uploadClosure = await recordCandidateSourceSnapshotUploadClosure(
+      input.databaseUrl,
+      {
+        approvalId: approval.approvalId,
+        ...identity,
+      },
+    );
+    // A first execution calls createInitialIntents exactly once; a recovery
+    // runtime loads the already-advanced intents instead. In either case both
+    // immutable domains must be returned prior-confirmed before the controller
+    // may perform its first mutation.
+    const intents = await remote.prepareIntents({
+      createInitialIntents: async () =>
+        await createCandidateSourceSnapshotDemoIpnsIntents(input.databaseUrl, {
+          ...identity,
+          intendedAt: input.authorization!.intendedAt,
+        }),
+      intendedAt: input.authorization.intendedAt,
+      plan: durable.plan,
+      ...(input.authorization.rollbackAuthorization
+        ? { rollbackAuthorization: input.authorization.rollbackAuthorization }
+        : {}),
+      uploadClosure,
+    });
+    for (const authorization of input.authorization.replayAuthorizations ??
+      []) {
+      await recordCandidateSourceSnapshotIpnsRetryAuthorization(
+        input.databaseUrl,
+        durable.plan,
+        { authorization, direction: "update" },
+      );
+    }
+    if (input.authorization.rollbackAuthorization) {
+      await recordCandidateSourceSnapshotIpnsRetryAuthorization(
+        input.databaseUrl,
+        durable.plan,
+        {
+          authorization: input.authorization.rollbackAuthorization,
+          direction: "rollback",
+        },
+      );
+    }
+    const cutover = await executeCandidateSourceSnapshotIpnsController({
+      approvalId: approval.approvalId,
+      boundary: remote.boundary,
+      executorEnabled: true,
+      intents,
+      journal: remote.journal,
+      plan: durable.plan,
+      replayAuthorizations: input.authorization.replayAuthorizations ?? [],
+      ...(input.authorization.rollbackAuthorization
+        ? { rollbackAuthorization: input.authorization.rollbackAuthorization }
+        : {}),
+      uploadClosureId: uploadClosure.closureId,
+    });
+    if (cutover.status !== "completed") {
+      return {
+        cutover,
+        executorEnabled: false,
+        ...identity,
+        status: "recovery_required",
+        summary,
+        uploadClosure,
+      };
+    }
+    await remote.recordFinalVerification({
+      approvalId: approval.approvalId,
+      localSource: bundle.localSource,
+      plan: durable.plan,
+      uploadClosure,
+    });
+    const completed = await completeCandidateSourceSnapshotDemoPlan(
+      input.databaseUrl,
+      {
+        cutover,
+        summary,
+        uploadClosure,
+        ...identity,
+      },
+    );
+    const storedResult = await dependencies.loadCompletedReplay(
+      input.databaseUrl,
+      {
+        approvalId: approval.approvalId,
+        implementationCommitSha: input.authorization.implementationCommitSha,
+        ...identity,
+      },
+    );
+    if (
+      !storedResult ||
+      storedResult.completedRevision !== completed.revision
+    ) {
+      throw new Error(
+        "Candidate completion did not replay its exact stored result",
+      );
+    }
+    return {
+      ...storedResult,
+      executorEnabled: false,
+      ...identity,
+      status: "completed",
+    };
+  } finally {
+    // The opt-in exists only in this process. Closing the runtime guarantees
+    // that no adapter survives a successful, stopped, or failed execution.
+    await remote.close();
+  }
 }

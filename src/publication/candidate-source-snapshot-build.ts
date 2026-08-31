@@ -20,9 +20,11 @@ import {
   CANDIDATE_SOURCE_SNAPSHOT_BOUND_SOURCE_PARQUET,
   CANDIDATE_SOURCE_SNAPSHOT_DISCLOSURE,
   CANDIDATE_SOURCE_SNAPSHOT_EXPECTED_COVERAGE,
+  CANDIDATE_SOURCE_SNAPSHOT_EXACT_PLAN_ARTIFACT_BYTES,
   CANDIDATE_SOURCE_SNAPSHOT_HARD_CEILINGS,
   CANDIDATE_SOURCE_SNAPSHOT_MAX_PLAN_ARTIFACT_BYTES,
   CANDIDATE_SOURCE_SNAPSHOT_PUBLICATION_CLASS,
+  CANDIDATE_SOURCE_SNAPSHOT_PLAN_REQUEST_CEILING,
   PROTECTED_CANDIDATE_SAMPLE_ROLLBACK,
   conservativeCandidateSourceSnapshotPricing,
   createCandidateSourceSnapshotCostEnvelope,
@@ -313,7 +315,10 @@ export async function buildCandidateSourceSnapshotDemo(options: {
   const preflight = candidateSourceSnapshotPreflightBindingSchema.parse(
     descriptor.preflight,
   );
-  const limits = { ...CANDIDATE_SOURCE_SNAPSHOT_HARD_CEILINGS };
+  const limits = {
+    ...CANDIDATE_SOURCE_SNAPSHOT_HARD_CEILINGS,
+    maxRequests: CANDIDATE_SOURCE_SNAPSHOT_PLAN_REQUEST_CEILING,
+  };
   const pricing = conservativeCandidateSourceSnapshotPricing({
     fixedAccountPlanEvidence: "human_confirmation_required",
     fixedAccountPlanMonthlyUsd: 7.5,
@@ -344,10 +349,6 @@ export async function buildCandidateSourceSnapshotDemo(options: {
   const prefixes = candidateSourceSnapshotPrefixes(namespaceId);
   const controlOutputRoot = path.join(
     safeRoot(descriptor.controlOutputRoot, "control output"),
-    namespaceId,
-  );
-  const planArtifactOutputRoot = path.join(
-    safeRoot(descriptor.planArtifactOutputRoot, "plan artifact output"),
     namespaceId,
   );
   const controls = await materializeCandidateSourceSnapshotControlArtifacts({
@@ -386,7 +387,7 @@ export async function buildCandidateSourceSnapshotDemo(options: {
     requestEnvelope,
   });
   const rollbackEvidence = preflight.protectedSampleRollback;
-  const plan = createCandidateSourceSnapshotDemoPlan({
+  const planValue = {
     artifactRepresentationVersion:
       CANDIDATE_SOURCE_SNAPSHOT_ARTIFACT_REPRESENTATION_VERSION,
     classification: {
@@ -402,6 +403,7 @@ export async function buildCandidateSourceSnapshotDemo(options: {
     costEnvelope,
     coverage: CANDIDATE_SOURCE_SNAPSHOT_EXPECTED_COVERAGE,
     disclaimer: CANDIDATE_SOURCE_SNAPSHOT_DISCLOSURE,
+    formatPadding: "",
     inventory: {
       inventoryRootCid:
         controls.controlArtifacts.objectInventory.indexArtifact.expectedCid,
@@ -451,8 +453,29 @@ export async function buildCandidateSourceSnapshotDemo(options: {
       },
     },
     version: CANDIDATE_SOURCE_SNAPSHOT_DEMO_PLAN_VERSION,
+  } satisfies Parameters<typeof createCandidateSourceSnapshotDemoPlan>[0];
+  const unpaddedPlan = createCandidateSourceSnapshotDemoPlan(planValue);
+  const unpaddedBytes = Buffer.from(`${canonicalJson(unpaddedPlan)}\n`, "utf8");
+  const paddingBytes =
+    CANDIDATE_SOURCE_SNAPSHOT_EXACT_PLAN_ARTIFACT_BYTES -
+    unpaddedBytes.byteLength;
+  if (paddingBytes < 0) {
+    throw new Error(
+      `Candidate v2.1 plan exceeds the frozen plan-artifact byte binding (${unpaddedBytes.byteLength} > ${CANDIDATE_SOURCE_SNAPSHOT_EXACT_PLAN_ARTIFACT_BYTES})`,
+    );
+  }
+  const plan = createCandidateSourceSnapshotDemoPlan({
+    ...planValue,
+    formatPadding: " ".repeat(paddingBytes),
   });
   const planBytes = Buffer.from(`${canonicalJson(plan)}\n`, "utf8");
+  if (
+    planBytes.byteLength !== CANDIDATE_SOURCE_SNAPSHOT_EXACT_PLAN_ARTIFACT_BYTES
+  ) {
+    throw new Error(
+      "Candidate v2.1 plan artifact did not preserve its exact byte binding",
+    );
+  }
   const planArtifact = {
     byteSize: planBytes.byteLength,
     expectedCid: await calculateIpfsCid(planBytes),
@@ -462,7 +485,11 @@ export async function buildCandidateSourceSnapshotDemo(options: {
   };
   const planArtifactObjectPath = await writeImmutablePlanArtifact({
     bytes: planBytes,
-    outputRoot: planArtifactOutputRoot,
+    outputRoot: path.join(
+      safeRoot(descriptor.planArtifactOutputRoot, "plan artifact output"),
+      namespaceId,
+      plan.planId,
+    ),
     remoteObjectKey: planArtifact.remoteObjectKey,
   });
   const exactUpload = createCandidateSourceSnapshotExactUploadBinding({

@@ -22,6 +22,11 @@ import {
   CANDIDATE_SOURCE_SNAPSHOT_EXPECTED_PRIOR_CIDS,
   CANDIDATE_SOURCE_SNAPSHOT_TARGET_BINDINGS,
 } from "../../src/publication/candidate-source-snapshot-preflight-binding.js";
+import {
+  admitCandidateSourceSnapshotPreflightRequest,
+  recordCandidateSourceSnapshotPreflightCycleOutcomes,
+  recordCandidateSourceSnapshotPreflightRequestOutcome,
+} from "../../src/db/candidate-source-snapshot-demo.js";
 
 const openPrior = CANDIDATE_SOURCE_SNAPSHOT_EXPECTED_PRIOR_CIDS.openData;
 const queryPrior = CANDIDATE_SOURCE_SNAPSHOT_EXPECTED_PRIOR_CIDS.queryTable;
@@ -221,6 +226,7 @@ export function syntheticCandidateSourceSnapshotDemo(): {
     costEnvelope,
     coverage: CANDIDATE_SOURCE_SNAPSHOT_EXPECTED_COVERAGE,
     disclaimer: CANDIDATE_SOURCE_SNAPSHOT_DISCLOSURE,
+    formatPadding: "",
     inventory,
     limits,
     namespaceId,
@@ -293,4 +299,61 @@ export function syntheticCandidateSourceSnapshotDemo(): {
     },
   ];
   return { exactUpload, objects, plan };
+}
+
+export async function recordSuccessfulCandidateSourceSnapshotPreflight(
+  databaseUrl: string,
+  plan: CandidateSourceSnapshotDemoPlan,
+): Promise<void> {
+  const requests = [
+    ["open_data", "bucket_head", null],
+    ["open_data", "names_read", "filebase_control"],
+    ["open_data", "public_resolve", "filebase_gateway"],
+    ["open_data", "public_resolve", "delegated_ipfs"],
+    ["query_table", "bucket_head", null],
+    ["query_table", "names_read", "filebase_control"],
+    ["query_table", "public_resolve", "filebase_gateway"],
+    ["query_table", "public_resolve", "delegated_ipfs"],
+  ] as const;
+  const admissions = await Promise.all(
+    requests.map(
+      async ([domain, operationKind, resolver]) =>
+        await admitCandidateSourceSnapshotPreflightRequest(databaseUrl, {
+          attemptSequence: 1,
+          domain,
+          operationKind,
+          planId: plan.planId,
+          planSha256: plan.planSha256,
+          redirectSequence: 0,
+          resolver,
+        }),
+    ),
+  );
+  for (const admission of admissions.filter(
+    (candidate) => candidate.resolver === null,
+  )) {
+    await recordCandidateSourceSnapshotPreflightRequestOutcome(databaseUrl, {
+      admission,
+      completedAt: "2026-08-31T00:00:00.000Z",
+      outcome: "succeeded",
+      receiptSha256: sha("8"),
+    });
+  }
+  for (const domain of ["open_data", "query_table"] as const) {
+    const cycle = admissions
+      .filter(
+        (candidate) =>
+          candidate.domain === domain && candidate.resolver !== null,
+      )
+      .map((admission) => ({
+        admission,
+        completedAt: "2026-08-31T00:00:00.000Z",
+        outcome: "succeeded" as const,
+        receiptSha256: sha("8"),
+      }));
+    await recordCandidateSourceSnapshotPreflightCycleOutcomes(
+      databaseUrl,
+      cycle,
+    );
+  }
 }

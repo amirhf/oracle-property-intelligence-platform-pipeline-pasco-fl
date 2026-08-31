@@ -2,8 +2,13 @@ import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
+  admitCandidateSourceSnapshotRemoteRead,
   completeCandidateSourceSnapshotDemoPlan,
+  loadExistingCandidateSourceSnapshotRemoteReadAdmission,
+  loadCandidateSourceSnapshotRemoteReadReceipt,
+  loadCompletedCandidateSourceSnapshotDemoReplay,
   recordCandidateSourceSnapshotRemoteCheck,
+  recordCandidateSourceSnapshotRemoteReadReceipt,
   recordCandidateSourceSnapshotRemoteVerification,
   recordCandidateSourceSnapshotUploadClosure,
   transitionCandidateSourceSnapshotIpnsIntent,
@@ -13,8 +18,14 @@ import {
   beginCandidateSourceSnapshotDemoExecution,
   confirmCandidateSourceSnapshotDemoCapacity,
   createCandidateSourceSnapshotDemoIpnsIntents,
+  admitCandidateSourceSnapshotPreflightRequest,
   expectedCandidateSourceSnapshotUploadReceiptSha256,
+  loadCandidateSourceSnapshotPreflightRequestOutcome,
+  loadCandidateSourceSnapshotIpnsIntents,
+  loadCandidateSourceSnapshotIpnsIntentState,
   PostgresCandidateSourceSnapshotUploadJournal,
+  recordCandidateSourceSnapshotPreflightCycleOutcomes,
+  recordCandidateSourceSnapshotPreflightRequestOutcome,
   recordCandidateSourceSnapshotDemoPlan,
   type CandidateSourceSnapshotIpnsDomain,
   type CandidateSourceSnapshotIpnsResolver,
@@ -28,6 +39,7 @@ const adminDatabaseUrl =
   "postgresql://postgres:elephant@localhost:5433/elephant";
 const schemaName = `candidate_snapshot_completion_${process.pid}_${Date.now()}`;
 const databaseUrl = `${adminDatabaseUrl}${adminDatabaseUrl.includes("?") ? "&" : "?"}options=-csearch_path%3D${schemaName}`;
+const implementationCommitSha = "1".repeat(40);
 const resolvers = [
   "filebase_control",
   "filebase_gateway",
@@ -41,7 +53,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(databaseUrl)).toHaveLength(28);
+  expect(await runMigrations(databaseUrl)).toHaveLength(30);
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });
 
@@ -58,6 +70,27 @@ describe("candidate source-snapshot Session 2A completion", () => {
   it("requires exact upload closure, ordered verified intents, and final remote verification", async () => {
     const fixture = syntheticCandidateSourceSnapshotDemo();
     await recordCandidateSourceSnapshotDemoPlan(databaseUrl, fixture);
+    const preflightInput = {
+      attemptSequence: 1,
+      domain: "open_data" as const,
+      operationKind: "bucket_head" as const,
+      planId: fixture.plan.planId,
+      planSha256: fixture.plan.planSha256,
+      redirectSequence: 0,
+      resolver: null,
+    };
+    const concurrentPreflightAdmissions = await Promise.all([
+      admitCandidateSourceSnapshotPreflightRequest(databaseUrl, preflightInput),
+      admitCandidateSourceSnapshotPreflightRequest(databaseUrl, preflightInput),
+    ]);
+    expect(
+      concurrentPreflightAdmissions
+        .map((admission) => admission.alreadyRecorded)
+        .sort(),
+    ).toEqual([false, true]);
+    const preflightAdmission = concurrentPreflightAdmissions.find(
+      (admission) => !admission.alreadyRecorded,
+    )!;
     await confirmCandidateSourceSnapshotDemoCapacity(databaseUrl, {
       confirmedAt: "2026-08-31T01:00:00.000Z",
       confirmedPlanName: "Filebase Pro or better",
@@ -65,20 +98,175 @@ describe("candidate source-snapshot Session 2A completion", () => {
       planId: fixture.plan.planId,
       planSha256: fixture.plan.planSha256,
     });
-    const approved = await approveCandidateSourceSnapshotDemoPlan(databaseUrl, {
+    const approvalInput = {
       approvedAt: "2026-08-31T01:01:00.000Z",
       approverReference: "synthetic-human-approver",
       authorizationStatement:
         renderCandidateSourceSnapshotAuthorizationStatement(
           fixture.plan,
           fixture.exactUpload,
+          implementationCommitSha,
         ),
+      implementationCommitSha,
       planId: fixture.plan.planId,
       planSha256: fixture.plan.planSha256,
+    };
+    await expect(
+      approveCandidateSourceSnapshotDemoPlan(databaseUrl, approvalInput),
+    ).rejects.toThrow("eight exact successful logical preflight receipts");
+
+    const preflightSql = postgres(databaseUrl, { max: 1 });
+    try {
+      const readinessBefore = await preflightSql<{ ready: boolean }[]>`
+        SELECT oracle_candidate_source_snapshot_preflight_is_approval_ready(
+          ${fixture.plan.planId}
+        ) AS ready
+      `;
+      expect(readinessBefore[0]?.ready).toBe(false);
+    } finally {
+      await preflightSql.end({ timeout: 5 });
+    }
+
+    await recordCandidateSourceSnapshotPreflightRequestOutcome(databaseUrl, {
+      admission: preflightAdmission,
+      completedAt: "2026-08-31T00:59:00.000Z",
+      outcome: "timeout_unknown",
+      receiptSha256: "9".repeat(64),
+    });
+    await expect(
+      loadCandidateSourceSnapshotPreflightRequestOutcome(
+        databaseUrl,
+        preflightAdmission,
+      ),
+    ).resolves.toEqual({
+      completedAt: "2026-08-31T00:59:00.000Z",
+      outcome: "timeout_unknown",
+      receiptSha256: "9".repeat(64),
+      requestId: preflightAdmission.requestId,
+    });
+    const retryAdmission = await admitCandidateSourceSnapshotPreflightRequest(
+      databaseUrl,
+      {
+        ...preflightInput,
+        attemptSequence: 2,
+      },
+    );
+    await recordCandidateSourceSnapshotPreflightRequestOutcome(databaseUrl, {
+      admission: retryAdmission,
+      completedAt: "2026-08-31T00:59:10.000Z",
+      outcome: "retryable_failure",
+      receiptSha256: "7".repeat(64),
+    });
+    const incompleteSql = postgres(databaseUrl, { max: 1 });
+    try {
+      const incomplete = await incompleteSql<{ ready: boolean }[]>`
+        SELECT oracle_candidate_source_snapshot_preflight_is_approval_ready(
+          ${fixture.plan.planId}
+        ) AS ready
+      `;
+      expect(incomplete[0]?.ready).toBe(false);
+    } finally {
+      await incompleteSql.end({ timeout: 5 });
+    }
+    const successfulAdmission =
+      await admitCandidateSourceSnapshotPreflightRequest(databaseUrl, {
+        ...preflightInput,
+        attemptSequence: 3,
+      });
+    const preflightOutcome = {
+      admission: successfulAdmission,
+      completedAt: "2026-08-31T00:59:20.000Z",
+      outcome: "succeeded" as const,
+      receiptSha256: "6".repeat(64),
+    };
+    await Promise.all([
+      recordCandidateSourceSnapshotPreflightRequestOutcome(
+        databaseUrl,
+        preflightOutcome,
+      ),
+      recordCandidateSourceSnapshotPreflightRequestOutcome(
+        databaseUrl,
+        preflightOutcome,
+      ),
+    ]);
+    const remainingPreflight = [
+      ["open_data", "names_read", "filebase_control"],
+      ["open_data", "public_resolve", "filebase_gateway"],
+      ["open_data", "public_resolve", "delegated_ipfs"],
+      ["query_table", "bucket_head", null],
+      ["query_table", "names_read", "filebase_control"],
+      ["query_table", "public_resolve", "filebase_gateway"],
+      ["query_table", "public_resolve", "delegated_ipfs"],
+    ] as const;
+    const remainingAdmissions = await Promise.all(
+      remainingPreflight.map(
+        async ([domain, operationKind, resolver]) =>
+          await admitCandidateSourceSnapshotPreflightRequest(databaseUrl, {
+            attemptSequence: 1,
+            domain,
+            operationKind,
+            planId: fixture.plan.planId,
+            planSha256: fixture.plan.planSha256,
+            redirectSequence: 0,
+            resolver,
+          }),
+      ),
+    );
+    const directResolverAdmission = remainingAdmissions.find(
+      (admission) => admission.resolver !== null,
+    )!;
+    await expect(
+      recordCandidateSourceSnapshotPreflightRequestOutcome(databaseUrl, {
+        admission: directResolverAdmission,
+        completedAt: "2026-08-31T00:59:00.000Z",
+        outcome: "succeeded",
+        receiptSha256: "8".repeat(64),
+      }),
+    ).rejects.toThrow("must be recorded as one atomic cycle");
+    for (const admission of remainingAdmissions.filter(
+      (candidate) => candidate.resolver === null,
+    )) {
+      await recordCandidateSourceSnapshotPreflightRequestOutcome(databaseUrl, {
+        admission,
+        completedAt: "2026-08-31T00:59:00.000Z",
+        outcome: "succeeded",
+        receiptSha256: "8".repeat(64),
+      });
+    }
+    for (const domain of ["open_data", "query_table"] as const) {
+      await recordCandidateSourceSnapshotPreflightCycleOutcomes(
+        databaseUrl,
+        remainingAdmissions
+          .filter(
+            (admission) =>
+              admission.domain === domain && admission.resolver !== null,
+          )
+          .map((admission) => ({
+            admission,
+            completedAt: "2026-08-31T00:59:00.000Z",
+            outcome: "succeeded" as const,
+            receiptSha256: "8".repeat(64),
+          })),
+      );
+    }
+    const readySql = postgres(databaseUrl, { max: 1 });
+    try {
+      const readinessAfter = await readySql<{ ready: boolean }[]>`
+        SELECT oracle_candidate_source_snapshot_preflight_is_approval_ready(
+          ${fixture.plan.planId}
+        ) AS ready
+      `;
+      expect(readinessAfter[0]?.ready).toBe(true);
+    } finally {
+      await readySql.end({ timeout: 5 });
+    }
+    const approved = await approveCandidateSourceSnapshotDemoPlan(databaseUrl, {
+      ...approvalInput,
     });
     await beginCandidateSourceSnapshotDemoExecution(databaseUrl, {
       approvalId: approved.approvalId,
       executorEnabled: true,
+      implementationCommitSha,
       planId: fixture.plan.planId,
       planSha256: fixture.plan.planSha256,
     });
@@ -159,7 +347,6 @@ describe("candidate source-snapshot Session 2A completion", () => {
       approvalId: approved.approvalId,
       planId: fixture.plan.planId,
       planSha256: fixture.plan.planSha256,
-      verifiedAt: "2026-08-31T01:03:00.000Z",
     };
     const closure = await recordCandidateSourceSnapshotUploadClosure(
       databaseUrl,
@@ -169,9 +356,28 @@ describe("candidate source-snapshot Session 2A completion", () => {
       exactObjectCount: fixture.exactUpload.exactObjectCount,
       exactTotalBytes: fixture.exactUpload.exactTotalBytes,
     });
+    const objectTimeSql = postgres(databaseUrl, { max: 1 });
+    try {
+      const rows = await objectTimeSql<{ verified_at: Date }[]>`
+        SELECT max(updated_at) AS verified_at
+        FROM oracle_candidate_source_snapshot_demo_objects
+        WHERE plan_id = ${fixture.plan.planId} AND status = 'verified'
+      `;
+      expect(closure.verifiedAt).toBe(rows[0]?.verified_at.toISOString());
+    } finally {
+      await objectTimeSql.end({ timeout: 5 });
+    }
     await expect(
       recordCandidateSourceSnapshotUploadClosure(databaseUrl, closureInput),
     ).resolves.toEqual(closure);
+    await expect(
+      loadCompletedCandidateSourceSnapshotDemoReplay(databaseUrl, {
+        approvalId: approved.approvalId,
+        implementationCommitSha,
+        planId: fixture.plan.planId,
+        planSha256: fixture.plan.planSha256,
+      }),
+    ).resolves.toBeNull();
 
     const intents = await createCandidateSourceSnapshotDemoIpnsIntents(
       databaseUrl,
@@ -182,9 +388,70 @@ describe("candidate source-snapshot Session 2A completion", () => {
       },
     );
     await expect(
-      completeCandidateSourceSnapshotDemoPlan(databaseUrl, {
+      loadCandidateSourceSnapshotIpnsIntents(databaseUrl, {
         planId: fixture.plan.planId,
         planSha256: fixture.plan.planSha256,
+      }),
+    ).resolves.toMatchObject([
+      {
+        approvalId: approved.approvalId,
+        cutoverPosition: 1,
+        domain: "open_data",
+        mutationAttemptCount: 0,
+        state: "intent_recorded",
+        uploadClosureId: closure.closureId,
+      },
+      {
+        approvalId: approved.approvalId,
+        cutoverPosition: 2,
+        domain: "query_table",
+        mutationAttemptCount: 0,
+        state: "intent_recorded",
+        uploadClosureId: closure.closureId,
+      },
+    ]);
+    for (const intent of intents) {
+      await expect(
+        loadCandidateSourceSnapshotIpnsIntentState(databaseUrl, {
+          domain: intent.domain,
+          intentId: intent.intentId,
+          planId: fixture.plan.planId,
+          planSha256: fixture.plan.planSha256,
+        }),
+      ).resolves.toMatchObject({
+        approvalId: approved.approvalId,
+        domain: intent.domain,
+        intentId: intent.intentId,
+        mutationAttemptCount: 0,
+        priorCid: intent.priorCid,
+        revision: 1,
+        state: "intent_recorded",
+        targetCid: intent.targetCid,
+        uploadClosureId: closure.closureId,
+      });
+    }
+    await expect(
+      completeCandidateSourceSnapshotDemoPlan(databaseUrl, {
+        cutover: {
+          openData: "target",
+          planId: fixture.plan.planId,
+          planSha256: fixture.plan.planSha256,
+          queryTable: "target",
+          reason: "completed",
+          rollback: "not_attempted",
+          status: "completed",
+        },
+        planId: fixture.plan.planId,
+        planSha256: fixture.plan.planSha256,
+        summary: {
+          attemptedRequests: 0,
+          recoveredByInspection: 0,
+          requestCostUsd: closure.admittedRequestCostUsd,
+          skippedVerified: closure.exactObjectCount,
+          totalObjects: closure.exactObjectCount,
+          uploadedAndVerified: 0,
+        },
+        uploadClosure: closure,
       }),
     ).rejects.toThrow("lacks remote verification");
 
@@ -196,6 +463,7 @@ describe("candidate source-snapshot Session 2A completion", () => {
       intentId: string;
       observedCid: string;
     }) => {
+      const observations = [];
       for (const resolver of resolvers) {
         const request = await journal.startResolutionRequest(fixture.plan, {
           cycleSequence: input.cycleSequence,
@@ -204,14 +472,18 @@ describe("candidate source-snapshot Session 2A completion", () => {
           resolver,
         });
         eventIndex += 1;
-        await journal.recordResolutionObservation(fixture.plan, request, {
-          classification: input.classification,
-          evidenceSha256: eventIndex.toString(16).padStart(64, "0"),
-          observedAt: new Date(Date.now() + eventIndex * 1_000).toISOString(),
-          observedCid: input.observedCid,
-          requestOutcome: "succeeded",
+        observations.push({
+          observation: {
+            classification: input.classification,
+            evidenceSha256: eventIndex.toString(16).padStart(64, "0"),
+            observedAt: new Date(Date.now() + eventIndex * 1_000).toISOString(),
+            observedCid: input.observedCid,
+            requestOutcome: "succeeded" as const,
+          },
+          request,
         });
       }
+      await journal.recordResolutionCycle(fixture.plan, observations);
     };
     const transition = async (input: {
       domain: CandidateSourceSnapshotIpnsDomain;
@@ -376,12 +648,25 @@ describe("candidate source-snapshot Session 2A completion", () => {
         toState: "verified",
       });
     }
+    for (const intent of intents) {
+      await expect(
+        loadCandidateSourceSnapshotIpnsIntentState(databaseUrl, {
+          domain: intent.domain,
+          intentId: intent.intentId,
+          planId: fixture.plan.planId,
+          planSha256: fixture.plan.planSha256,
+        }),
+      ).resolves.toMatchObject({
+        mutationAttemptCount: 1,
+        revision: 5,
+        state: "verified",
+      });
+    }
 
     await expect(
       recordCandidateSourceSnapshotRemoteCheck(databaseUrl, {
         checkKind: "plan_artifact",
         checkedAt: "2026-08-31T02:00:00.000Z",
-        evidenceSha256: "a".repeat(64),
         metrics: {},
         observedBytes: fixture.exactUpload.planArtifact.byteSize,
         observedCid: fixture.exactUpload.planArtifact.expectedCid,
@@ -389,7 +674,203 @@ describe("candidate source-snapshot Session 2A completion", () => {
         planId: fixture.plan.planId,
         planSha256: fixture.plan.planSha256,
       }),
-    ).rejects.toThrow("not authorized by the immutable request envelope");
+    ).rejects.toThrow("requires exact verified read receipts");
+
+    const remotePlanObject = fixture.objects.find(
+      (object) =>
+        object.remoteObjectKey ===
+        fixture.exactUpload.planArtifact.remoteObjectKey,
+    );
+    expect(remotePlanObject).toBeDefined();
+    const remoteReadInput = {
+      attemptSequence: 1,
+      checkKind: "plan_artifact" as const,
+      domain: "open_data" as const,
+      logicalRequestSequence: 1,
+      operationKind: "immutable_artifact_read" as const,
+      planId: fixture.plan.planId,
+      planSha256: fixture.plan.planSha256,
+      redirectSequence: 0,
+      remoteObjectKey: remotePlanObject!.remoteObjectKey,
+    };
+    const concurrentAdmissions = await Promise.all([
+      admitCandidateSourceSnapshotRemoteRead(databaseUrl, remoteReadInput),
+      admitCandidateSourceSnapshotRemoteRead(databaseUrl, {
+        ...remoteReadInput,
+        logicalRequestSequence: 2,
+      }),
+    ]);
+    expect(
+      concurrentAdmissions.map((item) => item.alreadyRecorded).sort(),
+    ).toEqual([false, false]);
+    await expect(
+      admitCandidateSourceSnapshotRemoteRead(databaseUrl, remoteReadInput),
+    ).resolves.toMatchObject({ alreadyRecorded: true });
+    const [readAdmission, secondReadAdmission] = concurrentAdmissions;
+    await expect(
+      loadCandidateSourceSnapshotRemoteReadReceipt(databaseUrl, readAdmission!),
+    ).resolves.toEqual({
+      receipt: null,
+      requestId: readAdmission!.requestId,
+      requestOutcome: "request_started",
+    });
+    const receiptInput = {
+      admission: readAdmission,
+      observedAt: "2026-08-31T02:00:00.000Z",
+      outcome: "verified" as const,
+      responseBytes: remotePlanObject!.byteSize,
+      responseSha256: remotePlanObject!.sha256,
+    };
+    const concurrentReceipts = await Promise.all([
+      recordCandidateSourceSnapshotRemoteReadReceipt(databaseUrl, receiptInput),
+      recordCandidateSourceSnapshotRemoteReadReceipt(databaseUrl, receiptInput),
+    ]);
+    expect(concurrentReceipts[1]).toEqual(concurrentReceipts[0]);
+    await expect(
+      loadCandidateSourceSnapshotRemoteReadReceipt(databaseUrl, readAdmission!),
+    ).resolves.toMatchObject({
+      receipt: {
+        outcome: "verified",
+        receiptSha256: concurrentReceipts[0]!.receiptSha256,
+        responseBytes: remotePlanObject!.byteSize,
+        responseSha256: remotePlanObject!.sha256,
+      },
+      requestOutcome: "succeeded",
+    });
+    await expect(
+      recordCandidateSourceSnapshotRemoteReadReceipt(databaseUrl, {
+        admission: secondReadAdmission!,
+        observedAt: "2026-08-31T02:00:01.000Z",
+        outcome: "retryable_failure",
+      }),
+    ).resolves.toMatchObject({ outcome: "retryable_failure" });
+
+    const redirectInput = {
+      ...remoteReadInput,
+      logicalRequestSequence: 2,
+      redirectSequence: 1,
+    };
+    const redirectStateSql = postgres(databaseUrl, { max: 1 });
+    try {
+      const beforeLookup = await redirectStateSql<
+        { category_count: number; request_count: number }[]
+      >`
+        SELECT accounting.request_count,
+               category.consumed_request_count AS category_count
+        FROM oracle_candidate_source_snapshot_demo_accounting accounting
+        JOIN oracle_candidate_source_snapshot_demo_request_categories category
+          ON category.plan_id = accounting.plan_id
+         AND category.request_category =
+           'final_credential_free_verification'
+        WHERE accounting.plan_id = ${fixture.plan.planId}
+      `;
+      await expect(
+        loadExistingCandidateSourceSnapshotRemoteReadAdmission(
+          databaseUrl,
+          redirectInput,
+        ),
+      ).resolves.toBeNull();
+      const afterMissingLookup = await redirectStateSql<
+        { category_count: number; request_count: number }[]
+      >`
+        SELECT accounting.request_count,
+               category.consumed_request_count AS category_count
+        FROM oracle_candidate_source_snapshot_demo_accounting accounting
+        JOIN oracle_candidate_source_snapshot_demo_request_categories category
+          ON category.plan_id = accounting.plan_id
+         AND category.request_category =
+           'final_credential_free_verification'
+        WHERE accounting.plan_id = ${fixture.plan.planId}
+      `;
+      expect(afterMissingLookup).toEqual(beforeLookup);
+
+      const redirectAdmission = await admitCandidateSourceSnapshotRemoteRead(
+        databaseUrl,
+        redirectInput,
+      );
+      expect(redirectAdmission.alreadyRecorded).toBe(false);
+      const afterAdmission = await redirectStateSql<
+        { category_count: number; request_count: number }[]
+      >`
+        SELECT accounting.request_count,
+               category.consumed_request_count AS category_count
+        FROM oracle_candidate_source_snapshot_demo_accounting accounting
+        JOIN oracle_candidate_source_snapshot_demo_request_categories category
+          ON category.plan_id = accounting.plan_id
+         AND category.request_category =
+           'final_credential_free_verification'
+        WHERE accounting.plan_id = ${fixture.plan.planId}
+      `;
+      await expect(
+        loadExistingCandidateSourceSnapshotRemoteReadAdmission(
+          databaseUrl,
+          redirectInput,
+        ),
+      ).resolves.toStrictEqual({
+        ...redirectAdmission,
+        alreadyRecorded: true,
+      });
+      const afterExistingLookup = await redirectStateSql<
+        { category_count: number; request_count: number }[]
+      >`
+        SELECT accounting.request_count,
+               category.consumed_request_count AS category_count
+        FROM oracle_candidate_source_snapshot_demo_accounting accounting
+        JOIN oracle_candidate_source_snapshot_demo_request_categories category
+          ON category.plan_id = accounting.plan_id
+         AND category.request_category =
+           'final_credential_free_verification'
+        WHERE accounting.plan_id = ${fixture.plan.planId}
+      `;
+      expect(afterExistingLookup).toEqual(afterAdmission);
+      await expect(
+        recordCandidateSourceSnapshotRemoteReadReceipt(databaseUrl, {
+          admission: redirectAdmission,
+          observedAt: "2026-08-31T02:00:02.000Z",
+          outcome: "verified",
+          responseBytes: remotePlanObject!.byteSize,
+          responseSha256: remotePlanObject!.sha256,
+        }),
+      ).resolves.toMatchObject({ outcome: "verified" });
+    } finally {
+      await redirectStateSql.end({ timeout: 5 });
+    }
+    await expect(
+      recordCandidateSourceSnapshotRemoteReadReceipt(databaseUrl, {
+        ...receiptInput,
+        observedAt: "2026-08-31T02:00:03.000Z",
+      }),
+    ).rejects.toThrow("replay conflicts");
+
+    const requestStateSql = postgres(databaseUrl, { max: 1 });
+    try {
+      const openRequests = await requestStateSql<{ count: string }[]>`
+        SELECT count(*)::text AS count
+        FROM oracle_candidate_source_snapshot_demo_requests
+        WHERE plan_id = ${fixture.plan.planId}
+          AND outcome = 'request_started'
+      `;
+      expect(Number(openRequests[0]?.count ?? -1)).toBe(0);
+    } finally {
+      await requestStateSql.end({ timeout: 5 });
+    }
+
+    const remoteCheckInput = {
+      checkKind: "plan_artifact" as const,
+      checkedAt: "2026-08-31T02:01:00.000Z",
+      metrics: {},
+      observedBytes: fixture.exactUpload.planArtifact.byteSize,
+      observedCid: fixture.exactUpload.planArtifact.expectedCid,
+      observedSha256: fixture.exactUpload.planArtifact.sha256,
+      planId: fixture.plan.planId,
+      planSha256: fixture.plan.planSha256,
+    };
+    const concurrentChecks = await Promise.all([
+      recordCandidateSourceSnapshotRemoteCheck(databaseUrl, remoteCheckInput),
+      recordCandidateSourceSnapshotRemoteCheck(databaseUrl, remoteCheckInput),
+    ]);
+    expect(concurrentChecks[1]).toEqual(concurrentChecks[0]);
+    expect(concurrentChecks[0]!.evidenceSha256).toMatch(/^[a-f0-9]{64}$/);
     const verificationSql = postgres(databaseUrl, { max: 1 });
     try {
       await expect(
@@ -414,7 +895,7 @@ describe("candidate source-snapshot Session 2A completion", () => {
           '2026-08-31T02:00:00.000Z'
         )
         `,
-      ).rejects.toThrow("not exact durable evidence");
+      ).rejects.toThrow("requires its exact verified read receipt set");
 
       await expect(
         recordCandidateSourceSnapshotRemoteVerification(databaseUrl, {
@@ -424,12 +905,30 @@ describe("candidate source-snapshot Session 2A completion", () => {
           uploadClosureId: closure.closureId,
           verifiedAt: "2026-08-31T02:00:00.000Z",
         }),
-      ).rejects.toThrow("not authorized by the immutable request envelope");
+      ).rejects.toThrow("checks are incomplete");
 
       await expect(
         completeCandidateSourceSnapshotDemoPlan(databaseUrl, {
+          cutover: {
+            openData: "target",
+            planId: fixture.plan.planId,
+            planSha256: fixture.plan.planSha256,
+            queryTable: "target",
+            reason: "completed",
+            rollback: "not_attempted",
+            status: "completed",
+          },
           planId: fixture.plan.planId,
           planSha256: fixture.plan.planSha256,
+          summary: {
+            attemptedRequests: 0,
+            recoveredByInspection: 0,
+            requestCostUsd: closure.admittedRequestCostUsd,
+            skippedVerified: closure.exactObjectCount,
+            totalObjects: closure.exactObjectCount,
+            uploadedAndVerified: 0,
+          },
+          uploadClosure: closure,
         }),
       ).rejects.toThrow("lacks remote verification");
 
@@ -453,7 +952,7 @@ describe("candidate source-snapshot Session 2A completion", () => {
       expect(durableRows).toEqual([
         {
           plan_state: "executing",
-          remote_checks: 0,
+          remote_checks: 1,
           remote_verifications: 0,
         },
       ]);

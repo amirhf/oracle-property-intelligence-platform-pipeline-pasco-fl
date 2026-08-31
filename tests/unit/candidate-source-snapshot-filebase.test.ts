@@ -320,7 +320,7 @@ describe("candidate source-snapshot Session 2 boundary", () => {
     }
   });
 
-  it("requires both intents, cuts over open data first, and reverses only definite failure", async () => {
+  it("keeps the legacy cutover shim fail closed without invoking a boundary", async () => {
     const { plan } = syntheticCandidateSourceSnapshotDemo();
     const intents = [
       {
@@ -337,43 +337,23 @@ describe("candidate source-snapshot Session 2 boundary", () => {
       },
     ];
     const calls: string[] = [];
-    const result = await executeCandidateSourceSnapshotIpnsCutover({
-      boundary: {
-        mutateAndVerify: async (domain) => {
-          calls.push(`update:${domain}`);
-          return domain === "open_data"
-            ? "verified"
-            : "prior_confirmed_failure";
-        },
-        rollbackAndVerify: async (domain) => {
-          calls.push(`rollback:${domain}`);
-          return "verified";
-        },
-      },
-      intents,
-      plan,
-      unverifiedObjectCount: 0,
-    });
-    expect(result).toStrictEqual({
-      openData: "verified",
-      queryTable: "prior_confirmed_failure",
-    });
-    expect(calls).toStrictEqual([
-      "update:open_data",
-      "update:query_table",
-      "rollback:open_data",
-    ]);
-
     await expect(
       executeCandidateSourceSnapshotIpnsCutover({
         boundary: {
-          mutateAndVerify: async () => "verified",
-          rollbackAndVerify: async () => "verified",
+          mutateAndVerify: async (domain) => {
+            calls.push(`update:${domain}`);
+            return "verified";
+          },
+          rollbackAndVerify: async (domain) => {
+            calls.push(`rollback:${domain}`);
+            return "verified";
+          },
         },
-        intents: intents.slice(0, 1),
+        intents,
         plan,
         unverifiedObjectCount: 0,
       }),
-    ).rejects.toThrow("both exact");
+    ).rejects.toThrow("Legacy candidate IPNS cutover is disabled");
+    expect(calls).toEqual([]);
   });
 });

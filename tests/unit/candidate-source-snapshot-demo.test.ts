@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   CANDIDATE_SOURCE_SNAPSHOT_HARD_CEILINGS,
+  CANDIDATE_SOURCE_SNAPSHOT_PLAN_REQUEST_CEILING,
   conservativeCandidateSourceSnapshotPricing,
   createCandidateSourceSnapshotCostEnvelope,
   createCandidateSourceSnapshotDemoPlan,
@@ -33,7 +34,10 @@ describe("candidate source-snapshot demo plan", () => {
   });
 
   it("prices the preliminary full inventory under explicit conservative classes", () => {
-    const limits = { ...CANDIDATE_SOURCE_SNAPSHOT_HARD_CEILINGS };
+    const limits = {
+      ...CANDIDATE_SOURCE_SNAPSHOT_HARD_CEILINGS,
+      maxRequests: CANDIDATE_SOURCE_SNAPSHOT_PLAN_REQUEST_CEILING,
+    };
     const pricing = conservativeCandidateSourceSnapshotPricing({
       fixedAccountPlanEvidence: "human_confirmation_required",
       fixedAccountPlanMonthlyUsd: 7.5,
@@ -42,10 +46,10 @@ describe("candidate source-snapshot demo plan", () => {
     });
     const requests = createCandidateSourceSnapshotRequestEnvelope({
       limits,
-      objectCount: 325_254,
+      objectCount: 325_312,
     });
     const cost = createCandidateSourceSnapshotCostEnvelope({
-      inventoryBytes: 3_267_142_549,
+      inventoryBytes: 3_474_519_090,
       limits,
       pricing,
       requestEnvelope: requests,
@@ -53,19 +57,30 @@ describe("candidate source-snapshot demo plan", () => {
     const legacyMaximumCost = 3_267_142_549 / 2 ** 30 + (325_254 * 3) / 1_000;
     expect(Math.round(legacyMaximumCost)).toBe(979);
     expect(legacyMaximumCost).toBeGreaterThan(978);
-    expect(requests.successfulExecution).toMatchObject({
-      classAMutations: 325_254,
-      namesApiOperations: 4,
-      publicResolverOperations: 4,
-      total: 325_262,
+    expect(requests.successfulTotalRequests).toBe(333_643);
+    expect(requests.maximumTotalRequests).toBe(1_080_000);
+    expect(requests.categoryRequests).toEqual({
+      ambiguous_upload_inspection: [0, 24_000],
+      bucket_names_preflight: [8, 48],
+      control_public_observation: [18, 42],
+      final_credential_free_verification: [8_303, 79_590],
+      names_mutation: [2, 2],
+      recovery: [0, 338],
+      rollback: [0, 44],
+      upload_provider_cid: [325_312, 975_936],
     });
-    expect(requests.ambiguousObjectInspectionAllowance.classBReads).toBe(
-      24_154,
-    );
-    expect(requests.maximumTotalRequests).toBe(1_000_000);
+    expect(requests.finalVerification).toMatchObject({
+      deterministicRequiredMaximumRequests: 74_727,
+      logicalRequests: 8_303,
+      protectedHeadroomRequests: 4_863,
+    });
     expect(cost.fixedAccountPlanMonthlyUsd).toBe(7.5);
+    expect(cost.requestUsd).toEqual({
+      maximumAttempts: 4.86,
+      successfulExecution: 1.5013935,
+    });
     expect(cost.maximumTotalUsd).toBeLessThan(25);
-    expect(cost.requestUsd.ambiguousObjectInspections).toBeGreaterThan(0);
+    expect(cost.maximumTotalUsd).toBe(12.412421548644);
   });
 
   it("rejects the previously proposed thousand-dollar rates and non-fail-closed config", () => {
@@ -122,11 +137,12 @@ describe("candidate source-snapshot demo plan", () => {
         ...identityInput,
         requestEnvelope: {
           ...plan.requestEnvelope,
-          maximumAttempts: {
-            ...plan.requestEnvelope.maximumAttempts,
-            classAMutations:
-              plan.requestEnvelope.maximumAttempts.classAMutations - 1,
-            total: plan.requestEnvelope.maximumAttempts.total - 1,
+          categoryRequests: {
+            ...plan.requestEnvelope.categoryRequests,
+            upload_provider_cid: [
+              plan.requestEnvelope.categoryRequests.upload_provider_cid[0],
+              plan.requestEnvelope.categoryRequests.upload_provider_cid[1] - 1,
+            ],
           },
           maximumTotalRequests: plan.requestEnvelope.maximumTotalRequests - 1,
         },
@@ -147,12 +163,9 @@ describe("candidate source-snapshot demo plan", () => {
         ...identityInput,
         requestEnvelope: {
           ...plan.requestEnvelope,
-          successfulExecution: {
-            ...plan.requestEnvelope.successfulExecution,
-            total: 0,
-          },
+          successfulTotalRequests: 0,
         },
       }),
-    ).toThrow("operation count total");
+    ).toThrow();
   });
 });

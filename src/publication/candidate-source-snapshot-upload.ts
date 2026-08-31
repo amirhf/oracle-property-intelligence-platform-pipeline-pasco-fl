@@ -3,6 +3,7 @@ import { z } from "zod";
 import { canonicalJsonSha256 } from "../lib/canonical-json.js";
 import {
   assertCandidateSourceSnapshotObjectNamespace,
+  candidateSourceSnapshotRequestCategory,
   candidateSourceSnapshotObjectSchema,
   validateCandidateSourceSnapshotDemoPlan,
   type CandidateSourceSnapshotDemoPlan,
@@ -36,6 +37,8 @@ export interface CandidateSourceSnapshotUploadAttempt {
   operation: "inspect" | "upload";
   recoveryUploadAttemptId: string | null;
   requestId: string;
+  /** Database admission time used only to distinguish a live request from crash residue. */
+  startedAt?: string;
 }
 
 export interface CandidateSourceSnapshotPlanAccounting {
@@ -116,6 +119,7 @@ export interface CandidateSourceSnapshotUploadJournal {
     attemptSequence: number,
   ): Promise<{
     accounting: CandidateSourceSnapshotPlanAccounting;
+    alreadyRecorded: boolean;
     attempt: CandidateSourceSnapshotUploadAttempt;
   }>;
   startInspection(
@@ -396,17 +400,65 @@ export async function executeCandidateSourceSnapshotUploads(options: {
       }
       return "absent";
     };
+    const waitForConcurrentUpload = async (
+      concurrentAttempt: CandidateSourceSnapshotUploadAttempt,
+    ): Promise<CandidateSourceSnapshotUploadAttempt | null> => {
+      const admittedAt = concurrentAttempt.startedAt
+        ? Date.parse(concurrentAttempt.startedAt)
+        : Number.NaN;
+      if (!Number.isFinite(admittedAt)) return concurrentAttempt;
+      const deadline = admittedAt + plan.limits.requestTimeoutMs;
+      for (;;) {
+        const concurrentCheckpoint = await options.journal.getCheckpoint(
+          plan,
+          object,
+        );
+        if (concurrentCheckpoint.status === "verified") {
+          if (
+            concurrentCheckpoint.providerCid !== object.expectedCid ||
+            concurrentCheckpoint.receiptSha256 === null
+          ) {
+            throw new Error(
+              "Concurrent candidate upload checkpoint is inconsistent",
+            );
+          }
+          skippedVerified += 1;
+          return null;
+        }
+        const replayedAttempt = (
+          await options.journal.listAttempts(plan, object)
+        ).find(
+          (candidate) => candidate.attemptId === concurrentAttempt.attemptId,
+        );
+        if (!replayedAttempt) {
+          throw new Error(
+            "Concurrent candidate upload attempt lost its durable identity",
+          );
+        }
+        if (replayedAttempt.outcome !== "request_started") {
+          return replayedAttempt;
+        }
+        if (Date.now() >= deadline) return replayedAttempt;
+        await (options.backoff?.(concurrentAttempt.attemptSequence) ??
+          new Promise((resolve) => setTimeout(resolve, 25)));
+      }
+    };
     const priorAttempts = [
       ...(await options.journal.listAttempts(plan, object)),
     ];
     for (const attempt of priorAttempts) {
       if (attempt.outcome === "request_started") {
-        await options.journal.markInterruptedAttemptUnknown(
-          plan,
-          object,
-          attempt,
-        );
-        attempt.outcome = "timeout_unknown";
+        const concurrentAttempt = await waitForConcurrentUpload(attempt);
+        if (!concurrentAttempt) return;
+        Object.assign(attempt, concurrentAttempt);
+        if (attempt.outcome === "request_started") {
+          await options.journal.markInterruptedAttemptUnknown(
+            plan,
+            object,
+            attempt,
+          );
+          attempt.outcome = "timeout_unknown";
+        }
       }
     }
     const recoveryAttempt = [...priorAttempts]
@@ -446,7 +498,31 @@ export async function executeCandidateSourceSnapshotUploads(options: {
         attemptSequence,
       );
       validateAccounting(plan, admitted.accounting);
-      const { attempt } = admitted;
+      let { attempt } = admitted;
+      if (admitted.alreadyRecorded) {
+        const concurrentAttempt = await waitForConcurrentUpload(attempt);
+        if (!concurrentAttempt) return;
+        attempt = concurrentAttempt;
+        if (attempt.outcome === "request_started") {
+          await options.journal.markInterruptedAttemptUnknown(
+            plan,
+            object,
+            attempt,
+          );
+          attempt.outcome = "timeout_unknown";
+        }
+        attemptsUsed = Math.max(attemptsUsed, attempt.attemptSequence);
+        if (retryable(attempt.outcome)) {
+          if ((await inspectUnknownUpload(attempt)) === "verified") return;
+          if (attemptsUsed >= plan.limits.maxRetries + 1) {
+            throw new Error(
+              "Candidate source-snapshot retry allowance is exhausted",
+            );
+          }
+          continue;
+        }
+        throw new Error("Candidate source-snapshot object is terminal");
+      }
       attemptsUsed += 1;
       attemptedRequests += 1;
       try {
@@ -566,6 +642,23 @@ function validateAccounting(
       requestCount: z.number().int().nonnegative(),
     })
     .parse(accounting);
+  const uploadMaximum = candidateSourceSnapshotRequestCategory(
+    plan.requestEnvelope,
+    "upload_provider_cid",
+  ).maximumRequests;
+  const finalVerificationMaximum = candidateSourceSnapshotRequestCategory(
+    plan.requestEnvelope,
+    "final_credential_free_verification",
+  ).maximumRequests;
+  const categoryMaximum = (
+    category: Parameters<typeof candidateSourceSnapshotRequestCategory>[1],
+  ) =>
+    candidateSourceSnapshotRequestCategory(plan.requestEnvelope, category)
+      .maximumRequests;
+  const preflightMaximum = categoryMaximum("bucket_names_preflight");
+  const controlMaximum = categoryMaximum("control_public_observation");
+  const recoveryMaximum = categoryMaximum("recovery");
+  const rollbackMaximum = categoryMaximum("rollback");
   if (
     parsed.requestCount !==
       parsed.classAMutationCount +
@@ -574,23 +667,21 @@ function validateAccounting(
         parsed.namesApiCount +
         parsed.publicResolverCount ||
     parsed.requestCount > plan.requestEnvelope.maximumTotalRequests ||
-    parsed.classAMutationCount >
-      plan.requestEnvelope.maximumAttempts.classAMutations ||
+    parsed.classAMutationCount > uploadMaximum ||
     parsed.classBReadCount >
-      plan.requestEnvelope.ambiguousObjectInspectionAllowance.classBReads ||
+      categoryMaximum("ambiguous_upload_inspection") +
+        preflightMaximum +
+        finalVerificationMaximum ||
     parsed.namesApiCount >
-      plan.requestEnvelope.maximumAttempts.namesApiOperations +
-        plan.requestEnvelope.recoveryAllowance.namesApiOperations ||
+      preflightMaximum +
+        categoryMaximum("names_mutation") +
+        controlMaximum +
+        recoveryMaximum +
+        rollbackMaximum ||
     parsed.publicResolverCount >
-      plan.requestEnvelope.maximumAttempts.publicResolverOperations +
-        plan.requestEnvelope.recoveryAllowance.publicResolverOperations ||
-    parsed.freeOperationCount >
-      plan.requestEnvelope.maximumAttempts.freeOperations +
-        plan.requestEnvelope.recoveryAllowance.freeOperations ||
-    parsed.requestCostUsd >
-      plan.costEnvelope.requestUsd.maximumAttempts +
-        plan.costEnvelope.recoveryRequestUsd +
-        plan.costEnvelope.requestUsd.ambiguousObjectInspections
+      preflightMaximum + controlMaximum + recoveryMaximum + rollbackMaximum ||
+    parsed.freeOperationCount !== 0 ||
+    parsed.requestCostUsd > plan.costEnvelope.requestUsd.maximumAttempts
   ) {
     throw new Error("Candidate request or cost ceiling is exhausted");
   }

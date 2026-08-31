@@ -8,7 +8,10 @@ import {
   type CandidateSourceSnapshotUploadCheckpoint,
   type CandidateSourceSnapshotUploadJournal,
 } from "../../src/publication/candidate-source-snapshot-upload.js";
-import type { CandidateSourceSnapshotUploadObject } from "../../src/publication/candidate-source-snapshot-demo.js";
+import {
+  candidateSourceSnapshotRequestCategory,
+  type CandidateSourceSnapshotUploadObject,
+} from "../../src/publication/candidate-source-snapshot-demo.js";
 import { syntheticCandidateSourceSnapshotDemo } from "../helpers/candidate-source-snapshot-demo.js";
 
 function identity(object: CandidateSourceSnapshotUploadObject) {
@@ -100,6 +103,7 @@ class RecoveryJournal implements CandidateSourceSnapshotUploadJournal {
     };
     return {
       accounting: this.accounting,
+      alreadyRecorded: false,
       attempt: {
         attemptId: `snapshotdemoinspection_${"3".repeat(32)}`,
         attemptSequence: 1,
@@ -191,6 +195,7 @@ class SameRunTimeoutJournal extends RecoveryJournal {
     };
     return {
       accounting: this.accounting,
+      alreadyRecorded: false,
       attempt: {
         attemptId: `snapshotdemoattempt_${String(this.uploadSequence).repeat(32)}`,
         attemptSequence: this.uploadSequence,
@@ -242,6 +247,76 @@ class SameRunTimeoutJournal extends RecoveryJournal {
       value.receiptSha256 = "e".repeat(64);
     }
     return value;
+  }
+}
+
+class ConcurrentUploadJournal extends RecoveryJournal {
+  private activeAttempt: CandidateSourceSnapshotUploadAttempt | null = null;
+
+  constructor(objects: CandidateSourceSnapshotUploadObject[]) {
+    super(objects);
+    this.checkpointByKey.set(this.firstKey, {
+      attemptCount: 0,
+      providerCid: null,
+      receiptSha256: null,
+      requestCount: 0,
+      status: "pending",
+    });
+  }
+
+  override async listAttempts(
+    _plan: unknown,
+    object: CandidateSourceSnapshotUploadObject,
+  ) {
+    return identity(object) === this.firstKey && this.activeAttempt
+      ? [this.activeAttempt]
+      : [];
+  }
+
+  override async startAttempt(
+    _plan: unknown,
+    _object: CandidateSourceSnapshotUploadObject,
+    attemptSequence: number,
+  ): ReturnType<CandidateSourceSnapshotUploadJournal["startAttempt"]> {
+    if (this.activeAttempt) {
+      return {
+        accounting: this.accounting,
+        alreadyRecorded: true,
+        attempt: this.activeAttempt,
+      };
+    }
+    this.accounting = {
+      ...this.accounting,
+      classAMutationCount: this.accounting.classAMutationCount + 1,
+      requestCostUsd: this.accounting.requestCostUsd + 0.0000045,
+      requestCount: this.accounting.requestCount + 1,
+    };
+    this.activeAttempt = {
+      attemptId: `snapshotdemoattempt_${"7".repeat(32)}`,
+      attemptSequence,
+      operation: "upload",
+      outcome: "request_started",
+      recoveryUploadAttemptId: null,
+      requestId: `snapshotdemorequest_${"8".repeat(32)}`,
+      startedAt: new Date().toISOString(),
+    };
+    return {
+      accounting: this.accounting,
+      alreadyRecorded: false,
+      attempt: this.activeAttempt,
+    };
+  }
+
+  override async recordVerified(
+    plan: unknown,
+    object: CandidateSourceSnapshotUploadObject,
+  ) {
+    if (!this.activeAttempt) throw new Error("missing concurrent attempt");
+    this.activeAttempt.outcome = "verified";
+    const value = this.checkpointByKey.get(identity(object))!;
+    value.status = "verified";
+    value.providerCid = object.expectedCid;
+    value.receiptSha256 = "e".repeat(64);
   }
 }
 
@@ -558,7 +633,11 @@ describe("candidate source-snapshot resumable upload boundary", () => {
     const startAttempt = journal.startAttempt.bind(journal);
     journal.startAttempt = vi.fn(async () => {
       const admitted = await startAttempt();
-      const count = plan.requestEnvelope.maximumAttempts.classAMutations + 1;
+      const count =
+        candidateSourceSnapshotRequestCategory(
+          plan.requestEnvelope,
+          "upload_provider_cid",
+        ).maximumRequests + 1;
       admitted.accounting = {
         classAMutationCount: count,
         classBReadCount: 0,
@@ -586,6 +665,61 @@ describe("candidate source-snapshot resumable upload boundary", () => {
       }),
     ).rejects.toThrow("request or cost ceiling is exhausted");
     expect(uploadOnce).not.toHaveBeenCalled();
+  });
+
+  it("shares one physical upload when concurrent executions race the same object", async () => {
+    const { objects, plan } = syntheticCandidateSourceSnapshotDemo();
+    const journal = new ConcurrentUploadJournal(objects);
+    let releaseUpload!: () => void;
+    let signalUploadStarted!: () => void;
+    const uploadStarted = new Promise<void>((resolve) => {
+      signalUploadStarted = resolve;
+    });
+    const uploadReleased = new Promise<void>((resolve) => {
+      releaseUpload = resolve;
+    });
+    const uploadOnce = vi.fn(async (_plan, object) => {
+      signalUploadStarted();
+      await uploadReleased;
+      return {
+        providerCid: object.expectedCid,
+        providerRequestIdHash: null,
+        responseBytes: object.byteSize,
+      };
+    });
+    const execute = () =>
+      executeCandidateSourceSnapshotUploads({
+        backoff: async () =>
+          await new Promise((resolve) => setTimeout(resolve, 1)),
+        executorEnabled: true,
+        journal,
+        objects,
+        plan,
+        transport: {
+          inspectExistingOnce: vi.fn(),
+          uploadOnce,
+        },
+        verifyLocalObject: vi.fn(async () => undefined),
+      });
+
+    const winner = execute();
+    await uploadStarted;
+    const concurrentReplay = execute();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    releaseUpload();
+    const summaries = await Promise.all([winner, concurrentReplay]);
+
+    expect(uploadOnce).toHaveBeenCalledTimes(1);
+    expect(journal.accounting).toMatchObject({
+      classAMutationCount: 1,
+      requestCount: 1,
+    });
+    expect(
+      summaries.map((summary) => summary.uploadedAndVerified).sort(),
+    ).toEqual([0, 1]);
+    expect(summaries.map((summary) => summary.skippedVerified).sort()).toEqual([
+      2, 3,
+    ]);
   });
 
   it("aborts and drains concurrent workers after the first terminal CID mismatch", async () => {

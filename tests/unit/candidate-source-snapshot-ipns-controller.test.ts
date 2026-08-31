@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 
+import { sha256 } from "../../src/lib/hash.js";
 import {
   executeCandidateSourceSnapshotIpnsController,
+  renderCandidateSourceSnapshotIpnsRetryAuthorizationStatement,
   type CandidateSourceSnapshotIpnsBoundary,
   type CandidateSourceSnapshotIpnsClassification,
   type CandidateSourceSnapshotIpnsCommand,
@@ -16,6 +18,54 @@ import { syntheticCandidateSourceSnapshotDemo } from "../helpers/candidate-sourc
 
 const approvalId = `snapshotdemoapproval_${"a".repeat(32)}`;
 const uploadClosureId = `snapshotdemouploadclosure_${"b".repeat(32)}`;
+const authorizedAt = "2026-08-31T00:00:00.000Z";
+const authorizerReference = "synthetic-controller";
+
+function exactReplayAuthorization(
+  input: Omit<
+    CandidateSourceSnapshotIpnsReplayAuthorization,
+    | "authorizationSha256"
+    | "authorizationStatement"
+    | "authorizedAt"
+    | "authorizerReference"
+  >,
+): CandidateSourceSnapshotIpnsReplayAuthorization {
+  const authorizationStatement =
+    renderCandidateSourceSnapshotIpnsRetryAuthorizationStatement(
+      input,
+      "update",
+    );
+  return {
+    ...input,
+    authorizationSha256: sha256(authorizationStatement),
+    authorizationStatement,
+    authorizedAt,
+    authorizerReference,
+  };
+}
+
+function exactRollbackAuthorization(
+  input: Omit<
+    CandidateSourceSnapshotIpnsRollbackAuthorization,
+    | "authorizationSha256"
+    | "authorizationStatement"
+    | "authorizedAt"
+    | "authorizerReference"
+  >,
+): CandidateSourceSnapshotIpnsRollbackAuthorization {
+  const authorizationStatement =
+    renderCandidateSourceSnapshotIpnsRetryAuthorizationStatement(
+      input,
+      "rollback",
+    );
+  return {
+    ...input,
+    authorizationSha256: sha256(authorizationStatement),
+    authorizationStatement,
+    authorizedAt,
+    authorizerReference,
+  };
+}
 
 function intents(
   mutationAttemptCount = 0,
@@ -31,6 +81,7 @@ function intents(
       domain: "open_data",
       intentId: "intent_open",
       mutationAttemptCount,
+      rollbackAttemptCount: 0,
       planId: plan.planId,
       planSha256: plan.planSha256,
       priorCid: plan.targets.openData.priorCid,
@@ -38,6 +89,7 @@ function intents(
       rollbackPosition: 2,
       state: "prior_confirmed",
       targetCid: plan.targets.openData.targetCid,
+      updateAttemptCount: mutationAttemptCount,
       uploadClosureId,
     },
     {
@@ -46,6 +98,7 @@ function intents(
       domain: "query_table",
       intentId: "intent_query",
       mutationAttemptCount,
+      rollbackAttemptCount: 0,
       planId: plan.planId,
       planSha256: plan.planSha256,
       priorCid: plan.targets.queryTable.priorCid,
@@ -53,6 +106,7 @@ function intents(
       rollbackPosition: 1,
       state: "prior_confirmed",
       targetCid: plan.targets.queryTable.targetCid,
+      updateAttemptCount: mutationAttemptCount,
       uploadClosureId,
     },
   ];
@@ -83,7 +137,14 @@ function harness(input: {
       CandidateSourceSnapshotIpnsClassification
     >
   >;
+  mutationFreshness?: Partial<
+    Record<
+      "open_data" | "query_table",
+      CandidateSourceSnapshotIpnsClassification
+    >
+  >;
   rollback?: CandidateSourceSnapshotIpnsClassification;
+  rollbackFreshness?: CandidateSourceSnapshotIpnsClassification;
 }) {
   const commands: CandidateSourceSnapshotIpnsCommand[] = [];
   const events: string[] = [];
@@ -93,7 +154,14 @@ function harness(input: {
       authorization,
     ]),
   );
+  let freshnessCommand: CandidateSourceSnapshotIpnsCommand | null = null;
   const journal: CandidateSourceSnapshotIpnsJournal = {
+    async beforeFreshnessObservation(command) {
+      freshnessCommand = command;
+      events.push(
+        `journal:before-freshness:${command.action}:${command.domain}`,
+      );
+    },
     async beforeMutation(command) {
       commands.push(command);
       events.push(`journal:before-mutation:${command.domain}`);
@@ -112,6 +180,11 @@ function harness(input: {
     async markVerified(command) {
       events.push(`journal:verified:${command.domain}`);
     },
+    async recordFreshnessObservation({ command, observation: observed }) {
+      events.push(
+        `journal:freshness:${command.action}:${command.domain}:${observed.classification}`,
+      );
+    },
     async recordObservation({ command, observation: observed }) {
       events.push(
         `journal:observation:${command.action}:${command.domain}:${observed.classification}`,
@@ -119,6 +192,17 @@ function harness(input: {
     },
   };
   const boundary: CandidateSourceSnapshotIpnsBoundary = {
+    async observeIdentity(domain) {
+      events.push(`boundary:observe:${domain}`);
+      if (!freshnessCommand || freshnessCommand.domain !== domain) {
+        throw new Error("freshness command is unavailable");
+      }
+      const classification =
+        freshnessCommand.action === "rollback"
+          ? (input.rollbackFreshness ?? "target")
+          : (input.mutationFreshness?.[domain] ?? "prior");
+      return observation(classification, freshnessCommand);
+    },
     async mutateAndObserve(command) {
       events.push(`boundary:mutate:${command.domain}`);
       return observation(input.mutation?.[command.domain] ?? "target", command);
@@ -155,10 +239,16 @@ describe("candidate source-snapshot closed IPNS controller", () => {
       status: "completed",
     });
     expect(test.events).toStrictEqual([
+      "journal:before-freshness:mutate:open_data",
+      "boundary:observe:open_data",
+      "journal:freshness:mutate:open_data:prior",
       "journal:before-mutation:open_data",
       "boundary:mutate:open_data",
       "journal:observation:mutate:open_data:target",
       "journal:verified:open_data",
+      "journal:before-freshness:mutate:query_table",
+      "boundary:observe:query_table",
+      "journal:freshness:mutate:query_table:prior",
       "journal:before-mutation:query_table",
       "boundary:mutate:query_table",
       "journal:observation:mutate:query_table:target",
@@ -222,20 +312,166 @@ describe("candidate source-snapshot closed IPNS controller", () => {
     expect(test.events.some((event) => event.includes("rollback"))).toBe(false);
   });
 
+  it("rejects an already-visible target without a terminal attempt and recovers it after exact durable retry evidence", async () => {
+    const { plan } = syntheticCandidateSourceSnapshotDemo();
+    const missingAttempt = harness({
+      mutationFreshness: { open_data: "target" },
+    });
+    await expect(
+      executeCandidateSourceSnapshotIpnsController({
+        approvalId,
+        boundary: missingAttempt.boundary,
+        executorEnabled: true,
+        intents: intents(),
+        journal: missingAttempt.journal,
+        plan,
+        uploadClosureId,
+      }),
+    ).rejects.toThrow("requires a prior terminal update attempt");
+    expect(missingAttempt.events).not.toContain("boundary:mutate:open_data");
+    expect(missingAttempt.events).not.toContain(
+      "journal:freshness:mutate:open_data:target",
+    );
+
+    const recoverableIntents = intents().map((intent) =>
+      intent.domain === "open_data"
+        ? {
+            ...intent,
+            mutationAttemptCount: 1,
+            updateAttemptCount: 1,
+          }
+        : intent,
+    );
+    const authorization = exactReplayAuthorization({
+      authorizationId: `snapshotdemoreplay_${"a".repeat(32)}`,
+      authorizedAttempt: 2,
+      domain: "open_data",
+      intentId: recoverableIntents[0]!.intentId,
+      planId: plan.planId,
+      planSha256: plan.planSha256,
+      priorCid: plan.targets.openData.priorCid,
+      targetCid: plan.targets.openData.targetCid,
+    });
+    const test = harness({
+      durableAuthorizations: [authorization],
+      mutationFreshness: { open_data: "target" },
+    });
+    await expect(
+      executeCandidateSourceSnapshotIpnsController({
+        approvalId,
+        boundary: test.boundary,
+        executorEnabled: true,
+        intents: recoverableIntents,
+        journal: test.journal,
+        plan,
+        replayAuthorizations: [authorization],
+        uploadClosureId,
+      }),
+    ).resolves.toMatchObject({ status: "completed" });
+    expect(test.events).not.toContain("boundary:mutate:open_data");
+    expect(test.events).toContain("boundary:mutate:query_table");
+  });
+
+  it("hard-stops a pre-mutation third CID without admitting or sending the PUT", async () => {
+    const { plan } = syntheticCandidateSourceSnapshotDemo();
+    const test = harness({
+      mutationFreshness: { open_data: "unexpected" },
+    });
+    await expect(
+      executeCandidateSourceSnapshotIpnsController({
+        approvalId,
+        boundary: test.boundary,
+        executorEnabled: true,
+        intents: intents(),
+        journal: test.journal,
+        plan,
+        uploadClosureId,
+      }),
+    ).resolves.toMatchObject({
+      openData: "unexpected",
+      status: "stopped",
+    });
+    expect(test.events.some((event) => event.includes("before-mutation"))).toBe(
+      false,
+    );
+    expect(test.events.some((event) => event.includes("boundary:mutate"))).toBe(
+      false,
+    );
+  });
+
+  it("performs an ambiguous rollback attempt-2 retry only with its exact durable authorization", async () => {
+    const { plan } = syntheticCandidateSourceSnapshotDemo();
+    const rollbackIntents = intents(0).map((intent) =>
+      intent.domain === "open_data"
+        ? {
+            ...intent,
+            mutationAttemptCount: 2,
+            rollbackAttemptCount: 1,
+            state: "rollback_ambiguous",
+            updateAttemptCount: 1,
+          }
+        : { ...intent, state: "update_failed_prior_confirmed" },
+    );
+    const authorization = exactRollbackAuthorization({
+      authorizationId: `snapshotdemoreplay_${"9".repeat(32)}`,
+      authorizedAttempt: 2,
+      domain: "open_data",
+      intentId: rollbackIntents[0]!.intentId,
+      planId: plan.planId,
+      planSha256: plan.planSha256,
+      priorCid: plan.targets.openData.priorCid,
+      targetCid: plan.targets.openData.targetCid,
+    });
+    const missing = harness({ rollback: "prior" });
+    await expect(
+      executeCandidateSourceSnapshotIpnsController({
+        approvalId,
+        boundary: missing.boundary,
+        executorEnabled: true,
+        intents: rollbackIntents,
+        journal: missing.journal,
+        plan,
+        uploadClosureId,
+      }),
+    ).rejects.toThrow("requires exact durable rollback authorization");
+    expect(missing.events).toStrictEqual([]);
+
+    const retry = harness({
+      durableAuthorizations: [authorization],
+      rollback: "prior",
+    });
+    await expect(
+      executeCandidateSourceSnapshotIpnsController({
+        approvalId,
+        boundary: retry.boundary,
+        executorEnabled: true,
+        intents: rollbackIntents,
+        journal: retry.journal,
+        plan,
+        rollbackAuthorization: authorization,
+        uploadClosureId,
+      }),
+    ).resolves.toMatchObject({ status: "rolled_back" });
+    expect(retry.commands).toHaveLength(1);
+    expect(retry.commands[0]).toMatchObject({
+      action: "rollback",
+      attemptNumber: 2,
+      commandId: `${plan.planId}:${rollbackIntents[0]!.intentId}:rollback:2`,
+    });
+  });
+
   it("requires exact authorization before one reverse open-data rollback", async () => {
     const { plan } = syntheticCandidateSourceSnapshotDemo();
-    const rollbackAuthorization: CandidateSourceSnapshotIpnsRollbackAuthorization =
-      {
-        authorizationId: `snapshotdemoreplay_${"c".repeat(32)}`,
-        authorizationSha256: "d".repeat(64),
-        authorizedAttempt: 1,
-        domain: "open_data",
-        intentId: intents()[0].intentId,
-        planId: plan.planId,
-        planSha256: plan.planSha256,
-        priorCid: plan.targets.openData.priorCid,
-        targetCid: plan.targets.openData.targetCid,
-      };
+    const rollbackAuthorization = exactRollbackAuthorization({
+      authorizationId: `snapshotdemoreplay_${"c".repeat(32)}`,
+      authorizedAttempt: 1,
+      domain: "open_data",
+      intentId: intents()[0].intentId,
+      planId: plan.planId,
+      planSha256: plan.planSha256,
+      priorCid: plan.targets.openData.priorCid,
+      targetCid: plan.targets.openData.targetCid,
+    });
     const test = harness({
       durableAuthorizations: [rollbackAuthorization],
       mutation: { query_table: "prior" },
@@ -297,18 +533,16 @@ describe("candidate source-snapshot closed IPNS controller", () => {
 
   it("rejects caller-only rollback authorization before boundary access", async () => {
     const { plan } = syntheticCandidateSourceSnapshotDemo();
-    const rollbackAuthorization: CandidateSourceSnapshotIpnsRollbackAuthorization =
-      {
-        authorizationId: `snapshotdemoreplay_${"e".repeat(32)}`,
-        authorizationSha256: "f".repeat(64),
-        authorizedAttempt: 1,
-        domain: "open_data",
-        intentId: intents()[0].intentId,
-        planId: plan.planId,
-        planSha256: plan.planSha256,
-        priorCid: plan.targets.openData.priorCid,
-        targetCid: plan.targets.openData.targetCid,
-      };
+    const rollbackAuthorization = exactRollbackAuthorization({
+      authorizationId: `snapshotdemoreplay_${"e".repeat(32)}`,
+      authorizedAttempt: 1,
+      domain: "open_data",
+      intentId: intents()[0].intentId,
+      planId: plan.planId,
+      planSha256: plan.planSha256,
+      priorCid: plan.targets.openData.priorCid,
+      targetCid: plan.targets.openData.targetCid,
+    });
     const test = harness({ mutation: { query_table: "prior" } });
 
     await expect(
@@ -367,7 +601,7 @@ describe("candidate source-snapshot closed IPNS controller", () => {
           plan,
           uploadClosureId,
         }),
-      ).rejects.toThrow("exact prior-confirmed");
+      ).rejects.toThrow("exact recoverable plan intent");
       expect(test.events).toStrictEqual([]);
     }
   });
@@ -390,21 +624,21 @@ describe("candidate source-snapshot closed IPNS controller", () => {
     expect(test.events).toStrictEqual([]);
 
     const replayAuthorizations: CandidateSourceSnapshotIpnsReplayAuthorization[] =
-      retryIntents.map((intent) => ({
-        authorizationId: `snapshotdemoreplay_${(intent.domain === "open_data"
-          ? "1"
-          : "2"
-        ).repeat(32)}`,
-        authorizationSha256:
-          intent.domain === "open_data" ? "3".repeat(64) : "4".repeat(64),
-        authorizedAttempt: 2,
-        domain: intent.domain,
-        intentId: intent.intentId,
-        planId: intent.planId,
-        planSha256: intent.planSha256,
-        priorCid: intent.priorCid,
-        targetCid: intent.targetCid,
-      }));
+      retryIntents.map((intent) =>
+        exactReplayAuthorization({
+          authorizationId: `snapshotdemoreplay_${(intent.domain === "open_data"
+            ? "1"
+            : "2"
+          ).repeat(32)}`,
+          authorizedAttempt: 2,
+          domain: intent.domain,
+          intentId: intent.intentId,
+          planId: intent.planId,
+          planSha256: intent.planSha256,
+          priorCid: intent.priorCid,
+          targetCid: intent.targetCid,
+        }),
+      );
     const callerOnly = harness({});
     await expect(
       executeCandidateSourceSnapshotIpnsController({
@@ -419,6 +653,9 @@ describe("candidate source-snapshot closed IPNS controller", () => {
       }),
     ).rejects.toThrow("journal did not confirm");
     expect(callerOnly.events).toStrictEqual([
+      "journal:before-freshness:mutate:open_data",
+      "boundary:observe:open_data",
+      "journal:freshness:mutate:open_data:prior",
       "journal:before-mutation:open_data",
     ]);
 
@@ -452,17 +689,18 @@ describe("candidate source-snapshot closed IPNS controller", () => {
     const { plan } = syntheticCandidateSourceSnapshotDemo();
     const retryIntents = intents(1);
     const replayAuthorizations: CandidateSourceSnapshotIpnsReplayAuthorization[] =
-      retryIntents.map((intent, index) => ({
-        authorizationId: `snapshotdemoreplay_${String(index + 5).repeat(32)}`,
-        authorizationSha256: String(index + 7).repeat(64),
-        authorizedAttempt: 2,
-        domain: intent.domain,
-        intentId: intent.intentId,
-        planId: intent.planId,
-        planSha256: intent.planSha256,
-        priorCid: intent.priorCid,
-        targetCid: intent.targetCid,
-      }));
+      retryIntents.map((intent, index) =>
+        exactReplayAuthorization({
+          authorizationId: `snapshotdemoreplay_${String(index + 5).repeat(32)}`,
+          authorizedAttempt: 2,
+          domain: intent.domain,
+          intentId: intent.intentId,
+          planId: intent.planId,
+          planSha256: intent.planSha256,
+          priorCid: intent.priorCid,
+          targetCid: intent.targetCid,
+        }),
+      );
     const durable = harness({
       durableAuthorizations: replayAuthorizations.map((authorization, index) =>
         index === 0
@@ -483,7 +721,12 @@ describe("candidate source-snapshot closed IPNS controller", () => {
         uploadClosureId,
       }),
     ).rejects.toThrow("journal did not confirm");
-    expect(durable.events).toStrictEqual(["journal:before-mutation:open_data"]);
+    expect(durable.events).toStrictEqual([
+      "journal:before-freshness:mutate:open_data",
+      "boundary:observe:open_data",
+      "journal:freshness:mutate:open_data:prior",
+      "journal:before-mutation:open_data",
+    ]);
   });
 
   it("does not call the boundary when durable mutation admission fails", async () => {
@@ -504,6 +747,11 @@ describe("candidate source-snapshot closed IPNS controller", () => {
         uploadClosureId,
       }),
     ).rejects.toThrow("journal unavailable");
-    expect(test.events).toStrictEqual(["journal:before-mutation:failed"]);
+    expect(test.events).toStrictEqual([
+      "journal:before-freshness:mutate:open_data",
+      "boundary:observe:open_data",
+      "journal:freshness:mutate:open_data:prior",
+      "journal:before-mutation:failed",
+    ]);
   });
 });

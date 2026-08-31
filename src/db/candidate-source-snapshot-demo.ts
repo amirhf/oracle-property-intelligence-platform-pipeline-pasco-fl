@@ -6,7 +6,7 @@ import {
   DurableInputError,
 } from "../lib/durability-errors.js";
 import { canonicalJsonSha256 } from "../lib/canonical-json.js";
-import { deterministicId } from "../lib/hash.js";
+import { deterministicId, sha256 } from "../lib/hash.js";
 import {
   assertCandidateSourceSnapshotObjectNamespace,
   candidateSourceSnapshotExactUploadBindingSchema,
@@ -14,6 +14,7 @@ import {
   validateCandidateSourceSnapshotDemoPlan,
   type CandidateSourceSnapshotDemoPlan,
   type CandidateSourceSnapshotExactUploadBinding,
+  type CandidateSourceSnapshotRequestCategory,
   type CandidateSourceSnapshotUploadObject,
 } from "../publication/candidate-source-snapshot-demo.js";
 import type {
@@ -24,6 +25,11 @@ import type {
   CandidateSourceSnapshotUploadJournal,
   CandidateSourceSnapshotUploadReceipt,
 } from "../publication/candidate-source-snapshot-upload.js";
+import {
+  renderCandidateSourceSnapshotIpnsRetryAuthorizationStatement,
+  type CandidateSourceSnapshotIpnsReplayAuthorization,
+  type CandidateSourceSnapshotIpnsRollbackAuthorization,
+} from "../publication/candidate-source-snapshot-ipns-controller.js";
 import { createCandidateSourceSnapshotApprovalIdentity } from "./candidate-source-snapshot-approval.js";
 
 const OBJECT_BATCH_SIZE = 500;
@@ -433,6 +439,22 @@ export async function recordCandidateSourceSnapshotDemoPlan(
         INSERT INTO oracle_candidate_source_snapshot_demo_accounting (plan_id)
         VALUES (${plan.planId})
       `;
+      await transaction`
+        INSERT INTO oracle_candidate_source_snapshot_demo_request_categories ${transaction(
+          Object.entries(plan.requestEnvelope.categoryRequests).map(
+            ([requestCategory, [successfulRequests, maximumRequests]]) => ({
+              plan_id: plan.planId,
+              planned_maximum_request_count: maximumRequests,
+              planned_successful_request_count: successfulRequests,
+              request_category: requestCategory,
+            }),
+          ),
+          "plan_id",
+          "request_category",
+          "planned_successful_request_count",
+          "planned_maximum_request_count",
+        )}
+      `;
 
       let objectCount = 0;
       let totalBytes = 0;
@@ -780,12 +802,96 @@ export async function confirmCandidateSourceSnapshotDemoCapacity(
   }
 }
 
+async function assertExactApprovalPreflight(
+  transaction: postgres.TransactionSql,
+  planId: string,
+): Promise<void> {
+  const categoryRows = await transaction<
+    {
+      consumed_request_count: number;
+      planned_successful_request_count: number;
+    }[]
+  >`
+    SELECT planned_successful_request_count, consumed_request_count
+    FROM oracle_candidate_source_snapshot_demo_request_categories
+    WHERE plan_id = ${planId}
+      AND request_category = 'bucket_names_preflight'
+    FOR UPDATE
+  `;
+  const requests = await transaction<ApprovalPreflightRequestRow[]>`
+    SELECT logical_request_id, domain, operation_kind, resolver,
+           attempt_sequence, redirect_sequence, outcome, receipt_sha256
+    FROM oracle_candidate_source_snapshot_demo_requests
+    WHERE plan_id = ${planId}
+      AND request_category = 'bucket_names_preflight'
+    ORDER BY domain, operation_kind, resolver NULLS FIRST
+    FOR UPDATE
+  `;
+  const category = categoryRows[0];
+  const keys = requests.map(
+    (request) =>
+      `${request.domain}:${request.operation_kind}:${request.resolver ?? "none"}`,
+  );
+  const uniqueKeys = new Set(keys);
+  const succeededKeys = requests
+    .filter((request) => request.outcome === "succeeded")
+    .map(
+      (request) =>
+        `${request.domain}:${request.operation_kind}:${request.resolver ?? "none"}`,
+    );
+  const logicalKeyPairs = new Set(
+    requests.map(
+      (request, index) => `${request.logical_request_id}:${keys[index]}`,
+    ),
+  );
+  if (
+    !category ||
+    category.planned_successful_request_count !== 8 ||
+    category.consumed_request_count !== requests.length ||
+    category.consumed_request_count < 8 ||
+    category.consumed_request_count > 48 ||
+    new Set(requests.map((request) => request.logical_request_id)).size !== 8 ||
+    uniqueKeys.size !== 8 ||
+    logicalKeyPairs.size !== 8 ||
+    keys.some((key) => !EXACT_APPROVAL_PREFLIGHT_KEYS.has(key)) ||
+    succeededKeys.length !== 8 ||
+    new Set(succeededKeys).size !== 8 ||
+    requests.some(
+      (request) =>
+        !["succeeded", "retryable_failure", "timeout_unknown"].includes(
+          request.outcome,
+        ) || request.receipt_sha256 === null,
+    )
+  ) {
+    throw new DurableConflictError(
+      "Candidate source-snapshot approval requires eight exact successful logical preflight receipts with closed bounded retry evidence",
+    );
+  }
+}
+
+async function assertExactApprovalDerivation(
+  transaction: postgres.TransactionSql,
+  planId: string,
+): Promise<void> {
+  const rows = await transaction<{ ready: boolean }[]>`
+    SELECT oracle_candidate_source_snapshot_derivation_is_approval_ready(
+      ${planId}
+    ) AS ready
+  `;
+  if (rows[0]?.ready !== true) {
+    throw new DurableConflictError(
+      "Candidate source-snapshot approval requires its exact compatible predecessor derivation",
+    );
+  }
+}
+
 export async function approveCandidateSourceSnapshotDemoPlan(
   databaseUrl: string,
   inputValue: {
     approvedAt: string;
     approverReference: string;
     authorizationStatement: string;
+    implementationCommitSha: string;
     planId: string;
     planSha256: string;
   },
@@ -799,6 +905,7 @@ export async function approveCandidateSourceSnapshotDemoPlan(
       approvedAt: operatorTimestampSchema,
       approverReference: operatorReferenceSchema,
       authorizationStatement: z.string().min(1).max(8_192),
+      implementationCommitSha: z.string().regex(/^[a-f0-9]{40}$/),
       planId: z.string().regex(/^snapshotdemo_[a-f0-9]{32}$/),
       planSha256: z.string().regex(/^[a-f0-9]{64}$/),
     })
@@ -808,11 +915,14 @@ export async function approveCandidateSourceSnapshotDemoPlan(
     return await sql.begin(async (transaction) => {
       await lock(transaction);
       const { plan, row } = await loadExactPlanRowForUpdate(transaction, input);
+      await assertExactApprovalDerivation(transaction, plan.planId);
+      await assertExactApprovalPreflight(transaction, plan.planId);
       const exact = planExactUploadFromRow(row);
       const approval = createCandidateSourceSnapshotApprovalIdentity({
         approvedAt: input.approvedAt,
         approverReference: input.approverReference,
         exactUpload: exact,
+        implementationCommitSha: input.implementationCommitSha,
         plan,
         statement: input.authorizationStatement,
       });
@@ -829,13 +939,14 @@ export async function approveCandidateSourceSnapshotDemoPlan(
           authorization_binding_sha256: string;
           authorization_statement: string;
           authorization_statement_sha256: string;
+          implementation_commit_sha: string;
         }[]
       >`
         SELECT approval_id, approval_sha256, approval_version,
                approved_plan_revision, approver_reference, approved_at,
                approved_at_iso, authorization_statement,
                authorization_statement_sha256, authorization_binding,
-               authorization_binding_sha256
+               authorization_binding_sha256, implementation_commit_sha
         FROM oracle_candidate_source_snapshot_demo_approvals
         WHERE plan_id = ${plan.planId}
       `;
@@ -844,6 +955,8 @@ export async function approveCandidateSourceSnapshotDemoPlan(
           existing[0].approval_id !== approval.approvalId ||
           existing[0].approval_sha256 !== approval.approvalSha256 ||
           existing[0].approval_version !== approval.approvalVersion ||
+          existing[0].implementation_commit_sha !==
+            input.implementationCommitSha ||
           existing[0].approver_reference !== input.approverReference ||
           existing[0].approved_at.toISOString() !== input.approvedAt ||
           existing[0].approved_at_iso !== input.approvedAt ||
@@ -874,7 +987,7 @@ export async function approveCandidateSourceSnapshotDemoPlan(
             approver_reference, approved_at, approved_at_iso,
             approval_version, approval_sha256, authorization_statement,
             authorization_statement_sha256, authorization_binding,
-            authorization_binding_sha256
+            authorization_binding_sha256, implementation_commit_sha
           ) VALUES (
             ${approval.approvalId}, ${plan.planId}, ${plan.planSha256},
             ${exact.planArtifact.sha256}, ${exact.planArtifact.expectedCid},
@@ -884,7 +997,8 @@ export async function approveCandidateSourceSnapshotDemoPlan(
             ${approval.approvalSha256}, ${approval.authorizationStatement},
             ${approval.authorizationStatementSha256},
             ${transaction.json(approval.authorizationBinding as postgres.JSONValue)},
-            ${approval.authorizationBindingSha256}
+            ${approval.authorizationBindingSha256},
+            ${input.implementationCommitSha}
           )
         `;
       }
@@ -929,6 +1043,7 @@ export async function beginCandidateSourceSnapshotDemoExecution(
   inputValue: {
     approvalId: string;
     executorEnabled: true;
+    implementationCommitSha: string;
     planId: string;
     planSha256: string;
   },
@@ -937,6 +1052,7 @@ export async function beginCandidateSourceSnapshotDemoExecution(
     .strictObject({
       approvalId: z.string().regex(/^snapshotdemoapproval_[a-f0-9]{32}$/),
       executorEnabled: z.literal(true),
+      implementationCommitSha: z.string().regex(/^[a-f0-9]{40}$/),
       planId: z.string().regex(/^snapshotdemo_[a-f0-9]{32}$/),
       planSha256: z.string().regex(/^[a-f0-9]{64}$/),
     })
@@ -951,6 +1067,7 @@ export async function beginCandidateSourceSnapshotDemoExecution(
         FROM oracle_candidate_source_snapshot_demo_approvals
         WHERE approval_id = ${input.approvalId}
           AND plan_id = ${plan.planId} AND plan_sha256 = ${plan.planSha256}
+          AND implementation_commit_sha = ${input.implementationCommitSha}
       `;
       if (!approvals[0]) {
         throw new DurableConflictError(
@@ -1011,6 +1128,7 @@ export interface CandidateSourceSnapshotDemoExecutionAdmission {
     approverReference: string;
     authorizationBindingSha256: string;
     authorizationStatementSha256: string;
+    implementationCommitSha: string;
   };
   capacityConfirmation: {
     confirmationId: string;
@@ -1028,6 +1146,7 @@ export async function loadCandidateSourceSnapshotDemoExecutionAdmission(
   databaseUrl: string,
   identityValue: {
     approvalId: string;
+    implementationCommitSha: string;
     planId: string;
     planSha256: string;
   },
@@ -1035,6 +1154,7 @@ export async function loadCandidateSourceSnapshotDemoExecutionAdmission(
   const identity = z
     .strictObject({
       approvalId: z.string().regex(/^snapshotdemoapproval_[a-f0-9]{32}$/),
+      implementationCommitSha: z.string().regex(/^[a-f0-9]{40}$/),
       planId: z.string().regex(/^snapshotdemo_[a-f0-9]{32}$/),
       planSha256: z.string().regex(/^[a-f0-9]{64}$/),
     })
@@ -1055,13 +1175,16 @@ export async function loadCandidateSourceSnapshotDemoExecutionAdmission(
           approver_reference: string;
           authorization_binding_sha256: string;
           authorization_statement_sha256: string;
+          implementation_commit_sha: string;
         }[]
       >`
         SELECT approval_id, approval_sha256, approver_reference, approved_at,
-               authorization_binding_sha256, authorization_statement_sha256
+               authorization_binding_sha256, authorization_statement_sha256,
+               implementation_commit_sha
         FROM oracle_candidate_source_snapshot_demo_approvals
         WHERE approval_id = ${identity.approvalId}
           AND plan_id = ${plan.planId} AND plan_sha256 = ${plan.planSha256}
+          AND implementation_commit_sha = ${identity.implementationCommitSha}
       `;
       const confirmations = await transaction<
         {
@@ -1149,6 +1272,7 @@ export async function loadCandidateSourceSnapshotDemoExecutionAdmission(
           authorizationBindingSha256: approvals[0].authorization_binding_sha256,
           authorizationStatementSha256:
             approvals[0].authorization_statement_sha256,
+          implementationCommitSha: approvals[0].implementation_commit_sha,
         },
         capacityConfirmation: {
           confirmationId: confirmations[0].confirmation_id,
@@ -1414,6 +1538,7 @@ interface AccountingRow {
 }
 
 export type CandidateSourceSnapshotIpnsDomain = "open_data" | "query_table";
+export type { CandidateSourceSnapshotRequestCategory };
 export type CandidateSourceSnapshotIpnsResolver =
   | "filebase_control"
   | "filebase_gateway"
@@ -1436,6 +1561,7 @@ export interface CandidateSourceSnapshotRemoteRequestAdmission {
     | "timeout_unknown"
     | "terminal_failure";
   requestId: string;
+  requestCategory: CandidateSourceSnapshotRequestCategory;
   resolver: CandidateSourceSnapshotIpnsResolver | null;
 }
 
@@ -1445,6 +1571,11 @@ export interface CandidateSourceSnapshotIpnsAttemptAdmission {
   direction: "rollback" | "update";
   request: CandidateSourceSnapshotRemoteRequestAdmission;
   requestedCid: string;
+}
+
+export interface CandidateSourceSnapshotInterruptedIpnsAttempt {
+  admission: CandidateSourceSnapshotIpnsAttemptAdmission;
+  receiptSha256: string;
 }
 
 interface IpnsIntentRow {
@@ -1465,7 +1596,19 @@ interface RemoteRequestRow {
   outcome: CandidateSourceSnapshotRemoteRequestAdmission["outcome"];
   receipt_sha256: string | null;
   request_id: string;
+  request_category: CandidateSourceSnapshotRequestCategory;
   resolver: CandidateSourceSnapshotIpnsResolver | null;
+}
+
+interface ApprovalPreflightRequestRow {
+  attempt_sequence: number;
+  domain: CandidateSourceSnapshotIpnsDomain;
+  logical_request_id: string;
+  operation_kind: z.infer<typeof preflightOperationKindSchema>;
+  outcome: string;
+  receipt_sha256: string | null;
+  redirect_sequence: number;
+  resolver: CandidateSourceSnapshotPreflightRequestAdmission["resolver"];
 }
 
 const ipnsDomainSchema = z.enum(["open_data", "query_table"]);
@@ -1475,6 +1618,16 @@ const ipnsResolverSchema = z.enum([
   "delegated_ipfs",
   "ipfs_io",
   "dweb_link",
+]);
+const requestCategorySchema = z.enum([
+  "upload_provider_cid",
+  "ambiguous_upload_inspection",
+  "bucket_names_preflight",
+  "names_mutation",
+  "control_public_observation",
+  "recovery",
+  "rollback",
+  "final_credential_free_verification",
 ]);
 const ipnsRequestOutcomeSchema = z.enum([
   "succeeded",
@@ -1490,6 +1643,139 @@ const ipnsObservationClassificationSchema = z.enum([
   "unavailable",
   "unexpected_cid",
 ]);
+const preflightOperationKindSchema = z.enum([
+  "bucket_head",
+  "bucket_prefix_scan",
+  "storage_network_check",
+  "account_usage",
+  "bucket_usage",
+  "names_read",
+  "public_resolve",
+]);
+const preflightRequestOutcomeSchema = z.enum([
+  "succeeded",
+  "absent",
+  "ambiguous",
+  "retryable_failure",
+  "timeout_unknown",
+  "terminal_failure",
+]);
+const ipnsIntentStateSchema = z.enum([
+  "intent_recorded",
+  "prior_confirmed",
+  "update_in_flight",
+  "target_observed",
+  "verified",
+  "update_ambiguous",
+  "unexpected_cid",
+  "update_failed_prior_confirmed",
+  "rollback_recorded",
+  "rollback_in_flight",
+  "rollback_ambiguous",
+  "rolled_back",
+  "manual_intervention_required",
+  "failed_terminal",
+]);
+
+const EXACT_APPROVAL_PREFLIGHT_KEYS = new Set([
+  "open_data:bucket_head:none",
+  "open_data:names_read:filebase_control",
+  "open_data:public_resolve:filebase_gateway",
+  "open_data:public_resolve:delegated_ipfs",
+  "query_table:bucket_head:none",
+  "query_table:names_read:filebase_control",
+  "query_table:public_resolve:filebase_gateway",
+  "query_table:public_resolve:delegated_ipfs",
+]);
+
+export interface CandidateSourceSnapshotPreflightRequestAdmission {
+  alreadyRecorded: boolean;
+  attemptSequence: number;
+  domain: CandidateSourceSnapshotIpnsDomain;
+  logicalRequestId: string;
+  operationKind: z.infer<typeof preflightOperationKindSchema>;
+  outcome: "request_started" | z.infer<typeof preflightRequestOutcomeSchema>;
+  planId: string;
+  planSha256: string;
+  redirectSequence: number;
+  requestId: string;
+  resolver: Extract<
+    CandidateSourceSnapshotIpnsResolver,
+    "filebase_control" | "filebase_gateway" | "delegated_ipfs"
+  > | null;
+}
+
+export interface CandidateSourceSnapshotIpnsIntentStateRecord {
+  approvalId: string;
+  bucket: string;
+  cutoverPosition: 1 | 2;
+  domain: CandidateSourceSnapshotIpnsDomain;
+  intendedAt: string;
+  intentId: string;
+  ipnsLabel: string;
+  ipnsNetworkKey: string;
+  mutationAttemptCount: number;
+  rollbackAttemptCount: number;
+  planId: string;
+  planSha256: string;
+  priorCid: string;
+  resolverPolicy: "candidate_source_snapshot_filebase_delegated_v1";
+  revision: number;
+  rollbackPosition: 1 | 2;
+  state: z.infer<typeof ipnsIntentStateSchema>;
+  targetCid: string;
+  updateAttemptCount: number;
+  uploadClosureId: string;
+}
+
+interface CandidateSourceSnapshotIpnsIntentStateRow {
+  approval_id: string;
+  bucket: string;
+  cutover_position: 1 | 2;
+  domain: CandidateSourceSnapshotIpnsDomain;
+  intended_at: Date;
+  intent_id: string;
+  ipns_label: string;
+  ipns_network_key: string;
+  mutation_attempt_count: string;
+  rollback_attempt_count: string;
+  prior_cid: string;
+  resolver_policy: "candidate_source_snapshot_filebase_delegated_v1";
+  revision: number;
+  rollback_position: 1 | 2;
+  state: string;
+  target_cid: string;
+  upload_closure_id: string;
+  update_attempt_count: string;
+}
+
+function ipnsIntentStateRecord(
+  plan: CandidateSourceSnapshotDemoPlan,
+  row: CandidateSourceSnapshotIpnsIntentStateRow,
+): CandidateSourceSnapshotIpnsIntentStateRecord {
+  return {
+    approvalId: row.approval_id,
+    bucket: row.bucket,
+    cutoverPosition: row.cutover_position,
+    domain: row.domain,
+    intendedAt: row.intended_at.toISOString(),
+    intentId: row.intent_id,
+    ipnsLabel: row.ipns_label,
+    ipnsNetworkKey: row.ipns_network_key,
+    mutationAttemptCount: Number(row.mutation_attempt_count),
+    rollbackAttemptCount: Number(row.rollback_attempt_count),
+    planId: plan.planId,
+    planSha256: plan.planSha256,
+    priorCid: row.prior_cid,
+    resolverPolicy: row.resolver_policy,
+    revision: row.revision,
+    rollbackPosition: row.rollback_position,
+    state: ipnsIntentStateSchema.parse(row.state),
+    targetCid: row.target_cid,
+    updateAttemptCount: Number(row.update_attempt_count),
+    uploadClosureId: row.upload_closure_id,
+  };
+}
 
 function remoteRequestId(input: {
   cycleSequence: number | null;
@@ -1576,6 +1862,763 @@ function requestId(input: {
     input.operation,
     String(input.sequence),
   ]);
+}
+
+function logicalRequestId(input: {
+  category: CandidateSourceSnapshotRequestCategory;
+  domain: CandidateSourceSnapshotIpnsDomain;
+  identity: string;
+  operationKind: string;
+  planId: string;
+}): string {
+  return deterministicId("snapshotdemologicalrequest", [
+    "candidate-source-snapshot-logical-request-v1",
+    input.planId,
+    input.category,
+    input.domain,
+    input.identity,
+    input.operationKind,
+  ]);
+}
+
+async function incrementRequestCategory(
+  transaction: postgres.TransactionSql,
+  input: {
+    category: CandidateSourceSnapshotRequestCategory;
+    plan: CandidateSourceSnapshotDemoPlan;
+    requestCostUsd: number;
+  },
+): Promise<void> {
+  const updated = await transaction<{ request_category: string }[]>`
+    UPDATE oracle_candidate_source_snapshot_demo_request_categories
+    SET consumed_request_count = consumed_request_count + 1,
+        request_cost_usd = request_cost_usd + ${input.requestCostUsd},
+        revision = revision + 1
+    WHERE plan_id = ${input.plan.planId}
+      AND request_category = ${input.category}
+      AND consumed_request_count < planned_maximum_request_count
+    RETURNING request_category
+  `;
+  if (!updated[0]) {
+    throw new DurableConflictError(
+      "Candidate source-snapshot request category allowance is exhausted",
+    );
+  }
+}
+
+function preflightOperationClass(
+  operationKind: z.infer<typeof preflightOperationKindSchema>,
+): "class_b_read" | "names_api" | "public_resolver" {
+  if (operationKind === "names_read") return "names_api";
+  if (operationKind === "public_resolve") return "public_resolver";
+  return "class_b_read";
+}
+
+export async function admitCandidateSourceSnapshotPreflightRequest(
+  databaseUrl: string,
+  inputValue: {
+    attemptSequence: number;
+    domain: CandidateSourceSnapshotIpnsDomain;
+    operationKind: z.infer<typeof preflightOperationKindSchema>;
+    planId: string;
+    planSha256: string;
+    redirectSequence: number;
+    resolver?: Extract<
+      CandidateSourceSnapshotIpnsResolver,
+      "filebase_control" | "filebase_gateway" | "delegated_ipfs"
+    > | null;
+  },
+): Promise<CandidateSourceSnapshotPreflightRequestAdmission> {
+  const input = z
+    .strictObject({
+      attemptSequence: z.number().int().min(1).max(3),
+      domain: ipnsDomainSchema,
+      operationKind: preflightOperationKindSchema,
+      planId: z.string().regex(/^snapshotdemo_[a-f0-9]{32}$/),
+      planSha256: z.string().regex(/^[a-f0-9]{64}$/),
+      redirectSequence: z.number().int().min(0).max(2),
+      resolver: z
+        .enum(["filebase_control", "filebase_gateway", "delegated_ipfs"])
+        .nullable()
+        .default(null),
+    })
+    .superRefine((value, context) => {
+      const resolverIsValid =
+        (value.operationKind === "names_read" &&
+          value.resolver === "filebase_control") ||
+        (value.operationKind === "public_resolve" &&
+          (value.resolver === "filebase_gateway" ||
+            value.resolver === "delegated_ipfs")) ||
+        (!(["names_read", "public_resolve"] as const).includes(
+          value.operationKind as "names_read" | "public_resolve",
+        ) &&
+          value.resolver === null);
+      if (!resolverIsValid) {
+        context.addIssue({
+          code: "custom",
+          message: "preflight resolver does not match its closed operation",
+        });
+      }
+    })
+    .parse(inputValue);
+  const sql = postgres(databaseUrl, { max: 1 });
+  try {
+    return await sql.begin(async (transaction) => {
+      await lock(transaction);
+      const { plan, row } = await loadExactPlanRowForUpdate(transaction, input);
+      if (
+        !["awaiting_configuration", "awaiting_approval", "executing"].includes(
+          row.state,
+        )
+      ) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot preflight requires an eligible exact plan",
+        );
+      }
+      const target =
+        input.domain === "open_data"
+          ? plan.targets.openData
+          : plan.targets.queryTable;
+      const identity =
+        input.operationKind === "names_read" ||
+        input.operationKind === "public_resolve"
+          ? `${target.ipnsNetworkKey}:${input.resolver}`
+          : target.bucket;
+      const logicalId = logicalRequestId({
+        category: "bucket_names_preflight",
+        domain: input.domain,
+        identity,
+        operationKind: input.operationKind,
+        planId: plan.planId,
+      });
+      const id = deterministicId("snapshotdemorequest", [
+        "candidate-source-snapshot-preflight-request-v1",
+        plan.planId,
+        logicalId,
+        String(input.attemptSequence),
+        String(input.redirectSequence),
+      ]);
+      const existing = await transaction<
+        {
+          attempt_sequence: number;
+          domain: CandidateSourceSnapshotIpnsDomain;
+          logical_request_id: string;
+          operation_kind: z.infer<typeof preflightOperationKindSchema>;
+          outcome: CandidateSourceSnapshotPreflightRequestAdmission["outcome"];
+          redirect_sequence: number;
+          request_id: string;
+          resolver: CandidateSourceSnapshotPreflightRequestAdmission["resolver"];
+        }[]
+      >`
+        SELECT request_id, logical_request_id, domain, operation_kind,
+               resolver, attempt_sequence, redirect_sequence, outcome
+        FROM oracle_candidate_source_snapshot_demo_requests
+        WHERE request_id = ${id}
+        FOR UPDATE
+      `;
+      if (existing[0]) {
+        const replay = existing[0];
+        if (
+          replay.logical_request_id !== logicalId ||
+          replay.domain !== input.domain ||
+          replay.operation_kind !== input.operationKind ||
+          replay.resolver !== input.resolver ||
+          replay.attempt_sequence !== input.attemptSequence ||
+          replay.redirect_sequence !== input.redirectSequence
+        ) {
+          throw new DurableConflictError(
+            "Candidate source-snapshot preflight admission replay conflicts",
+          );
+        }
+        return {
+          ...input,
+          alreadyRecorded: true,
+          logicalRequestId: logicalId,
+          outcome: replay.outcome,
+          requestId: id,
+        };
+      }
+      const accountingRows = await transaction<AccountingRow[]>`
+        SELECT request_count, class_a_mutation_count, class_b_read_count,
+               names_api_count, public_resolver_count, free_operation_count,
+               request_cost_usd, revision
+        FROM oracle_candidate_source_snapshot_demo_accounting
+        WHERE plan_id = ${plan.planId}
+        FOR UPDATE
+      `;
+      const current = accountingRows[0];
+      if (!current) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot preflight accounting is missing",
+        );
+      }
+      const requestCostUsd = 0.0045 / 1_000;
+      const operationClass = preflightOperationClass(input.operationKind);
+      const nextRequestCount = current.request_count + 1;
+      const nextRequestCostUsd =
+        Number(current.request_cost_usd) + requestCostUsd;
+      if (
+        nextRequestCount > plan.requestEnvelope.maximumTotalRequests ||
+        nextRequestCostUsd > plan.costEnvelope.requestUsd.maximumAttempts
+      ) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot preflight request allowance is exhausted",
+        );
+      }
+      const updated = await transaction<{ plan_id: string }[]>`
+        UPDATE oracle_candidate_source_snapshot_demo_accounting
+        SET request_count = request_count + 1,
+            class_b_read_count = class_b_read_count +
+              ${operationClass === "class_b_read" ? 1 : 0},
+            names_api_count = names_api_count +
+              ${operationClass === "names_api" ? 1 : 0},
+            public_resolver_count = public_resolver_count +
+              ${operationClass === "public_resolver" ? 1 : 0},
+            request_cost_usd = request_cost_usd + ${requestCostUsd},
+            revision = revision + 1
+        WHERE plan_id = ${plan.planId} AND revision = ${current.revision}
+        RETURNING plan_id
+      `;
+      if (!updated[0]) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot preflight lost global admission",
+        );
+      }
+      await incrementRequestCategory(transaction, {
+        category: "bucket_names_preflight",
+        plan,
+        requestCostUsd,
+      });
+      await transaction`
+        INSERT INTO oracle_candidate_source_snapshot_demo_requests (
+          request_id, plan_id, operation_class, operation_kind, domain,
+          resolver, request_cost_usd, outcome, request_category,
+          logical_request_id, attempt_sequence, redirect_sequence
+        ) VALUES (
+          ${id}, ${plan.planId}, ${operationClass}, ${input.operationKind},
+          ${input.domain}, ${input.resolver}, ${requestCostUsd},
+          'request_started', 'bucket_names_preflight', ${logicalId},
+          ${input.attemptSequence}, ${input.redirectSequence}
+        )
+      `;
+      return {
+        ...input,
+        alreadyRecorded: false,
+        logicalRequestId: logicalId,
+        outcome: "request_started" as const,
+        requestId: id,
+      };
+    });
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
+}
+
+export interface CandidateSourceSnapshotPreflightRequestOutcomeInput {
+  admission: CandidateSourceSnapshotPreflightRequestAdmission;
+  completedAt: string;
+  outcome: z.infer<typeof preflightRequestOutcomeSchema>;
+  receiptSha256: string;
+}
+
+async function recordPreflightRequestOutcomeInTransaction(
+  transaction: postgres.TransactionSql,
+  inputValue: CandidateSourceSnapshotPreflightRequestOutcomeInput,
+): Promise<void> {
+  const completedAt = operatorTimestampSchema.parse(inputValue.completedAt);
+  const outcome = preflightRequestOutcomeSchema.parse(inputValue.outcome);
+  const receiptSha256 = z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .parse(inputValue.receiptSha256);
+  const admission = inputValue.admission;
+  const { plan } = await loadExactPlanRowForUpdate(transaction, admission);
+  const rows = await transaction<
+    {
+      attempt_sequence: number;
+      logical_request_id: string;
+      operation_kind: string;
+      outcome: string;
+      receipt_sha256: string | null;
+      redirect_sequence: number;
+      resolver: string | null;
+    }[]
+  >`
+    SELECT logical_request_id, operation_kind, resolver,
+           attempt_sequence, redirect_sequence, outcome, receipt_sha256
+    FROM oracle_candidate_source_snapshot_demo_requests
+    WHERE request_id = ${admission.requestId}
+      AND plan_id = ${plan.planId}
+      AND request_category = 'bucket_names_preflight'
+    FOR UPDATE
+  `;
+  const row = rows[0];
+  if (
+    !row ||
+    row.logical_request_id !== admission.logicalRequestId ||
+    row.operation_kind !== admission.operationKind ||
+    row.resolver !== admission.resolver ||
+    row.attempt_sequence !== admission.attemptSequence ||
+    row.redirect_sequence !== admission.redirectSequence
+  ) {
+    throw new DurableConflictError(
+      "Candidate source-snapshot preflight outcome lacks exact admission",
+    );
+  }
+  if (row.outcome !== "request_started") {
+    if (row.outcome === outcome && row.receipt_sha256 === receiptSha256) {
+      return;
+    }
+    throw new DurableConflictError(
+      "Candidate source-snapshot preflight outcome replay conflicts",
+    );
+  }
+  const updated = await transaction<{ request_id: string }[]>`
+    UPDATE oracle_candidate_source_snapshot_demo_requests
+    SET outcome = ${outcome}, receipt_sha256 = ${receiptSha256},
+        completed_at = ${completedAt}
+    WHERE request_id = ${admission.requestId}
+      AND outcome = 'request_started'
+    RETURNING request_id
+  `;
+  if (!updated[0]) {
+    throw new DurableConflictError(
+      "Candidate source-snapshot preflight outcome lost its admission",
+    );
+  }
+}
+
+export async function recordCandidateSourceSnapshotPreflightRequestOutcome(
+  databaseUrl: string,
+  inputValue: CandidateSourceSnapshotPreflightRequestOutcomeInput,
+): Promise<void> {
+  const resolverScoped = inputValue.admission.resolver !== null;
+  const interruptedResolverClosure =
+    resolverScoped &&
+    inputValue.admission.alreadyRecorded &&
+    inputValue.admission.outcome === "request_started" &&
+    inputValue.outcome === "timeout_unknown";
+  if (resolverScoped && !interruptedResolverClosure) {
+    throw new DurableInputError(
+      "Candidate source-snapshot resolver preflight outcomes must be recorded as one atomic cycle",
+    );
+  }
+  const sql = postgres(databaseUrl, { max: 1 });
+  try {
+    await sql.begin(async (transaction) => {
+      await lock(transaction);
+      await recordPreflightRequestOutcomeInTransaction(transaction, inputValue);
+    });
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
+}
+
+export async function recordCandidateSourceSnapshotPreflightCycleOutcomes(
+  databaseUrl: string,
+  inputValues: readonly CandidateSourceSnapshotPreflightRequestOutcomeInput[],
+): Promise<void> {
+  if (inputValues.length !== 3) {
+    throw new DurableInputError(
+      "Candidate source-snapshot preflight cycle requires exactly three resolver outcomes",
+    );
+  }
+  const first = inputValues[0]!.admission;
+  const resolvers = new Set(
+    inputValues.map((value) => value.admission.resolver),
+  );
+  if (
+    resolvers.size !== 3 ||
+    !["filebase_control", "filebase_gateway", "delegated_ipfs"].every(
+      (resolver) => resolvers.has(resolver as typeof first.resolver),
+    ) ||
+    inputValues.some(
+      ({ admission }) =>
+        admission.planId !== first.planId ||
+        admission.planSha256 !== first.planSha256 ||
+        admission.domain !== first.domain ||
+        admission.attemptSequence !== first.attemptSequence,
+    )
+  ) {
+    throw new DurableInputError(
+      "Candidate source-snapshot preflight cycle identity is inconsistent",
+    );
+  }
+  const sql = postgres(databaseUrl, { max: 1 });
+  try {
+    await sql.begin(async (transaction) => {
+      await lock(transaction);
+      for (const input of inputValues) {
+        await recordPreflightRequestOutcomeInTransaction(transaction, input);
+      }
+    });
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
+}
+
+export async function loadCandidateSourceSnapshotPreflightRequestOutcome(
+  databaseUrl: string,
+  admission: CandidateSourceSnapshotPreflightRequestAdmission,
+): Promise<{
+  completedAt: string | null;
+  outcome: CandidateSourceSnapshotPreflightRequestAdmission["outcome"];
+  receiptSha256: string | null;
+  requestId: string;
+}> {
+  const sql = postgres(databaseUrl, { max: 1 });
+  try {
+    const rows = await sql<
+      {
+        attempt_sequence: number;
+        completed_at: Date | null;
+        domain: CandidateSourceSnapshotIpnsDomain;
+        logical_request_id: string;
+        operation_kind: string;
+        outcome: CandidateSourceSnapshotPreflightRequestAdmission["outcome"];
+        receipt_sha256: string | null;
+        redirect_sequence: number;
+        resolver: CandidateSourceSnapshotPreflightRequestAdmission["resolver"];
+      }[]
+    >`
+      SELECT logical_request_id, domain, operation_kind, resolver,
+             attempt_sequence, redirect_sequence, outcome, receipt_sha256,
+             completed_at
+      FROM oracle_candidate_source_snapshot_demo_requests
+      WHERE request_id = ${admission.requestId}
+        AND plan_id = ${admission.planId}
+        AND request_category = 'bucket_names_preflight'
+    `;
+    const row = rows[0];
+    if (
+      !row ||
+      row.logical_request_id !== admission.logicalRequestId ||
+      row.domain !== admission.domain ||
+      row.operation_kind !== admission.operationKind ||
+      row.resolver !== admission.resolver ||
+      row.attempt_sequence !== admission.attemptSequence ||
+      row.redirect_sequence !== admission.redirectSequence ||
+      (row.outcome === "request_started") !== (row.completed_at === null) ||
+      (row.outcome === "request_started") !== (row.receipt_sha256 === null)
+    ) {
+      throw new DurableConflictError(
+        "Candidate source-snapshot preflight resume binding is invalid",
+      );
+    }
+    return {
+      completedAt: row.completed_at?.toISOString() ?? null,
+      outcome: row.outcome,
+      receiptSha256: row.receipt_sha256,
+      requestId: admission.requestId,
+    };
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
+}
+
+export async function loadCandidateSourceSnapshotIpnsIntentState(
+  databaseUrl: string,
+  inputValue: {
+    domain: CandidateSourceSnapshotIpnsDomain;
+    intentId: string;
+    planId: string;
+    planSha256: string;
+  },
+): Promise<CandidateSourceSnapshotIpnsIntentStateRecord> {
+  const input = z
+    .strictObject({
+      domain: ipnsDomainSchema,
+      intentId: z.string().regex(/^snapshotdemointent_[a-f0-9]{32}$/),
+      planId: z.string().regex(/^snapshotdemo_[a-f0-9]{32}$/),
+      planSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    })
+    .parse(inputValue);
+  const sql = postgres(databaseUrl, { max: 1 });
+  try {
+    return await sql.begin(async (transaction) => {
+      await lock(transaction);
+      const { plan } = await loadExactPlanRowForUpdate(transaction, input);
+      const rows = await transaction<
+        CandidateSourceSnapshotIpnsIntentStateRow[]
+      >`
+        SELECT intent.intent_id, intent.approval_id, intent.upload_closure_id,
+               intent.resolver_policy, intent.cutover_position,
+               intent.rollback_position, intent.domain, intent.bucket,
+               intent.ipns_label, intent.ipns_network_key, intent.prior_cid,
+               intent.target_cid, intent.intended_at,
+               intent_state.state, intent_state.revision,
+               (SELECT count(*)::text
+                  FROM oracle_candidate_source_snapshot_demo_ipns_attempts attempt
+                  WHERE attempt.intent_id = intent.intent_id
+               ) AS mutation_attempt_count,
+               (SELECT count(*)::text
+                  FROM oracle_candidate_source_snapshot_demo_ipns_attempts attempt
+                  WHERE attempt.intent_id = intent.intent_id
+                    AND attempt.direction = 'update'
+               ) AS update_attempt_count,
+               (SELECT count(*)::text
+                  FROM oracle_candidate_source_snapshot_demo_ipns_attempts attempt
+                  WHERE attempt.intent_id = intent.intent_id
+                    AND attempt.direction = 'rollback'
+               ) AS rollback_attempt_count
+        FROM oracle_candidate_source_snapshot_demo_ipns_intents intent
+        JOIN oracle_candidate_source_snapshot_demo_ipns_intent_state intent_state
+          ON intent_state.intent_id = intent.intent_id
+        WHERE intent.intent_id = ${input.intentId}
+          AND intent.plan_id = ${plan.planId}
+          AND intent.plan_sha256 = ${plan.planSha256}
+          AND intent.domain = ${input.domain}
+        FOR UPDATE OF intent_state
+      `;
+      const row = rows[0];
+      if (!row) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot IPNS intent state is not durable",
+        );
+      }
+      return ipnsIntentStateRecord(plan, row);
+    });
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
+}
+
+export async function recordCandidateSourceSnapshotIpnsRetryAuthorization(
+  databaseUrl: string,
+  planValue: CandidateSourceSnapshotDemoPlan,
+  inputValue: {
+    authorization:
+      | CandidateSourceSnapshotIpnsReplayAuthorization
+      | CandidateSourceSnapshotIpnsRollbackAuthorization;
+    direction: "rollback" | "update";
+  },
+): Promise<
+  | CandidateSourceSnapshotIpnsReplayAuthorization
+  | CandidateSourceSnapshotIpnsRollbackAuthorization
+> {
+  const plan = validateCandidateSourceSnapshotDemoPlan(planValue);
+  const input = z
+    .strictObject({
+      authorization: z.strictObject({
+        authorizationId: z.string().regex(/^snapshotdemoreplay_[a-f0-9]{32}$/),
+        authorizationSha256: z.string().regex(/^[a-f0-9]{64}$/),
+        authorizationStatement: z.string().min(1).max(8_192),
+        authorizedAttempt: z.number().int().min(1).max(3),
+        authorizedAt: z.string().datetime({ offset: true }),
+        authorizerReference: z.string().regex(/^[a-z0-9][a-z0-9_-]{2,127}$/),
+        domain: ipnsDomainSchema,
+        intentId: z.string().regex(/^snapshotdemointent_[a-f0-9]{32}$/),
+        planId: z.string().regex(/^snapshotdemo_[a-f0-9]{32}$/),
+        planSha256: z.string().regex(/^[a-f0-9]{64}$/),
+        priorCid: z
+          .string()
+          .regex(/^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,120})$/),
+        targetCid: z.string().regex(/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/),
+      }),
+      direction: z.enum(["rollback", "update"]),
+    })
+    .parse(inputValue);
+  const authorization = input.authorization;
+  const authorizedAt = new Date(authorization.authorizedAt).toISOString();
+  const expectedStatement =
+    renderCandidateSourceSnapshotIpnsRetryAuthorizationStatement(
+      authorization,
+      input.direction,
+    );
+  if (
+    authorization.authorizedAt !== authorizedAt ||
+    authorization.authorizationStatement !== expectedStatement ||
+    authorization.authorizationSha256 !== sha256(expectedStatement) ||
+    authorization.planId !== plan.planId ||
+    authorization.planSha256 !== plan.planSha256 ||
+    (input.direction === "rollback" && authorization.domain !== "open_data")
+  ) {
+    throw new DurableInputError(
+      "Candidate source-snapshot retry authorization statement is not exact",
+    );
+  }
+  const requestedCid =
+    input.direction === "update"
+      ? authorization.targetCid
+      : authorization.priorCid;
+  const sql = postgres(databaseUrl, { max: 1 });
+  try {
+    return await sql.begin(async (transaction) => {
+      await lock(transaction);
+      const { row } = await loadExactPlanRowForUpdate(transaction, plan);
+      if (row.state !== "executing") {
+        throw new DurableConflictError(
+          "Candidate source-snapshot retry authorization requires executing plan",
+        );
+      }
+      const intents = await transaction<
+        { prior_cid: string; target_cid: string }[]
+      >`
+        SELECT prior_cid, target_cid
+        FROM oracle_candidate_source_snapshot_demo_ipns_intents
+        WHERE intent_id = ${authorization.intentId}
+          AND plan_id = ${plan.planId} AND plan_sha256 = ${plan.planSha256}
+          AND domain = ${authorization.domain}
+        FOR UPDATE
+      `;
+      if (
+        intents[0]?.prior_cid !== authorization.priorCid ||
+        intents[0]?.target_cid !== authorization.targetCid
+      ) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot retry authorization lacks its exact intent",
+        );
+      }
+      const existing = await transaction<
+        {
+          authorization_id: string;
+          authorization_sha256: string;
+          authorized_at: Date;
+          authorizer_reference: string;
+          direction: "rollback" | "update";
+          domain: CandidateSourceSnapshotIpnsDomain;
+          intent_id: string;
+          plan_id: string;
+          requested_cid: string;
+        }[]
+      >`
+        SELECT authorization_id, intent_id, plan_id, domain, direction,
+               requested_cid, authorization_sha256, authorizer_reference,
+               authorized_at
+        FROM oracle_candidate_source_snapshot_demo_replay_authorizations
+        WHERE authorization_id = ${authorization.authorizationId}
+           OR (intent_id = ${authorization.intentId}
+               AND direction = ${input.direction}
+               AND authorization_sha256 = ${authorization.authorizationSha256})
+        FOR UPDATE
+      `;
+      if (existing.length > 0) {
+        const replay = existing[0]!;
+        if (
+          existing.length !== 1 ||
+          replay.authorization_id !== authorization.authorizationId ||
+          replay.authorization_sha256 !== authorization.authorizationSha256 ||
+          replay.authorized_at.toISOString() !== authorization.authorizedAt ||
+          replay.authorizer_reference !== authorization.authorizerReference ||
+          replay.direction !== input.direction ||
+          replay.domain !== authorization.domain ||
+          replay.intent_id !== authorization.intentId ||
+          replay.plan_id !== plan.planId ||
+          replay.requested_cid !== requestedCid
+        ) {
+          throw new DurableConflictError(
+            "Candidate source-snapshot retry authorization replay conflicts",
+          );
+        }
+        return authorization;
+      }
+      const attemptCounts = await transaction<{ attempt_count: number }[]>`
+        SELECT count(*)::integer AS attempt_count
+        FROM oracle_candidate_source_snapshot_demo_ipns_attempts
+        WHERE intent_id = ${authorization.intentId}
+          AND direction = ${input.direction}
+      `;
+      if (
+        authorization.authorizedAttempt !==
+        (attemptCounts[0]?.attempt_count ?? 0) + 1
+      ) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot retry authorization attempt is not next",
+        );
+      }
+      await transaction`
+        INSERT INTO oracle_candidate_source_snapshot_demo_replay_authorizations (
+          authorization_id, intent_id, plan_id, domain, direction,
+          requested_cid, authorization_sha256, authorizer_reference,
+          authorized_at
+        ) VALUES (
+          ${authorization.authorizationId}, ${authorization.intentId},
+          ${plan.planId}, ${authorization.domain}, ${input.direction},
+          ${requestedCid}, ${authorization.authorizationSha256},
+          ${authorization.authorizerReference}, ${authorization.authorizedAt}
+        )
+      `;
+      return authorization;
+    });
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
+}
+
+export async function loadCandidateSourceSnapshotIpnsIntents(
+  databaseUrl: string,
+  inputValue: {
+    planId: string;
+    planSha256: string;
+  },
+): Promise<readonly CandidateSourceSnapshotIpnsIntentStateRecord[]> {
+  const input = z
+    .strictObject({
+      planId: z.string().regex(/^snapshotdemo_[a-f0-9]{32}$/),
+      planSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    })
+    .parse(inputValue);
+  const sql = postgres(databaseUrl, { max: 1 });
+  try {
+    return await sql.begin(async (transaction) => {
+      await lock(transaction);
+      const { plan } = await loadExactPlanRowForUpdate(transaction, input);
+      const rows = await transaction<
+        CandidateSourceSnapshotIpnsIntentStateRow[]
+      >`
+        SELECT intent.intent_id, intent.approval_id, intent.upload_closure_id,
+               intent.resolver_policy, intent.cutover_position,
+               intent.rollback_position, intent.domain, intent.bucket,
+               intent.ipns_label, intent.ipns_network_key, intent.prior_cid,
+               intent.target_cid, intent.intended_at,
+               intent_state.state, intent_state.revision,
+               (SELECT count(*)::text
+                  FROM oracle_candidate_source_snapshot_demo_ipns_attempts attempt
+                  WHERE attempt.intent_id = intent.intent_id
+               ) AS mutation_attempt_count,
+               (SELECT count(*)::text
+                  FROM oracle_candidate_source_snapshot_demo_ipns_attempts attempt
+                  WHERE attempt.intent_id = intent.intent_id
+                    AND attempt.direction = 'update'
+               ) AS update_attempt_count,
+               (SELECT count(*)::text
+                  FROM oracle_candidate_source_snapshot_demo_ipns_attempts attempt
+                  WHERE attempt.intent_id = intent.intent_id
+                    AND attempt.direction = 'rollback'
+               ) AS rollback_attempt_count
+        FROM oracle_candidate_source_snapshot_demo_ipns_intents intent
+        JOIN oracle_candidate_source_snapshot_demo_ipns_intent_state intent_state
+          ON intent_state.intent_id = intent.intent_id
+        WHERE intent.plan_id = ${plan.planId}
+          AND intent.plan_sha256 = ${plan.planSha256}
+        ORDER BY intent.cutover_position
+        FOR UPDATE OF intent_state
+      `;
+      if (
+        rows.length !== 2 ||
+        rows[0]?.domain !== "open_data" ||
+        rows[0]?.cutover_position !== 1 ||
+        rows[1]?.domain !== "query_table" ||
+        rows[1]?.cutover_position !== 2
+      ) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot IPNS intent set is incomplete",
+        );
+      }
+      const records = rows.map((row) => ipnsIntentStateRecord(plan, row));
+      if (
+        records[0]?.approvalId !== records[1]?.approvalId ||
+        records[0]?.uploadClosureId !== records[1]?.uploadClosureId
+      ) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot IPNS intent set conflicts",
+        );
+      }
+      return records;
+    });
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
 }
 
 function attemptId(input: {
@@ -1894,22 +2937,6 @@ async function loadIpnsIntentForUpdate(
   return rows[0];
 }
 
-function remoteRequestAllowance(
-  plan: CandidateSourceSnapshotDemoPlan,
-  operationClass: "names_api" | "public_resolver",
-): number {
-  if (operationClass === "names_api") {
-    return (
-      plan.requestEnvelope.maximumAttempts.namesApiOperations +
-      plan.requestEnvelope.recoveryAllowance.namesApiOperations
-    );
-  }
-  return (
-    plan.requestEnvelope.maximumAttempts.publicResolverOperations +
-    plan.requestEnvelope.recoveryAllowance.publicResolverOperations
-  );
-}
-
 async function admitIpnsRemoteRequest(
   transaction: postgres.TransactionSql,
   input: {
@@ -1919,6 +2946,10 @@ async function admitIpnsRemoteRequest(
     intentId: string;
     operationKind: CandidateSourceSnapshotRemoteRequestAdmission["operationKind"];
     plan: CandidateSourceSnapshotDemoPlan;
+    requestCategory: Extract<
+      CandidateSourceSnapshotRequestCategory,
+      "control_public_observation" | "names_mutation" | "recovery" | "rollback"
+    >;
     resolver: CandidateSourceSnapshotIpnsResolver | null;
     sequence: number;
   },
@@ -1940,8 +2971,8 @@ async function admitIpnsRemoteRequest(
     sequence: input.sequence,
   });
   const existing = await transaction<RemoteRequestRow[]>`
-    SELECT request_id, intent_id, domain, operation_kind, cycle_sequence,
-           resolver, outcome, receipt_sha256, completed_at
+    SELECT request_id, intent_id, domain, operation_kind, request_category,
+           cycle_sequence, resolver, outcome, receipt_sha256, completed_at
     FROM oracle_candidate_source_snapshot_demo_requests
     WHERE request_id = ${id}
     FOR UPDATE
@@ -1952,6 +2983,7 @@ async function admitIpnsRemoteRequest(
       row.intent_id !== input.intentId ||
       row.domain !== input.domain ||
       row.operation_kind !== input.operationKind ||
+      row.request_category !== input.requestCategory ||
       row.cycle_sequence !== input.cycleSequence ||
       row.resolver !== input.resolver
     ) {
@@ -1980,6 +3012,7 @@ async function admitIpnsRemoteRequest(
       operationKind: row.operation_kind,
       outcome: row.outcome,
       requestId: row.request_id,
+      requestCategory: row.request_category,
       resolver: row.resolver,
     };
   }
@@ -2012,16 +3045,8 @@ async function admitIpnsRemoteRequest(
     request_count: current.request_count + 1,
     revision: current.revision + 1,
   });
-  const classCount =
-    operationClass === "names_api"
-      ? nextAccounting.namesApiCount
-      : nextAccounting.publicResolverCount;
-  const allowedRequestCost =
-    input.plan.costEnvelope.requestUsd.maximumAttempts +
-    input.plan.costEnvelope.requestUsd.ambiguousObjectInspections +
-    input.plan.costEnvelope.recoveryRequestUsd;
+  const allowedRequestCost = input.plan.costEnvelope.requestUsd.maximumAttempts;
   if (
-    classCount > remoteRequestAllowance(input.plan, operationClass) ||
     nextAccounting.requestCount >
       input.plan.requestEnvelope.maximumTotalRequests ||
     nextAccounting.requestCostUsd > allowedRequestCost
@@ -2045,14 +3070,29 @@ async function admitIpnsRemoteRequest(
       "Candidate source-snapshot remote request lost its accounting admission",
     );
   }
+  await incrementRequestCategory(transaction, {
+    category: input.requestCategory,
+    plan: input.plan,
+    requestCostUsd,
+  });
+  const logicalId = logicalRequestId({
+    category: input.requestCategory,
+    domain: input.domain,
+    identity: `${input.intentId}:${input.identityScope}:${input.cycleSequence ?? 0}:${input.resolver ?? "none"}`,
+    operationKind: input.operationKind,
+    planId: input.plan.planId,
+  });
   await transaction`
     INSERT INTO oracle_candidate_source_snapshot_demo_requests (
       request_id, plan_id, operation_class, operation_kind, intent_id, domain,
-      remote_object_key, cycle_sequence, resolver, request_cost_usd, outcome
+      remote_object_key, cycle_sequence, resolver, request_cost_usd, outcome,
+      request_category, logical_request_id, attempt_sequence, redirect_sequence
     ) VALUES (
       ${id}, ${input.plan.planId}, ${operationClass}, ${input.operationKind},
       ${input.intentId}, ${input.domain}, NULL, ${input.cycleSequence},
-      ${input.resolver}, ${requestCostUsd}, 'request_started'
+      ${input.resolver}, ${requestCostUsd}, 'request_started',
+      ${input.requestCategory}, ${logicalId},
+      ${input.operationKind === "names_update" ? input.sequence : 1}, 0
     )
   `;
   return {
@@ -2064,6 +3104,7 @@ async function admitIpnsRemoteRequest(
     operationKind: input.operationKind,
     outcome: "request_started",
     requestId: id,
+    requestCategory: input.requestCategory,
     resolver: input.resolver,
   };
 }
@@ -2079,6 +3120,7 @@ async function admitRequest(
   },
 ): Promise<{
   accounting: CandidateSourceSnapshotPlanAccounting;
+  alreadyRecorded: boolean;
   attempt: CandidateSourceSnapshotUploadAttempt;
   replayedResult: CandidateSourceSnapshotInspectionResult | null;
 }> {
@@ -2086,6 +3128,60 @@ async function admitRequest(
   await loadObjectForUpdate(transaction, input.plan, input.object);
   const id = requestId(input);
   const attemptIdValue = attemptId(input);
+  if (input.operation === "upload") {
+    const existing = await transaction<
+      {
+        attempt_id: string;
+        attempt_sequence: number;
+        outcome: CandidateSourceSnapshotUploadAttempt["outcome"];
+        request_id: string;
+        started_at: Date;
+      }[]
+    >`
+      SELECT attempt_id, request_id, attempt_sequence, outcome, started_at
+      FROM oracle_candidate_source_snapshot_demo_upload_attempts
+      WHERE attempt_id = ${attemptIdValue}
+        AND plan_id = ${input.plan.planId}
+        AND domain = ${input.object.domain}
+        AND remote_object_key = ${input.object.remoteObjectKey}
+        AND attempt_sequence = ${input.sequence}
+      FOR UPDATE
+    `;
+    if (existing[0]) {
+      const row = existing[0];
+      if (row.request_id !== id) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot upload admission replay conflicts with durable identity",
+        );
+      }
+      const accountingRows = await transaction<AccountingRow[]>`
+        SELECT request_count, class_a_mutation_count, class_b_read_count,
+               names_api_count, public_resolver_count, free_operation_count,
+               request_cost_usd, revision
+        FROM oracle_candidate_source_snapshot_demo_accounting
+        WHERE plan_id = ${input.plan.planId}
+      `;
+      if (!accountingRows[0]) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot accounting is missing",
+        );
+      }
+      return {
+        accounting: accounting(accountingRows[0]),
+        alreadyRecorded: true,
+        attempt: {
+          attemptId: row.attempt_id,
+          attemptSequence: row.attempt_sequence,
+          operation: "upload",
+          outcome: row.outcome,
+          recoveryUploadAttemptId: null,
+          requestId: row.request_id,
+          startedAt: row.started_at.toISOString(),
+        },
+        replayedResult: null,
+      };
+    }
+  }
   if (input.operation === "inspect") {
     if (!input.recoveryAttempt) {
       throw new DurableInputError(
@@ -2168,6 +3264,7 @@ async function admitRequest(
               };
       return {
         accounting: accounting(accountingRows[0]),
+        alreadyRecorded: true,
         attempt: {
           attemptId: row.inspection_id,
           attemptSequence: input.sequence,
@@ -2202,16 +3299,13 @@ async function admitRequest(
   const nextRequestCount = current.request_count + 1;
   const requestCostUsd = 0.0045 / 1_000;
   const nextRequestCostUsd = Number(current.request_cost_usd) + requestCostUsd;
+  const requestCategory =
+    input.operation === "upload"
+      ? "upload_provider_cid"
+      : "ambiguous_upload_inspection";
   if (
-    nextClassA > input.plan.requestEnvelope.maximumAttempts.classAMutations ||
-    nextClassB >
-      input.plan.requestEnvelope.ambiguousObjectInspectionAllowance
-        .classBReads ||
     nextRequestCount > input.plan.requestEnvelope.maximumTotalRequests ||
-    nextRequestCostUsd >
-      input.plan.costEnvelope.requestUsd.maximumAttempts +
-        input.plan.costEnvelope.requestUsd.ambiguousObjectInspections +
-        input.plan.costEnvelope.recoveryRequestUsd
+    nextRequestCostUsd > input.plan.costEnvelope.requestUsd.maximumAttempts
   ) {
     throw new DurableConflictError(
       "Candidate source-snapshot request or cost allowance is exhausted",
@@ -2242,18 +3336,32 @@ async function admitRequest(
       "Candidate source-snapshot request lost its accounting admission",
     );
   }
+  await incrementRequestCategory(transaction, {
+    category: requestCategory,
+    plan: input.plan,
+    requestCostUsd,
+  });
   const operationClass =
     input.operation === "upload" ? "class_a_mutation" : "class_b_read";
   const operationKind =
     input.operation === "upload" ? "put_object" : "inspect_object";
+  const logicalId = logicalRequestId({
+    category: requestCategory,
+    domain: input.object.domain,
+    identity: input.object.remoteObjectKey,
+    operationKind,
+    planId: input.plan.planId,
+  });
   await transaction`
     INSERT INTO oracle_candidate_source_snapshot_demo_requests (
       request_id, plan_id, operation_class, operation_kind, domain,
-      remote_object_key, request_cost_usd, outcome
+      remote_object_key, request_cost_usd, outcome, request_category,
+      logical_request_id, attempt_sequence, redirect_sequence
     ) VALUES (
       ${id}, ${input.plan.planId}, ${operationClass}, ${operationKind},
       ${input.object.domain}, ${input.object.remoteObjectKey},
-      ${requestCostUsd}, 'request_started'
+      ${requestCostUsd}, 'request_started', ${requestCategory}, ${logicalId},
+      ${input.sequence}, 0
     )
   `;
   const attempt: CandidateSourceSnapshotUploadAttempt = {
@@ -2266,7 +3374,7 @@ async function admitRequest(
     requestId: id,
   };
   if (input.operation === "upload") {
-    await transaction`
+    const insertedAttempts = await transaction<{ started_at: Date }[]>`
       INSERT INTO oracle_candidate_source_snapshot_demo_upload_attempts (
         attempt_id, request_id, plan_id, domain, remote_object_key,
         attempt_sequence, outcome, request_count
@@ -2275,7 +3383,14 @@ async function admitRequest(
         ${input.object.domain}, ${input.object.remoteObjectKey},
         ${input.sequence}, 'request_started', 1
       )
+      RETURNING started_at
     `;
+    if (!insertedAttempts[0]) {
+      throw new DurableConflictError(
+        "Candidate source-snapshot upload attempt was not persisted",
+      );
+    }
+    attempt.startedAt = insertedAttempts[0].started_at.toISOString();
     const objectUpdates = await transaction<{ remote_object_key: string }[]>`
       UPDATE oracle_candidate_source_snapshot_demo_objects
       SET status = 'admitted', attempt_count = attempt_count + 1,
@@ -2320,6 +3435,7 @@ async function admitRequest(
   }
   return {
     accounting: nextAccounting,
+    alreadyRecorded: false,
     attempt,
     replayedResult: null,
   };
@@ -2348,6 +3464,7 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
       cycleSequence: number;
       domain: CandidateSourceSnapshotIpnsDomain;
       intentId: string;
+      requestCategory?: "control_public_observation" | "recovery" | "rollback";
       resolver: CandidateSourceSnapshotIpnsResolver;
     },
   ): Promise<CandidateSourceSnapshotRemoteRequestAdmission> {
@@ -2357,6 +3474,9 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
         cycleSequence: z.number().int().min(1).max(32),
         domain: ipnsDomainSchema,
         intentId: z.string().regex(/^snapshotdemointent_[a-f0-9]{32}$/),
+        requestCategory: z
+          .enum(["control_public_observation", "recovery", "rollback"])
+          .default("control_public_observation"),
         resolver: ipnsResolverSchema,
       })
       .parse(inputValue);
@@ -2369,6 +3489,7 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
           identityScope: "resolution",
           operationKind,
           plan,
+          requestCategory: input.requestCategory,
           sequence: input.cycleSequence,
         }),
     );
@@ -2391,124 +3512,215 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
         | "terminal_failure";
     },
   ): Promise<void> {
+    void planValue;
+    void requestValue;
+    void observationValue;
+    throw new DurableInputError(
+      "Candidate source-snapshot resolver observations must be recorded as one atomic cycle",
+    );
+  }
+
+  async recordResolutionCycle(
+    planValue: CandidateSourceSnapshotDemoPlan,
+    inputValues: readonly {
+      observation: {
+        classification:
+          "prior" | "target" | "split" | "unavailable" | "unexpected_cid";
+        evidenceSha256: string;
+        observedAt: string;
+        observedCid: string | null;
+        requestOutcome:
+          | "succeeded"
+          | "ambiguous"
+          | "retryable_failure"
+          | "timeout_unknown"
+          | "terminal_failure";
+      };
+      request: CandidateSourceSnapshotRemoteRequestAdmission;
+    }[],
+  ): Promise<void> {
     const plan = validateCandidateSourceSnapshotDemoPlan(planValue);
-    const request = z
-      .strictObject({
-        accounting: z.unknown(),
-        alreadyRecorded: z.boolean(),
-        cycleSequence: z.number().int().min(1).max(32),
-        domain: ipnsDomainSchema,
-        intentId: z.string().regex(/^snapshotdemointent_[a-f0-9]{32}$/),
-        operationKind: z.enum(["names_read", "public_resolve"]),
-        outcome: z.enum([
-          "request_started",
-          "succeeded",
-          "ambiguous",
-          "retryable_failure",
-          "timeout_unknown",
-          "terminal_failure",
-        ]),
-        requestId: z.string().regex(/^snapshotdemorequest_[a-f0-9]{32}$/),
-        resolver: ipnsResolverSchema,
-      })
-      .parse(requestValue);
-    const observation = z
-      .strictObject({
-        classification: ipnsObservationClassificationSchema,
-        evidenceSha256: z.string().regex(/^[a-f0-9]{64}$/),
-        observedAt: z.string().datetime({ offset: true }),
-        observedCid: z
-          .string()
-          .regex(/^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,120})$/)
-          .nullable(),
-        requestOutcome: ipnsRequestOutcomeSchema,
-      })
-      .parse(observationValue);
-    const validOutcome =
-      (["prior", "target", "unexpected_cid"].includes(
-        observation.classification,
-      ) &&
-        observation.requestOutcome === "succeeded") ||
-      (observation.classification === "split" &&
-        observation.requestOutcome === "ambiguous") ||
-      (observation.classification === "unavailable" &&
-        ["retryable_failure", "timeout_unknown", "terminal_failure"].includes(
-          observation.requestOutcome,
-        ));
-    if (!validOutcome) {
+    if (inputValues.length !== 3) {
       throw new DurableInputError(
-        "Candidate source-snapshot observation outcome is inconsistent",
+        "Candidate source-snapshot resolution cycle requires exactly three resolver observations",
+      );
+    }
+    const parsed = inputValues.map(({ observation, request }) => {
+      const parsedRequest = z
+        .strictObject({
+          accounting: z.custom<CandidateSourceSnapshotPlanAccounting>(),
+          alreadyRecorded: z.boolean(),
+          cycleSequence: z.number().int().min(1).max(32),
+          domain: ipnsDomainSchema,
+          intentId: z.string().regex(/^snapshotdemointent_[a-f0-9]{32}$/),
+          operationKind: z.enum(["names_read", "public_resolve"]),
+          outcome: z.enum([
+            "request_started",
+            "succeeded",
+            "ambiguous",
+            "retryable_failure",
+            "timeout_unknown",
+            "terminal_failure",
+          ]),
+          requestId: z.string().regex(/^snapshotdemorequest_[a-f0-9]{32}$/),
+          requestCategory: requestCategorySchema,
+          resolver: z.enum([
+            "filebase_control",
+            "filebase_gateway",
+            "delegated_ipfs",
+          ]),
+        })
+        .parse(request);
+      const parsedObservation = z
+        .strictObject({
+          classification: ipnsObservationClassificationSchema,
+          evidenceSha256: z.string().regex(/^[a-f0-9]{64}$/),
+          observedAt: z.string().datetime({ offset: true }),
+          observedCid: z
+            .string()
+            .regex(/^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,120})$/)
+            .nullable(),
+          requestOutcome: ipnsRequestOutcomeSchema,
+        })
+        .parse(observation);
+      const validOutcome =
+        (["prior", "target", "unexpected_cid"].includes(
+          parsedObservation.classification,
+        ) &&
+          parsedObservation.requestOutcome === "succeeded") ||
+        (parsedObservation.classification === "split" &&
+          parsedObservation.requestOutcome === "ambiguous") ||
+        (parsedObservation.classification === "unavailable" &&
+          ["retryable_failure", "timeout_unknown", "terminal_failure"].includes(
+            parsedObservation.requestOutcome,
+          ));
+      if (!validOutcome) {
+        throw new DurableInputError(
+          "Candidate source-snapshot observation outcome is inconsistent",
+        );
+      }
+      return { observation: parsedObservation, request: parsedRequest };
+    });
+    const first = parsed[0]!.request;
+    const resolvers = new Set(parsed.map(({ request }) => request.resolver));
+    if (
+      resolvers.size !== 3 ||
+      !["filebase_control", "filebase_gateway", "delegated_ipfs"].every(
+        (resolver) => resolvers.has(resolver as typeof first.resolver),
+      ) ||
+      parsed.some(
+        ({ request }) =>
+          request.intentId !== first.intentId ||
+          request.domain !== first.domain ||
+          request.cycleSequence !== first.cycleSequence ||
+          request.requestCategory !== first.requestCategory,
+      )
+    ) {
+      throw new DurableInputError(
+        "Candidate source-snapshot resolution cycle identity is inconsistent",
       );
     }
     await this.transaction(async (transaction) => {
-      await assertExecutingPlan(transaction, plan);
-      const intent = await loadIpnsIntentForUpdate(
-        transaction,
-        plan,
-        request.intentId,
-        request.domain,
-      );
-      if (
-        (observation.classification === "prior" &&
-          observation.observedCid !== intent.prior_cid) ||
-        (observation.classification === "target" &&
-          observation.observedCid !== intent.target_cid) ||
-        (["split", "unavailable"].includes(observation.classification) &&
-          observation.observedCid !== null) ||
-        (observation.classification === "unexpected_cid" &&
-          (observation.observedCid === null ||
-            [intent.prior_cid, intent.target_cid].includes(
-              observation.observedCid,
-            )))
-      ) {
-        throw new DurableInputError(
-          "Candidate source-snapshot observation is not bound to the intent",
+      for (const value of parsed) {
+        await this.recordResolutionObservationInTransaction(
+          transaction,
+          plan,
+          value.request,
+          value.observation,
         );
       }
-      const id = ipnsObservationId({
-        cycleSequence: request.cycleSequence,
-        intentId: request.intentId,
-        resolver: request.resolver,
-      });
-      const existing = await transaction<
-        {
-          classification: string;
-          cycle_sequence: number;
-          evidence_sha256: string;
-          intent_id: string;
-          observed_at: Date;
-          observed_cid: string | null;
-          request_id: string;
-          resolver: string;
-        }[]
-      >`
+    });
+  }
+
+  private async recordResolutionObservationInTransaction(
+    transaction: postgres.TransactionSql,
+    plan: CandidateSourceSnapshotDemoPlan,
+    request: CandidateSourceSnapshotRemoteRequestAdmission & {
+      cycleSequence: number;
+      resolver: CandidateSourceSnapshotIpnsResolver;
+    },
+    observation: {
+      classification:
+        "prior" | "target" | "split" | "unavailable" | "unexpected_cid";
+      evidenceSha256: string;
+      observedAt: string;
+      observedCid: string | null;
+      requestOutcome:
+        | "succeeded"
+        | "ambiguous"
+        | "retryable_failure"
+        | "timeout_unknown"
+        | "terminal_failure";
+    },
+  ): Promise<void> {
+    await assertExecutingPlan(transaction, plan);
+    const intent = await loadIpnsIntentForUpdate(
+      transaction,
+      plan,
+      request.intentId,
+      request.domain,
+    );
+    if (
+      (observation.classification === "prior" &&
+        observation.observedCid !== intent.prior_cid) ||
+      (observation.classification === "target" &&
+        observation.observedCid !== intent.target_cid) ||
+      (["split", "unavailable"].includes(observation.classification) &&
+        observation.observedCid !== null) ||
+      (observation.classification === "unexpected_cid" &&
+        (observation.observedCid === null ||
+          [intent.prior_cid, intent.target_cid].includes(
+            observation.observedCid,
+          )))
+    ) {
+      throw new DurableInputError(
+        "Candidate source-snapshot observation is not bound to the intent",
+      );
+    }
+    const id = ipnsObservationId({
+      cycleSequence: request.cycleSequence,
+      intentId: request.intentId,
+      resolver: request.resolver,
+    });
+    const existing = await transaction<
+      {
+        classification: string;
+        cycle_sequence: number;
+        evidence_sha256: string;
+        intent_id: string;
+        observed_at: Date;
+        observed_cid: string | null;
+        request_id: string;
+        resolver: string;
+      }[]
+    >`
         SELECT observation_id, request_id, intent_id, cycle_sequence,
                resolver, classification, observed_cid, evidence_sha256,
                observed_at
         FROM oracle_candidate_source_snapshot_demo_ipns_observations
         WHERE observation_id = ${id}
       `;
-      if (existing[0]) {
-        const row = existing[0];
-        if (
-          row.request_id !== request.requestId ||
-          row.intent_id !== request.intentId ||
-          row.cycle_sequence !== request.cycleSequence ||
-          row.resolver !== request.resolver ||
-          row.classification !== observation.classification ||
-          row.observed_cid !== observation.observedCid ||
-          row.evidence_sha256 !== observation.evidenceSha256 ||
-          row.observed_at.toISOString() !== observation.observedAt
-        ) {
-          throw new DurableConflictError(
-            "Candidate source-snapshot observation replay conflicts with durable evidence",
-          );
-        }
-        return;
+    if (existing[0]) {
+      const row = existing[0];
+      if (
+        row.request_id !== request.requestId ||
+        row.intent_id !== request.intentId ||
+        row.cycle_sequence !== request.cycleSequence ||
+        row.resolver !== request.resolver ||
+        row.classification !== observation.classification ||
+        row.observed_cid !== observation.observedCid ||
+        row.evidence_sha256 !== observation.evidenceSha256 ||
+        row.observed_at.toISOString() !== observation.observedAt
+      ) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot observation replay conflicts with durable evidence",
+        );
       }
-      const requestRows = await transaction<RemoteRequestRow[]>`
-        SELECT request_id, intent_id, domain, operation_kind, cycle_sequence,
-               resolver, outcome, receipt_sha256, completed_at
+      return;
+    }
+    const requestRows = await transaction<RemoteRequestRow[]>`
+        SELECT request_id, intent_id, domain, operation_kind, request_category,
+               cycle_sequence, resolver, outcome, receipt_sha256, completed_at
         FROM oracle_candidate_source_snapshot_demo_requests
         WHERE request_id = ${request.requestId}
           AND plan_id = ${plan.planId}
@@ -2516,14 +3728,15 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
           AND domain = ${request.domain}
           AND cycle_sequence = ${request.cycleSequence}
           AND resolver = ${request.resolver}
+          AND request_category = ${request.requestCategory}
         FOR UPDATE
       `;
-      if (!requestRows[0] || requestRows[0].outcome !== "request_started") {
-        throw new DurableConflictError(
-          "Candidate source-snapshot observation lacks its admitted request",
-        );
-      }
-      const completed = await transaction<{ request_id: string }[]>`
+    if (!requestRows[0] || requestRows[0].outcome !== "request_started") {
+      throw new DurableConflictError(
+        "Candidate source-snapshot observation lacks its admitted request",
+      );
+    }
+    const completed = await transaction<{ request_id: string }[]>`
         UPDATE oracle_candidate_source_snapshot_demo_requests
         SET outcome = ${observation.requestOutcome},
             receipt_sha256 = ${observation.evidenceSha256},
@@ -2531,12 +3744,12 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
         WHERE request_id = ${request.requestId} AND outcome = 'request_started'
         RETURNING request_id
       `;
-      if (!completed[0]) {
-        throw new DurableConflictError(
-          "Candidate source-snapshot observation lost its admitted request",
-        );
-      }
-      await transaction`
+    if (!completed[0]) {
+      throw new DurableConflictError(
+        "Candidate source-snapshot observation lost its admitted request",
+      );
+    }
+    await transaction`
         INSERT INTO oracle_candidate_source_snapshot_demo_ipns_observations (
           observation_id, request_id, intent_id, cycle_sequence, resolver,
           classification, observed_cid, evidence_sha256, observed_at
@@ -2546,8 +3759,7 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
           ${observation.classification}, ${observation.observedCid},
           ${observation.evidenceSha256}, ${observation.observedAt}
         )
-      `;
-    });
+    `;
   }
 
   async startIpnsMutationAttempt(
@@ -2587,6 +3799,12 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
         intentId: input.intentId,
         operationKind: "names_update",
         plan,
+        requestCategory:
+          input.direction === "rollback"
+            ? "rollback"
+            : input.attemptSequence === 1
+              ? "names_mutation"
+              : "recovery",
         resolver: null,
         sequence: input.attemptSequence,
       });
@@ -2646,6 +3864,131 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
         direction: input.direction,
         request,
         requestedCid,
+      };
+    });
+  }
+
+  async closeInterruptedIpnsMutationAttempt(
+    planValue: CandidateSourceSnapshotDemoPlan,
+    inputValue: {
+      direction: "rollback" | "update";
+      domain: CandidateSourceSnapshotIpnsDomain;
+      intentId: string;
+    },
+  ): Promise<CandidateSourceSnapshotInterruptedIpnsAttempt | null> {
+    const plan = validateCandidateSourceSnapshotDemoPlan(planValue);
+    const input = z
+      .strictObject({
+        direction: z.enum(["rollback", "update"]),
+        domain: ipnsDomainSchema,
+        intentId: z.string().regex(/^snapshotdemointent_[a-f0-9]{32}$/),
+      })
+      .parse(inputValue);
+    return await this.transaction(async (transaction) => {
+      await assertExecutingPlan(transaction, plan);
+      await loadIpnsIntentForUpdate(
+        transaction,
+        plan,
+        input.intentId,
+        input.domain,
+      );
+      const rows = await transaction<
+        {
+          attempt_id: string;
+          attempt_sequence: number;
+          direction: "rollback" | "update";
+          request_category: CandidateSourceSnapshotRequestCategory;
+          request_id: string;
+          requested_cid: string;
+        }[]
+      >`
+        SELECT attempt.attempt_id, attempt.attempt_sequence, attempt.direction,
+               attempt.requested_cid, attempt.request_id,
+               request.request_category
+        FROM oracle_candidate_source_snapshot_demo_ipns_attempts attempt
+        JOIN oracle_candidate_source_snapshot_demo_requests request
+          ON request.request_id = attempt.request_id
+        WHERE attempt.plan_id = ${plan.planId}
+          AND attempt.intent_id = ${input.intentId}
+          AND attempt.domain = ${input.domain}
+          AND attempt.direction = ${input.direction}
+          AND attempt.outcome = 'request_started'
+          AND request.outcome = 'request_started'
+        ORDER BY attempt.attempt_sequence
+        FOR UPDATE OF attempt, request
+      `;
+      if (rows.length === 0) return null;
+      if (rows.length !== 1) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot recovery found multiple interrupted IPNS attempts",
+        );
+      }
+      const row = rows[0]!;
+      const receiptSha256 = canonicalJsonSha256({
+        attemptId: row.attempt_id,
+        direction: row.direction,
+        domain: input.domain,
+        intentId: input.intentId,
+        outcome: "timeout_unknown",
+        planId: plan.planId,
+        requestId: row.request_id,
+        requestedCid: row.requested_cid,
+        schemaVersion: "candidate-source-snapshot-interrupted-ipns-v1",
+      });
+      const attempts = await transaction<{ attempt_id: string }[]>`
+        UPDATE oracle_candidate_source_snapshot_demo_ipns_attempts
+        SET outcome = 'timeout_unknown', receipt_sha256 = ${receiptSha256},
+            completed_at = now()
+        WHERE attempt_id = ${row.attempt_id}
+          AND request_id = ${row.request_id}
+          AND outcome = 'request_started'
+        RETURNING attempt_id
+      `;
+      const requests = await transaction<{ request_id: string }[]>`
+        UPDATE oracle_candidate_source_snapshot_demo_requests
+        SET outcome = 'timeout_unknown', receipt_sha256 = ${receiptSha256},
+            completed_at = now()
+        WHERE request_id = ${row.request_id}
+          AND outcome = 'request_started'
+        RETURNING request_id
+      `;
+      if (!attempts[0] || !requests[0]) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot interrupted IPNS admission lost its exact request",
+        );
+      }
+      const accountingRows = await transaction<AccountingRow[]>`
+        SELECT request_count, class_a_mutation_count, class_b_read_count,
+               names_api_count, public_resolver_count, free_operation_count,
+               request_cost_usd, revision
+        FROM oracle_candidate_source_snapshot_demo_accounting
+        WHERE plan_id = ${plan.planId}
+      `;
+      if (!accountingRows[0]) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot accounting is missing",
+        );
+      }
+      return {
+        admission: {
+          attemptId: row.attempt_id,
+          attemptSequence: row.attempt_sequence,
+          direction: row.direction,
+          request: {
+            accounting: accounting(accountingRows[0]),
+            alreadyRecorded: true,
+            cycleSequence: null,
+            domain: input.domain,
+            intentId: input.intentId,
+            operationKind: "names_update",
+            outcome: "timeout_unknown",
+            requestCategory: row.request_category,
+            requestId: row.request_id,
+            resolver: null,
+          },
+          requestedCid: row.requested_cid,
+        },
+        receiptSha256,
       };
     });
   }
@@ -2815,9 +4158,10 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
           attempt_sequence: number;
           outcome: CandidateSourceSnapshotUploadAttempt["outcome"];
           request_id: string;
+          started_at: Date;
         }[]
       >`
-        SELECT attempt_id, attempt_sequence, outcome, request_id
+        SELECT attempt_id, attempt_sequence, outcome, request_id, started_at
         FROM oracle_candidate_source_snapshot_demo_upload_attempts
         WHERE plan_id = ${plan.planId} AND domain = ${object.domain}
           AND remote_object_key = ${object.remoteObjectKey}
@@ -2830,6 +4174,7 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
         outcome: row.outcome,
         recoveryUploadAttemptId: null,
         requestId: row.request_id,
+        startedAt: row.started_at.toISOString(),
       }));
     });
   }
