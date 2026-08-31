@@ -49,7 +49,7 @@ function enabledEnvironment(plan: CandidateSourceSnapshotDemoPlan) {
     CANDIDATE_DEMO_FILEBASE_API_TOKEN: Buffer.from(
       `${access}:${secret}`,
     ).toString("base64"),
-    CANDIDATE_DEMO_FILEBASE_S3_ENDPOINT: "https://s3.filebase.com",
+    CANDIDATE_DEMO_FILEBASE_S3_ENDPOINT: "https://s3.filebase.io",
     CANDIDATE_DEMO_FILEBASE_SECRET_ACCESS_KEY: secret,
     CANDIDATE_DEMO_MAX_BUDGET_USD: String(plan.limits.maxBudgetUsd),
     CANDIDATE_DEMO_MAX_CONCURRENCY: String(plan.limits.maxConcurrency),
@@ -85,7 +85,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(databaseUrl)).toHaveLength(32);
+  expect(await runMigrations(databaseUrl)).toHaveLength(34);
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });
 

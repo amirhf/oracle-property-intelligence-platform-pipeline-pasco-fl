@@ -36,11 +36,17 @@ async function main(): Promise<void> {
           await readFile(path.resolve(authorizationArgument), "utf8"),
         ) as CandidateSourceSnapshotSession2Authorization)
       : undefined;
+  const executorLeaseHolderToken =
+    process.env.CANDIDATE_SOURCE_SNAPSHOT_EXECUTOR_LEASE_TOKEN?.trim();
   const result = await executeCandidateSourceSnapshotSession2({
     ...(authorization ? { authorization } : {}),
     databaseUrl,
     descriptor,
     environment: process.env,
+    ...(authorization?.uploadContinuationAuthorization &&
+    executorLeaseHolderToken
+      ? { executorLeaseHolderToken }
+      : {}),
   });
   process.stdout.write(
     `${JSON.stringify(
@@ -66,14 +72,22 @@ async function main(): Promise<void> {
 await main().catch((error: unknown) => {
   const classification =
     error instanceof CandidateSourceSnapshotUploadError
-      ? error.outcome
+      ? {
+          failureClass: error.evidence.failureClass,
+          outcome: error.outcome,
+          stage: error.evidence.stage,
+        }
       : error instanceof Error
-        ? error.name
-        : "UnknownError";
+        ? { failureClass: "terminal", outcome: error.name, stage: "unknown" }
+        : {
+            failureClass: "terminal",
+            outcome: "UnknownError",
+            stage: "unknown",
+          };
   // The execution CLI deliberately emits no raw exception, environment value,
   // credential, local path, provider body, or remote response.
   process.stderr.write(
-    `${JSON.stringify({ classification, status: "failed_closed" })}\n`,
+    `${JSON.stringify({ ...classification, status: "failed_closed" })}\n`,
   );
   process.exitCode = 1;
 });

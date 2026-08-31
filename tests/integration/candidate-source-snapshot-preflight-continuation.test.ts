@@ -38,7 +38,7 @@ function enabledEnvironment(plan: CandidateSourceSnapshotDemoPlan) {
     CANDIDATE_DEMO_FILEBASE_API_TOKEN: Buffer.from(
       `${access}:${secret}`,
     ).toString("base64"),
-    CANDIDATE_DEMO_FILEBASE_S3_ENDPOINT: "https://s3.filebase.com",
+    CANDIDATE_DEMO_FILEBASE_S3_ENDPOINT: "https://s3.filebase.io",
     CANDIDATE_DEMO_FILEBASE_SECRET_ACCESS_KEY: secret,
     CANDIDATE_DEMO_MAX_BUDGET_USD: String(plan.limits.maxBudgetUsd),
     CANDIDATE_DEMO_MAX_CONCURRENCY: String(plan.limits.maxConcurrency),
@@ -82,7 +82,7 @@ async function withDisposableDatabase(
   }
   try {
     expect((await runMigrations(isolatedDatabaseUrl)).at(-1)).toBe(
-      "033_candidate_source_snapshot_preflight_chain.sql",
+      "034_candidate_source_snapshot_transport_continuation.sql",
     );
     await test(isolatedDatabaseUrl);
   } finally {
@@ -190,7 +190,7 @@ beforeAll(async () => {
   }
   const applied = await runMigrations(databaseUrl);
   expect(applied.at(-1)).toBe(
-    "033_candidate_source_snapshot_preflight_chain.sql",
+    "034_candidate_source_snapshot_transport_continuation.sql",
   );
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });

@@ -57,7 +57,7 @@ function enabledEnvironment(
       `${accessKeyId}:${secretAccessKey}`,
       "utf8",
     ).toString("base64"),
-    CANDIDATE_DEMO_FILEBASE_S3_ENDPOINT: "https://s3.filebase.com",
+    CANDIDATE_DEMO_FILEBASE_S3_ENDPOINT: "https://s3.filebase.io",
     CANDIDATE_DEMO_FILEBASE_SECRET_ACCESS_KEY: secretAccessKey,
     CANDIDATE_DEMO_MAX_BUDGET_USD: String(limits.maxBudgetUsd),
     CANDIDATE_DEMO_MAX_CONCURRENCY: String(limits.maxConcurrency),
@@ -432,6 +432,155 @@ describe("candidate source-snapshot Session 2 entry point", () => {
       expect(transportClose).toHaveBeenCalledOnce();
       expect(remoteClose).toHaveBeenCalledOnce();
     }
+  });
+
+  it("routes an authorized upload continuation through reconciliation and its lease before IPNS", async () => {
+    const bundle = syntheticBundle();
+    const fixture = syntheticCandidateSourceSnapshotDemo();
+    const approvedAt = "2026-08-31T12:00:00.000Z";
+    const approverReference = "operator_test-session-2";
+    const implementationCommitSha = "a".repeat(40);
+    const authorizationStatement =
+      renderCandidateSourceSnapshotAuthorizationStatement(
+        bundle.build.plan,
+        fixture.exactUpload,
+        implementationCommitSha,
+      );
+    const approval = createCandidateSourceSnapshotApprovalIdentity({
+      approvedAt,
+      approverReference,
+      exactUpload: fixture.exactUpload,
+      implementationCommitSha,
+      plan: bundle.build.plan,
+      statement: authorizationStatement,
+    });
+    const order: string[] = [];
+    const uploadClosure = {
+      admittedRequestCostUsd: 0,
+      admittedRequestCount: fixture.exactUpload.exactObjectCount,
+      approvalId: approval.approvalId,
+      closureId: `snapshotdemouploadclosure_${"b".repeat(32)}`,
+      closureSha256: "c".repeat(64),
+      exactObjectCount: fixture.exactUpload.exactObjectCount,
+      exactTotalBytes: fixture.exactUpload.exactTotalBytes,
+      planId: fixture.plan.planId,
+      planSha256: fixture.plan.planSha256,
+      verifiedAt: "2026-08-31T12:02:00.000Z",
+    };
+    const summary = {
+      attemptedRequests: 1,
+      recoveredByInspection: 1,
+      requestCostUsd: 0,
+      skippedVerified: 1,
+      totalObjects: fixture.exactUpload.exactObjectCount,
+      uploadedAndVerified: 0,
+    };
+    const uploadContinuationAuthorization = {
+      authorizationBinding: {
+        plan: {
+          planId: fixture.plan.planId,
+          planSha256: fixture.plan.planSha256,
+        },
+      },
+    } as never;
+    const executeUploadContinuation = vi.fn(async (request) => {
+      order.push("upload_continuation");
+      expect(request.holderToken).toBe("private-lease-token-0000000000000001");
+      await request.afterUploadsVerified?.(summary);
+      return summary;
+    });
+    const recordUploadClosure = vi.fn(async () => {
+      order.push("upload_closure");
+      return uploadClosure;
+    });
+    const remote = {
+      boundary: {} as never,
+      close: vi.fn(async () => undefined),
+      journal: {} as never,
+      prepareIntents: vi.fn(async () => {
+        order.push("prepare_intents");
+        return [];
+      }),
+      readOnlyPreflight: vi.fn(async () => {
+        throw new Error("continuation must not replay the old preflight");
+      }),
+      recordFinalVerification: vi.fn(async () => undefined),
+    };
+    const remoteRuntimeFactory = vi.fn(() => {
+      order.push("runtime_constructed");
+      return remote;
+    });
+    const cutover = {
+      openData: "prior" as const,
+      planId: fixture.plan.planId,
+      planSha256: fixture.plan.planSha256,
+      queryTable: "not_attempted" as const,
+      reason: "open_data_prior_observed" as const,
+      rollback: "not_attempted" as const,
+      status: "stopped" as const,
+    };
+    const executeIpnsController = vi.fn(async () => {
+      order.push("ipns_controller");
+      return cutover;
+    });
+
+    await expect(
+      executeCandidateSourceSnapshotSession2({
+        authorization: {
+          approvedAt,
+          approverReference,
+          authorizationStatement,
+          confirmedAt: "2026-08-31T11:59:00.000Z",
+          confirmedPlanName: "Filebase Pro or better",
+          confirmerReference: "operator_test-capacity",
+          intendedAt: "2026-08-31T12:01:00.000Z",
+          implementationCommitSha,
+          uploadContinuationAuthorization,
+        },
+        databaseUrl: "postgresql://not-contacted.invalid/not-contacted",
+        dependencies: {
+          approvePlan: vi.fn(async () => ({
+            approvalId: approval.approvalId,
+            approvalSha256: approval.approvalSha256,
+            state: {} as never,
+          })) as never,
+          confirmCapacity: vi.fn() as never,
+          executeIpnsController: executeIpnsController as never,
+          executeUploadContinuation: executeUploadContinuation as never,
+          loadCompletedReplay: vi.fn(async () => null),
+          loadPlan: vi.fn(async () => ({
+            exactUpload: fixture.exactUpload,
+            plan: fixture.plan,
+            state: { approvalCount: 1, state: "executing" },
+          })) as never,
+          prepareBundle: async () => bundle,
+          recordPlan: vi.fn() as never,
+          recordPlanDerivation: vi.fn() as never,
+          recordUploadClosure: recordUploadClosure as never,
+          remoteRuntimeFactory: remoteRuntimeFactory as never,
+          uploadTransportFactory: vi.fn() as never,
+        },
+        descriptor: {} as CandidateSourceSnapshotBuildDescriptor,
+        environment: enabledEnvironment(bundle, approval.approvalId),
+        executorLeaseHolderToken: "private-lease-token-0000000000000001",
+      }),
+    ).resolves.toMatchObject({ status: "recovery_required" });
+
+    expect(order).toEqual([
+      "upload_continuation",
+      "upload_closure",
+      "runtime_constructed",
+      "prepare_intents",
+      "ipns_controller",
+    ]);
+    expect(order.indexOf("upload_closure")).toBeLessThan(
+      order.indexOf("prepare_intents"),
+    );
+    expect(order.indexOf("upload_closure")).toBeLessThan(
+      order.indexOf("ipns_controller"),
+    );
+    expect(remote.readOnlyPreflight).not.toHaveBeenCalled();
+    expect(remoteRuntimeFactory).toHaveBeenCalledOnce();
   });
 
   it("returns an exact completed replay without constructing a remote adapter", async () => {

@@ -8,7 +8,7 @@ import {
 } from "./candidate-source-snapshot-demo.js";
 
 const ENABLED_FLAG = "CANDIDATE_DEMO_REMOTE_EXECUTOR_ENABLED";
-const S3_ENDPOINT = "https://s3.filebase.com" as const;
+const S3_ENDPOINT = "https://s3.filebase.io" as const;
 const NAMES_ENDPOINT = "https://api.filebase.io" as const;
 const approvalIdSchema = z
   .string()

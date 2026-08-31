@@ -24,6 +24,7 @@ import type {
   CandidateSourceSnapshotUploadCheckpoint,
   CandidateSourceSnapshotUploadJournal,
   CandidateSourceSnapshotUploadReceipt,
+  CandidateSourceSnapshotTransportFailureEvidence,
 } from "../publication/candidate-source-snapshot-upload.js";
 import {
   renderCandidateSourceSnapshotIpnsRetryAuthorizationStatement,
@@ -33,6 +34,48 @@ import {
 import { createCandidateSourceSnapshotApprovalIdentity } from "./candidate-source-snapshot-approval.js";
 
 const OBJECT_BATCH_SIZE = 500;
+
+export interface CandidateSourceSnapshotUploadJournalLeaseBinding {
+  authorizationId: string;
+  leaseEpoch: 1;
+  leaseId: string;
+}
+
+const uploadJournalLeaseBindingSchema = z.strictObject({
+  authorizationId: z
+    .string()
+    .regex(/^snapshotdemouploadcontinuation_[a-f0-9]{32}$/),
+  leaseEpoch: z.literal(1),
+  leaseId: z.string().regex(/^snapshotdemoexecutorlease_[a-f0-9]{32}$/),
+});
+
+const transportFailureEvidenceSchema = z
+  .strictObject({
+    evidenceSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    failureClass: z.enum(["outcome_unknown", "retryable", "terminal"]),
+    providerRequestIdHash: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .nullable(),
+    schemaVersion: z.literal("candidate-source-snapshot-transport-failure-v1"),
+    stage: z.enum([
+      "head_object_request",
+      "put_object_connection",
+      "put_object_provider_response",
+      "put_object_streaming_request",
+      "transport_deadline",
+      "unknown",
+    ]),
+  })
+  .superRefine((value, context) => {
+    const { evidenceSha256: _evidenceSha256, ...identity } = value;
+    if (canonicalJsonSha256(identity) !== value.evidenceSha256) {
+      context.addIssue({
+        code: "custom",
+        message: "transport failure evidence hash is inconsistent",
+      });
+    }
+  });
 
 export interface CandidateSourceSnapshotDurableState {
   approvalCount: number;
@@ -3078,6 +3121,7 @@ async function admitIpnsRemoteRequest(
 async function admitRequest(
   transaction: postgres.TransactionSql,
   input: {
+    continuation?: CandidateSourceSnapshotUploadJournalLeaseBinding;
     object: CandidateSourceSnapshotUploadObject;
     operation: "inspect" | "upload";
     plan: CandidateSourceSnapshotDemoPlan;
@@ -3099,23 +3143,37 @@ async function admitRequest(
       {
         attempt_id: string;
         attempt_sequence: number;
+        executor_lease_epoch: number | null;
+        executor_lease_id: string | null;
         outcome: CandidateSourceSnapshotUploadAttempt["outcome"];
         request_id: string;
         started_at: Date;
+        upload_continuation_authorization_id: string | null;
       }[]
     >`
-      SELECT attempt_id, request_id, attempt_sequence, outcome, started_at
-      FROM oracle_candidate_source_snapshot_demo_upload_attempts
-      WHERE attempt_id = ${attemptIdValue}
-        AND plan_id = ${input.plan.planId}
-        AND domain = ${input.object.domain}
-        AND remote_object_key = ${input.object.remoteObjectKey}
-        AND attempt_sequence = ${input.sequence}
+      SELECT attempt.attempt_id, attempt.request_id, attempt.attempt_sequence,
+             attempt.outcome, attempt.started_at,
+             request.upload_continuation_authorization_id,
+             request.executor_lease_id, request.executor_lease_epoch
+      FROM oracle_candidate_source_snapshot_demo_upload_attempts attempt
+      JOIN oracle_candidate_source_snapshot_demo_requests request
+        ON request.request_id = attempt.request_id
+      WHERE attempt.attempt_id = ${attemptIdValue}
+        AND attempt.plan_id = ${input.plan.planId}
+        AND attempt.domain = ${input.object.domain}
+        AND attempt.remote_object_key = ${input.object.remoteObjectKey}
+        AND attempt.attempt_sequence = ${input.sequence}
       FOR UPDATE
     `;
     if (existing[0]) {
       const row = existing[0];
-      if (row.request_id !== id) {
+      if (
+        row.request_id !== id ||
+        row.upload_continuation_authorization_id !==
+          (input.continuation?.authorizationId ?? null) ||
+        row.executor_lease_id !== (input.continuation?.leaseId ?? null) ||
+        row.executor_lease_epoch !== (input.continuation?.leaseEpoch ?? null)
+      ) {
         throw new DurableConflictError(
           "Candidate source-snapshot upload admission replay conflicts with durable identity",
         );
@@ -3177,13 +3235,20 @@ async function admitRequest(
         receipt_sha256: string | null;
         recovery_upload_attempt_id: string;
         request_id: string;
+        upload_continuation_authorization_id: string | null;
+        executor_lease_id: string | null;
+        executor_lease_epoch: number | null;
       }[]
     >`
       SELECT attempt.inspection_id, attempt.request_id,
              attempt.recovery_upload_attempt_id, attempt.outcome,
              attempt.observed_cid, attempt.observed_sha256,
-             attempt.observed_bytes, attempt.receipt_sha256
+             attempt.observed_bytes, attempt.receipt_sha256,
+             request.upload_continuation_authorization_id,
+             request.executor_lease_id, request.executor_lease_epoch
       FROM oracle_candidate_source_snapshot_demo_inspection_attempts attempt
+      JOIN oracle_candidate_source_snapshot_demo_requests request
+        ON request.request_id = attempt.request_id
       WHERE attempt.inspection_id = ${attemptIdValue}
         AND attempt.plan_id = ${input.plan.planId}
         AND attempt.domain = ${input.object.domain}
@@ -3195,7 +3260,11 @@ async function admitRequest(
       const row = existing[0];
       if (
         row.request_id !== id ||
-        row.recovery_upload_attempt_id !== input.recoveryAttempt.attemptId
+        row.recovery_upload_attempt_id !== input.recoveryAttempt.attemptId ||
+        row.upload_continuation_authorization_id !==
+          (input.continuation?.authorizationId ?? null) ||
+        row.executor_lease_id !== (input.continuation?.leaseId ?? null) ||
+        row.executor_lease_epoch !== (input.continuation?.leaseEpoch ?? null)
       ) {
         throw new DurableConflictError(
           "Candidate source-snapshot inspection admission replay conflicts with durable identity",
@@ -3322,12 +3391,16 @@ async function admitRequest(
     INSERT INTO oracle_candidate_source_snapshot_demo_requests (
       request_id, plan_id, operation_class, operation_kind, domain,
       remote_object_key, request_cost_usd, outcome, request_category,
-      logical_request_id, attempt_sequence, redirect_sequence
+      logical_request_id, attempt_sequence, redirect_sequence,
+      upload_continuation_authorization_id, executor_lease_id,
+      executor_lease_epoch
     ) VALUES (
       ${id}, ${input.plan.planId}, ${operationClass}, ${operationKind},
       ${input.object.domain}, ${input.object.remoteObjectKey},
       ${requestCostUsd}, 'request_started', ${requestCategory}, ${logicalId},
-      ${input.sequence}, 0
+      ${input.sequence}, 0, ${input.continuation?.authorizationId ?? null},
+      ${input.continuation?.leaseId ?? null},
+      ${input.continuation?.leaseEpoch ?? null}
     )
   `;
   const attempt: CandidateSourceSnapshotUploadAttempt = {
@@ -3409,7 +3482,17 @@ async function admitRequest(
 
 /** PostgreSQL-backed resumable journal for the future explicitly enabled run. */
 export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSourceSnapshotUploadJournal {
-  constructor(private readonly databaseUrl: string) {}
+  readonly #continuation:
+    CandidateSourceSnapshotUploadJournalLeaseBinding | undefined;
+
+  constructor(
+    private readonly databaseUrl: string,
+    continuation?: CandidateSourceSnapshotUploadJournalLeaseBinding,
+  ) {
+    this.#continuation = continuation
+      ? uploadJournalLeaseBindingSchema.parse(continuation)
+      : undefined;
+  }
 
   private async transaction<T>(
     operation: (transaction: postgres.TransactionSql) => Promise<T>,
@@ -4155,6 +4238,7 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
     return await this.transaction(
       async (transaction) =>
         await admitRequest(transaction, {
+          ...(this.#continuation ? { continuation: this.#continuation } : {}),
           object,
           operation: "upload",
           plan,
@@ -4173,6 +4257,7 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
     return await this.transaction(
       async (transaction) =>
         await admitRequest(transaction, {
+          ...(this.#continuation ? { continuation: this.#continuation } : {}),
           object,
           operation: "inspect",
           plan,
@@ -4205,6 +4290,7 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
       | "retryable_http_error"
       | "terminal_failure"
       | "timeout_unknown",
+    evidenceValue?: CandidateSourceSnapshotTransportFailureEvidence,
   ): Promise<void> {
     if (
       ![
@@ -4217,12 +4303,21 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
     }
     const plan = validateCandidateSourceSnapshotDemoPlan(planValue);
     const object = candidateSourceSnapshotObjectSchema().parse(objectValue);
+    const evidence = evidenceValue
+      ? transportFailureEvidenceSchema.parse(evidenceValue)
+      : undefined;
+    if (this.#continuation && !evidence) {
+      throw new DurableInputError(
+        "Continuation upload failure requires fixed transport evidence",
+      );
+    }
     await this.finishUploadAttempt(
       plan,
       object,
       attempt,
       outcome as
         "connection_failure" | "retryable_http_error" | "timeout_unknown",
+      evidence,
     );
   }
 
@@ -4231,6 +4326,7 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
     object: CandidateSourceSnapshotUploadObject,
     attempt: CandidateSourceSnapshotUploadAttempt,
     outcome: "connection_failure" | "retryable_http_error" | "timeout_unknown",
+    evidence?: CandidateSourceSnapshotTransportFailureEvidence,
   ): Promise<void> {
     await this.transaction(async (transaction) => {
       await loadObjectForUpdate(transaction, plan, object);
@@ -4239,7 +4335,12 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
         outcome === "timeout_unknown" ? "timeout_unknown" : "retryable_failure";
       const completedAttempt = await transaction<{ attempt_id: string }[]>`
         UPDATE oracle_candidate_source_snapshot_demo_upload_attempts
-        SET outcome = ${outcome}, completed_at = now()
+        SET outcome = ${outcome},
+            provider_request_id_hash = ${evidence?.providerRequestIdHash ?? null},
+            receipt_sha256 = ${evidence?.evidenceSha256 ?? null},
+            transport_stage = ${evidence?.stage ?? null},
+            failure_class = ${evidence?.failureClass ?? null},
+            completed_at = now()
         WHERE attempt_id = ${attempt.attemptId}
           AND request_id = ${attempt.requestId}
           AND outcome = 'request_started'
@@ -4247,7 +4348,9 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
       `;
       const completedRequest = await transaction<{ request_id: string }[]>`
         UPDATE oracle_candidate_source_snapshot_demo_requests
-        SET outcome = ${requestOutcome}, completed_at = now()
+        SET outcome = ${requestOutcome},
+            receipt_sha256 = ${evidence?.evidenceSha256 ?? null},
+            completed_at = now()
         WHERE request_id = ${attempt.requestId} AND outcome = 'request_started'
         RETURNING request_id
       `;
@@ -4276,18 +4379,32 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
     objectValue: CandidateSourceSnapshotUploadObject,
     attempt: CandidateSourceSnapshotUploadAttempt,
     outcome: "provider_cid_mismatch" | "terminal_failure",
+    evidenceValue?: CandidateSourceSnapshotTransportFailureEvidence,
   ): Promise<void> {
     if (!["provider_cid_mismatch", "terminal_failure"].includes(outcome)) {
       throw new DurableInputError("Upload terminal outcome is invalid");
     }
     const plan = validateCandidateSourceSnapshotDemoPlan(planValue);
     const object = candidateSourceSnapshotObjectSchema().parse(objectValue);
+    const evidence = evidenceValue
+      ? transportFailureEvidenceSchema.parse(evidenceValue)
+      : undefined;
+    if (this.#continuation && !evidence) {
+      throw new DurableInputError(
+        "Continuation terminal failure requires fixed transport evidence",
+      );
+    }
     await this.transaction(async (transaction) => {
       await loadObjectForUpdate(transaction, plan, object);
       await assertUploadAttemptForUpdate(transaction, plan, object, attempt);
       const completedAttempt = await transaction<{ attempt_id: string }[]>`
         UPDATE oracle_candidate_source_snapshot_demo_upload_attempts
-        SET outcome = ${outcome}, completed_at = now()
+        SET outcome = ${outcome},
+            provider_request_id_hash = ${evidence?.providerRequestIdHash ?? null},
+            receipt_sha256 = ${evidence?.evidenceSha256 ?? null},
+            transport_stage = ${evidence?.stage ?? null},
+            failure_class = ${evidence?.failureClass ?? null},
+            completed_at = now()
         WHERE attempt_id = ${attempt.attemptId}
           AND request_id = ${attempt.requestId}
           AND outcome = 'request_started'
@@ -4295,7 +4412,9 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
       `;
       const completedRequest = await transaction<{ request_id: string }[]>`
         UPDATE oracle_candidate_source_snapshot_demo_requests
-        SET outcome = 'terminal_failure', completed_at = now()
+        SET outcome = 'terminal_failure',
+            receipt_sha256 = ${evidence?.evidenceSha256 ?? null},
+            completed_at = now()
         WHERE request_id = ${attempt.requestId} AND outcome = 'request_started'
         RETURNING request_id
       `;
@@ -4355,7 +4474,9 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
         SET outcome = 'verified', provider_cid = ${parsedReceipt.providerCid},
             provider_request_id_hash = ${parsedReceipt.providerRequestIdHash},
             receipt_sha256 = ${parsedReceipt.receiptSha256},
-            response_bytes = ${parsedReceipt.responseBytes}, completed_at = now()
+            response_bytes = ${parsedReceipt.responseBytes},
+            transport_stage = ${this.#continuation ? "put_object_provider_response" : null},
+            failure_class = NULL, completed_at = now()
         WHERE attempt_id = ${attempt.attemptId}
           AND request_id = ${attempt.requestId}
           AND outcome = 'request_started'

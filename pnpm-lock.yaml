@@ -23,6 +23,9 @@ importers:
       '@restatedev/restate-sdk':
         specifier: 1.16.9
         version: 1.16.9
+      '@smithy/node-http-handler':
+        specifier: 4.11.3
+        version: 4.11.3
       ajv:
         specifier: 8.20.0
         version: 8.20.0

@@ -94,6 +94,7 @@ export interface CandidateSourceSnapshotUploadJournal {
     object: CandidateSourceSnapshotUploadObject,
     attempt: CandidateSourceSnapshotUploadAttempt,
     outcome: Exclude<CandidateSourceSnapshotAttemptOutcome, "verified">,
+    evidence?: CandidateSourceSnapshotTransportFailureEvidence,
   ): Promise<void>;
   recordInspectionResult(
     plan: CandidateSourceSnapshotDemoPlan,
@@ -106,6 +107,7 @@ export interface CandidateSourceSnapshotUploadJournal {
     object: CandidateSourceSnapshotUploadObject,
     attempt: CandidateSourceSnapshotUploadAttempt,
     outcome: "provider_cid_mismatch" | "terminal_failure",
+    evidence?: CandidateSourceSnapshotTransportFailureEvidence,
   ): Promise<void>;
   recordVerified(
     plan: CandidateSourceSnapshotDemoPlan,
@@ -133,9 +135,13 @@ export interface CandidateSourceSnapshotUploadJournal {
   }>;
 }
 
+export type CandidateSourceSnapshotSocketStage = 4 | 8 | 16;
+
 export interface CandidateSourceSnapshotUploadTransport {
   /** Releases transport-owned clients. Injected provider clients remain caller-owned. */
   close?(): Promise<void> | void;
+  /** Applies only a durably authorized continuation concurrency stage. */
+  setMaxSockets?(maxSockets: CandidateSourceSnapshotSocketStage): void;
   /** Exactly one bounded Class-B provider read; never mutates the object. */
   inspectExistingOnce(
     plan: CandidateSourceSnapshotDemoPlan,
@@ -163,7 +169,51 @@ export interface CandidateSourceSnapshotUploadTransport {
   }>;
 }
 
+export const CANDIDATE_SOURCE_SNAPSHOT_CONTINUATION_MAX_TIMEOUT_MS = 60_000;
+export const CANDIDATE_SOURCE_SNAPSHOT_CONTINUATION_PROMOTION_VERIFIED_OBJECTS = 64;
+
+export interface CandidateSourceSnapshotFixedUploadExecutionPermit {
+  /** One currently authorized stage; the immutable plan remains capped at 16. */
+  maxConcurrency: number;
+  /** Overall coordinator deadline. Transport connection/socket bounds remain smaller. */
+  requestTimeoutMs: number;
+}
+
+export interface CandidateSourceSnapshotStagedUploadExecutionPermit {
+  /** Closed continuation schedule. Workers are released only after durable promotion. */
+  concurrencyStages: readonly [4, 8, 16];
+  /** Durable lease phase from which this invocation resumes. */
+  initialConcurrency: 4 | 8 | 16;
+  promotionVerifiedObjectsPerStage: typeof CANDIDATE_SOURCE_SNAPSHOT_CONTINUATION_PROMOTION_VERIFIED_OBJECTS;
+  /** Overall coordinator deadline. Transport connection/socket bounds remain smaller. */
+  requestTimeoutMs: number;
+}
+
+export type CandidateSourceSnapshotUploadExecutionPermit =
+  | CandidateSourceSnapshotFixedUploadExecutionPermit
+  | CandidateSourceSnapshotStagedUploadExecutionPermit;
+
+export type CandidateSourceSnapshotTransportFailureStage =
+  | "head_object_request"
+  | "put_object_connection"
+  | "put_object_provider_response"
+  | "put_object_streaming_request"
+  | "transport_deadline"
+  | "unknown";
+
+export type CandidateSourceSnapshotTransportFailureClass =
+  "outcome_unknown" | "retryable" | "terminal";
+
+export interface CandidateSourceSnapshotTransportFailureEvidence {
+  evidenceSha256: string;
+  failureClass: CandidateSourceSnapshotTransportFailureClass;
+  providerRequestIdHash: string | null;
+  schemaVersion: "candidate-source-snapshot-transport-failure-v1";
+  stage: CandidateSourceSnapshotTransportFailureStage;
+}
+
 export class CandidateSourceSnapshotUploadError extends Error {
+  readonly evidence: CandidateSourceSnapshotTransportFailureEvidence;
   readonly outcome:
     | "connection_failure"
     | "retryable_http_error"
@@ -173,10 +223,31 @@ export class CandidateSourceSnapshotUploadError extends Error {
   constructor(
     outcome: CandidateSourceSnapshotUploadError["outcome"],
     message = "Candidate source-snapshot upload failed",
+    evidence?: {
+      failureClass: CandidateSourceSnapshotTransportFailureClass;
+      providerRequestIdHash?: string | null;
+      stage: CandidateSourceSnapshotTransportFailureStage;
+    },
   ) {
     super(message);
     this.name = "CandidateSourceSnapshotUploadError";
     this.outcome = outcome;
+    const identity = {
+      failureClass:
+        evidence?.failureClass ??
+        (outcome === "terminal_failure"
+          ? "terminal"
+          : outcome === "timeout_unknown"
+            ? "outcome_unknown"
+            : "retryable"),
+      providerRequestIdHash: evidence?.providerRequestIdHash ?? null,
+      schemaVersion: "candidate-source-snapshot-transport-failure-v1" as const,
+      stage: evidence?.stage ?? ("unknown" as const),
+    };
+    this.evidence = {
+      ...identity,
+      evidenceSha256: canonicalJsonSha256(identity),
+    };
   }
 }
 
@@ -220,15 +291,53 @@ async function boundedTransportCall<T>(input: {
   const deadline = new AbortController();
   const signal = AbortSignal.any([input.fatalSignal, deadline.signal]);
   let timeout: ReturnType<typeof setTimeout> | undefined;
-  const timedOut = new Promise<never>((_resolve, reject) => {
+  const transport = Promise.resolve().then(
+    async () => await input.call(signal),
+  );
+  const result = transport.then(
+    (value) => ({ kind: "value" as const, value }),
+    (error: unknown) => ({ error, kind: "error" as const }),
+  );
+  const timedOut = new Promise<{
+    error: CandidateSourceSnapshotUploadError;
+    kind: "timeout";
+  }>((resolve) => {
     timeout = setTimeout(() => {
-      const error = new CandidateSourceSnapshotUploadError("timeout_unknown");
+      const error = new CandidateSourceSnapshotUploadError(
+        "timeout_unknown",
+        undefined,
+        {
+          failureClass: "outcome_unknown",
+          stage: "transport_deadline",
+        },
+      );
       deadline.abort(error);
-      reject(error);
+      resolve({ error, kind: "timeout" });
     }, input.timeoutMs);
   });
   try {
-    return await Promise.race([input.call(signal), timedOut]);
+    const outcome = await Promise.race([result, timedOut]);
+    if (outcome.kind === "value") return outcome.value;
+    if (outcome.kind === "error") throw outcome.error;
+
+    // Do not begin the mandatory HEAD reconciliation while an aborted PUT may
+    // still own its request body or socket. A compliant transport settles
+    // promptly after abort; a transport that does not is stopped fail-closed
+    // instead of permitting an overlapping retry.
+    let settlementTimeout: ReturnType<typeof setTimeout> | undefined;
+    const settled = await Promise.race([
+      result.then(() => true),
+      new Promise<false>((resolve) => {
+        settlementTimeout = setTimeout(() => resolve(false), 1_000);
+      }),
+    ]);
+    if (settlementTimeout !== undefined) clearTimeout(settlementTimeout);
+    if (!settled) {
+      throw new Error(
+        "Candidate transport did not settle after its bounded abort",
+      );
+    }
+    throw outcome.error;
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
   }
@@ -236,12 +345,14 @@ async function boundedTransportCall<T>(input: {
 
 export async function executeCandidateSourceSnapshotUploads(options: {
   backoff?: (attemptSequence: number) => Promise<void>;
+  executionPermit?: CandidateSourceSnapshotUploadExecutionPermit;
   executorEnabled: true;
   journal: CandidateSourceSnapshotUploadJournal;
   objects:
     | Iterable<CandidateSourceSnapshotUploadObject>
     | AsyncIterable<CandidateSourceSnapshotUploadObject>;
   plan: CandidateSourceSnapshotDemoPlan;
+  onPromote?: (nextStage: 8 | 16) => Promise<void>;
   signal?: AbortSignal;
   transport: CandidateSourceSnapshotUploadTransport;
   verifyLocalObject: (
@@ -252,6 +363,54 @@ export async function executeCandidateSourceSnapshotUploads(options: {
     throw new Error("Candidate source-snapshot executor is disabled");
   }
   const plan = validateCandidateSourceSnapshotDemoPlan(options.plan);
+  const requestTimeoutSchema = z
+    .number()
+    .int()
+    .min(500)
+    .max(CANDIDATE_SOURCE_SNAPSHOT_CONTINUATION_MAX_TIMEOUT_MS);
+  const executionPermit = z
+    .union([
+      z.strictObject({
+        maxConcurrency: z
+          .number()
+          .int()
+          .positive()
+          .max(plan.limits.maxConcurrency),
+        requestTimeoutMs: requestTimeoutSchema,
+      }),
+      z.strictObject({
+        concurrencyStages: z.tuple([z.literal(4), z.literal(8), z.literal(16)]),
+        initialConcurrency: z.union([
+          z.literal(4),
+          z.literal(8),
+          z.literal(16),
+        ]),
+        promotionVerifiedObjectsPerStage: z.literal(
+          CANDIDATE_SOURCE_SNAPSHOT_CONTINUATION_PROMOTION_VERIFIED_OBJECTS,
+        ),
+        requestTimeoutMs: requestTimeoutSchema,
+      }),
+    ])
+    .parse(
+      options.executionPermit ?? {
+        maxConcurrency: plan.limits.maxConcurrency,
+        requestTimeoutMs: plan.limits.requestTimeoutMs,
+      },
+    );
+  const stagedPermit =
+    "concurrencyStages" in executionPermit ? executionPermit : null;
+  const initialStageIndex = stagedPermit
+    ? stagedPermit.concurrencyStages.indexOf(stagedPermit.initialConcurrency)
+    : 0;
+  if (
+    stagedPermit &&
+    initialStageIndex < stagedPermit.concurrencyStages.length - 1 &&
+    !options.onPromote
+  ) {
+    throw new Error(
+      "Candidate staged upload execution requires a durable promotion callback",
+    );
+  }
   const iterator = asAsyncIterable(options.objects)[Symbol.asyncIterator]();
   const fatalController = new AbortController();
   const executionSignal = options.signal
@@ -262,6 +421,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
     if (fatalError === undefined) {
       fatalError = error;
       fatalController.abort(error);
+      wakeActivationWaiters();
     }
   };
   const assertRunning = (): void => {
@@ -290,6 +450,65 @@ export async function executeCandidateSourceSnapshotUploads(options: {
   let attemptedRequests = 0;
   let recoveredByInspection = 0;
   const seen = new Set<string>();
+  let activeConcurrency = stagedPermit
+    ? stagedPermit.initialConcurrency
+    : "maxConcurrency" in executionPermit
+      ? executionPermit.maxConcurrency
+      : plan.limits.maxConcurrency;
+  let inventoryExhausted = false;
+  let newlyVerifiedObjects = 0;
+  let promotionError: unknown;
+  let promotionGate: Promise<void> = Promise.resolve();
+  let stageIndex = initialStageIndex;
+  let nextPromotionAt =
+    CANDIDATE_SOURCE_SNAPSHOT_CONTINUATION_PROMOTION_VERIFIED_OBJECTS;
+  const activationWaiters = new Set<() => void>();
+
+  function wakeActivationWaiters(): void {
+    for (const wake of activationWaiters) wake();
+    activationWaiters.clear();
+  }
+
+  const waitForWorkerActivation = async (
+    workerIndex: number,
+  ): Promise<boolean> => {
+    while (workerIndex >= activeConcurrency && !inventoryExhausted) {
+      assertRunning();
+      await new Promise<void>((resolve) => activationWaiters.add(resolve));
+    }
+    assertRunning();
+    return !inventoryExhausted;
+  };
+
+  const recordNewlyVerifiedObject = async (): Promise<void> => {
+    if (!stagedPermit) return;
+    newlyVerifiedObjects += 1;
+    const promotion = promotionGate.then(async () => {
+      if (promotionError !== undefined) throw promotionError;
+      while (
+        stageIndex < stagedPermit.concurrencyStages.length - 1 &&
+        newlyVerifiedObjects >= nextPromotionAt
+      ) {
+        const nextStage = stagedPermit.concurrencyStages[stageIndex + 1] as
+          8 | 16;
+        try {
+          await options.onPromote!(nextStage);
+        } catch (error) {
+          promotionError = error;
+          throw error;
+        }
+        stageIndex += 1;
+        nextPromotionAt += stagedPermit.promotionVerifiedObjectsPerStage;
+        activeConcurrency = nextStage;
+        wakeActivationWaiters();
+      }
+    });
+    promotionGate = promotion.then(
+      () => undefined,
+      () => undefined,
+    );
+    await promotion;
+  };
 
   const processObject = async (
     rawObject: CandidateSourceSnapshotUploadObject,
@@ -352,7 +571,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
             call: async (signal) =>
               await options.transport.inspectExistingOnce(plan, object, signal),
             fatalSignal: executionSignal,
-            timeoutMs: plan.limits.requestTimeoutMs,
+            timeoutMs: executionPermit.requestTimeoutMs,
           });
         } catch (error) {
           if (fatalError !== undefined || executionSignal.aborted) throw error;
@@ -390,6 +609,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
           throw new Error("Candidate inspection verification is inconsistent");
         }
         recoveredByInspection += 1;
+        await recordNewlyVerifiedObject();
         return "verified";
       }
       if (inspection.outcome === "mismatch") {
@@ -409,7 +629,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
         ? Date.parse(concurrentAttempt.startedAt)
         : Number.NaN;
       if (!Number.isFinite(admittedAt)) return concurrentAttempt;
-      const deadline = admittedAt + plan.limits.requestTimeoutMs;
+      const deadline = admittedAt + executionPermit.requestTimeoutMs;
       for (;;) {
         const concurrentCheckpoint = await options.journal.getCheckpoint(
           plan,
@@ -533,14 +753,24 @@ export async function executeCandidateSourceSnapshotUploads(options: {
           call: async (signal) =>
             await options.transport.uploadOnce(plan, object, signal),
           fatalSignal: executionSignal,
-          timeoutMs: plan.limits.requestTimeoutMs,
+          timeoutMs: executionPermit.requestTimeoutMs,
         });
         if (result.providerCid !== object.expectedCid) {
+          const evidence = new CandidateSourceSnapshotUploadError(
+            "terminal_failure",
+            undefined,
+            {
+              failureClass: "terminal",
+              providerRequestIdHash: result.providerRequestIdHash,
+              stage: "put_object_provider_response",
+            },
+          ).evidence;
           await options.journal.recordTerminalFailure(
             plan,
             object,
             attempt,
             "provider_cid_mismatch",
+            evidence,
           );
           throw new Error("Filebase returned a missing or mismatched CID");
         }
@@ -565,6 +795,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
         };
         await options.journal.recordVerified(plan, object, attempt, receipt);
         uploadedAndVerified += 1;
+        await recordNewlyVerifiedObject();
         return;
       } catch (error) {
         if (!(error instanceof CandidateSourceSnapshotUploadError)) throw error;
@@ -574,6 +805,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
             object,
             attempt,
             "terminal_failure",
+            error.evidence,
           );
           throw error;
         }
@@ -582,6 +814,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
           object,
           attempt,
           error.outcome,
+          error.evidence,
         );
         if (fatalError !== undefined || executionSignal.aborted) throw error;
         // A transport reset or 5xx can be post-dispatch just as a timeout can.
@@ -598,13 +831,25 @@ export async function executeCandidateSourceSnapshotUploads(options: {
 
   const workers = Array.from(
     {
-      length: Math.min(plan.limits.maxConcurrency, plan.inventory.objectCount),
+      length: Math.min(
+        stagedPermit
+          ? stagedPermit.concurrencyStages[2]
+          : "maxConcurrency" in executionPermit
+            ? executionPermit.maxConcurrency
+            : plan.limits.maxConcurrency,
+        plan.inventory.objectCount,
+      ),
     },
-    async () => {
+    async (_value, workerIndex) => {
       try {
         for (;;) {
+          if (!(await waitForWorkerActivation(workerIndex))) return;
           const item = await next();
-          if (item.done) return;
+          if (item.done) {
+            inventoryExhausted = true;
+            wakeActivationWaiters();
+            return;
+          }
           await processObject(item.value);
         }
       } catch (error) {

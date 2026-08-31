@@ -54,6 +54,7 @@
     "@duckdb/node-api": "1.5.5-r.4",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@restatedev/restate-sdk": "1.16.9",
+    "@smithy/node-http-handler": "4.11.3",
     "ajv": "8.20.0",
     "ajv-formats": "3.0.1",
     "cheerio": "1.2.0",

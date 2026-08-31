@@ -21,6 +21,7 @@ import {
   recordCandidateSourceSnapshotPreflightContinuation,
   type CandidateSourceSnapshotPreflightContinuationAuthorization,
 } from "../db/candidate-source-snapshot-preflight-continuation.js";
+import type { CandidateSourceSnapshotUploadContinuationAuthorization } from "../db/candidate-source-snapshot-upload-continuation.js";
 import { recordCompatibleCandidateSourceSnapshotPlanDerivation } from "../db/candidate-source-snapshot-plan-derivation.js";
 import {
   buildCandidateSourceSnapshotDemo,
@@ -53,6 +54,7 @@ import {
   type CandidateSourceSnapshotUploadSummary,
   type CandidateSourceSnapshotUploadTransport,
 } from "./candidate-source-snapshot-upload.js";
+import { executeCandidateSourceSnapshotUploadContinuation } from "./candidate-source-snapshot-upload-continuation-runtime.js";
 import {
   executeCandidateSourceSnapshotIpnsController,
   type CandidateSourceSnapshotIpnsBoundary,
@@ -228,6 +230,7 @@ export interface CandidateSourceSnapshotSession2Authorization {
   preflightContinuationAuthorization?: CandidateSourceSnapshotPreflightContinuationAuthorization;
   replayAuthorizations?: readonly CandidateSourceSnapshotIpnsReplayAuthorization[];
   rollbackAuthorization?: CandidateSourceSnapshotIpnsRollbackAuthorization;
+  uploadContinuationAuthorization?: CandidateSourceSnapshotUploadContinuationAuthorization;
 }
 
 /**
@@ -275,6 +278,7 @@ export interface CandidateSourceSnapshotSession2Dependencies {
   createIntents: typeof createCandidateSourceSnapshotDemoIpnsIntents;
   executeIpnsController: typeof executeCandidateSourceSnapshotIpnsController;
   executeUploads: typeof executeCandidateSourceSnapshotUploads;
+  executeUploadContinuation: typeof executeCandidateSourceSnapshotUploadContinuation;
   loadCompletedReplay: typeof loadCompletedCandidateSourceSnapshotDemoReplay;
   loadPlan: typeof loadCandidateSourceSnapshotDemoPlan;
   prepareBundle: typeof prepareCandidateSourceSnapshotExecutionBundle;
@@ -301,6 +305,7 @@ const defaultSession2Dependencies: CandidateSourceSnapshotSession2Dependencies =
     createIntents: createCandidateSourceSnapshotDemoIpnsIntents,
     executeIpnsController: executeCandidateSourceSnapshotIpnsController,
     executeUploads: executeCandidateSourceSnapshotUploads,
+    executeUploadContinuation: executeCandidateSourceSnapshotUploadContinuation,
     loadCompletedReplay: loadCompletedCandidateSourceSnapshotDemoReplay,
     loadPlan: loadCandidateSourceSnapshotDemoPlan,
     prepareBundle: prepareCandidateSourceSnapshotExecutionBundle,
@@ -331,6 +336,7 @@ export async function executeCandidateSourceSnapshotSession2(input: {
   dependencies?: Partial<CandidateSourceSnapshotSession2Dependencies>;
   descriptor: CandidateSourceSnapshotBuildDescriptor;
   environment: NodeJS.ProcessEnv;
+  executorLeaseHolderToken?: string;
   s3Executor?: CandidateSourceSnapshotS3CommandExecutor;
 }): Promise<CandidateSourceSnapshotSession2Result> {
   // Consume the process-scoped opt-in before any local preparation or config
@@ -438,34 +444,49 @@ export async function executeCandidateSourceSnapshotSession2(input: {
         input.authorization.preflightContinuationAuthorization,
       )
     : undefined;
-  const remote = dependencies.remoteRuntimeFactory({
-    config,
-    databaseUrl: input.databaseUrl,
-    plan: bundle.build.plan,
-  });
+  const uploadContinuationAuthorization =
+    input.authorization.uploadContinuationAuthorization;
+  if (
+    uploadContinuationAuthorization &&
+    (!input.executorLeaseHolderToken ||
+      input.executorLeaseHolderToken.length < 32 ||
+      input.executorLeaseHolderToken.length > 512)
+  ) {
+    throw new Error(
+      "Candidate upload continuation requires one private executor lease token",
+    );
+  }
+  let remote: CandidateSourceSnapshotSession2RemoteRuntime | null = null;
   let uploadTransport: CandidateSourceSnapshotUploadTransport | null = null;
   try {
-    // This bounded, read-only preflight follows durable approval but precedes
-    // execution admission and every upload/mutation. A failure leaves the
-    // exact approval available for replay with no write effect admitted.
-    await remote.readOnlyPreflight({
-      ...(continuationAuthorization ? { continuationAuthorization } : {}),
-    });
-    await dependencies.beginExecution(input.databaseUrl, {
-      approvalId: approval.approvalId,
-      ...(continuationAuthorization
-        ? {
-            continuationAuthorizationId:
-              continuationAuthorization.authorizationId,
-          }
-        : {}),
-      executorEnabled: true,
-      implementationCommitSha: continuationAuthorization
-        ? continuationAuthorization.authorizationBinding
-            .amendedImplementationCommitSha
-        : input.authorization.implementationCommitSha,
-      ...identity,
-    });
+    if (!uploadContinuationAuthorization) {
+      remote = dependencies.remoteRuntimeFactory({
+        config,
+        databaseUrl: input.databaseUrl,
+        plan: bundle.build.plan,
+      });
+      // This bounded, read-only preflight follows durable approval but precedes
+      // execution admission and every upload/mutation. A failure leaves the
+      // exact approval available for replay with no write effect admitted.
+      await remote.readOnlyPreflight({
+        ...(continuationAuthorization ? { continuationAuthorization } : {}),
+      });
+      await dependencies.beginExecution(input.databaseUrl, {
+        approvalId: approval.approvalId,
+        ...(continuationAuthorization
+          ? {
+              continuationAuthorizationId:
+                continuationAuthorization.authorizationId,
+            }
+          : {}),
+        executorEnabled: true,
+        implementationCommitSha: continuationAuthorization
+          ? continuationAuthorization.authorizationBinding
+              .amendedImplementationCommitSha
+          : input.authorization.implementationCommitSha,
+        ...identity,
+      });
+    }
     const durable = await dependencies.loadPlan(input.databaseUrl, identity);
     if (
       durable.plan.planId !== bundle.build.plan.planId ||
@@ -487,36 +508,67 @@ export async function executeCandidateSourceSnapshotSession2(input: {
         "Candidate execution requires the exact durable approval and executing state",
       );
     }
-    const journal = new PostgresCandidateSourceSnapshotUploadJournal(
-      input.databaseUrl,
-    );
-    uploadTransport = dependencies.uploadTransportFactory({
-      bundle,
-      config,
-      journal,
-      ...(input.s3Executor ? { s3Executor: input.s3Executor } : {}),
-    });
-    const summary = await dependencies.executeUploads({
-      backoff: async (attemptSequence) => {
-        await new Promise((resolve) =>
-          setTimeout(resolve, Math.min(1_000, attemptSequence * 250)),
+    let uploadClosure: CandidateSourceSnapshotUploadClosure | undefined;
+    let summary: CandidateSourceSnapshotUploadSummary;
+    if (uploadContinuationAuthorization) {
+      summary = await dependencies.executeUploadContinuation({
+        afterUploadsVerified: async () => {
+          uploadClosure = await dependencies.recordUploadClosure(
+            input.databaseUrl,
+            { approvalId: approval.approvalId, ...identity },
+          );
+        },
+        authorization: uploadContinuationAuthorization,
+        config,
+        createObjects: bundle.createObjects,
+        databaseUrl: input.databaseUrl,
+        holderToken: input.executorLeaseHolderToken!,
+        localSource: bundle.localSource,
+        plan: durable.plan,
+        ...(input.s3Executor ? { s3Executor: input.s3Executor } : {}),
+      });
+      if (!uploadClosure) {
+        throw new Error(
+          "Candidate upload continuation did not persist upload closure",
         );
-      },
-      executorEnabled: true,
-      journal,
-      objects: bundle.createObjects(),
-      plan: durable.plan,
-      transport: uploadTransport,
-      verifyLocalObject: async (object) =>
-        await bundle.localSource.verify(object),
-    });
-    const uploadClosure = await dependencies.recordUploadClosure(
-      input.databaseUrl,
-      {
-        approvalId: approval.approvalId,
-        ...identity,
-      },
-    );
+      }
+      remote = dependencies.remoteRuntimeFactory({
+        config,
+        databaseUrl: input.databaseUrl,
+        plan: bundle.build.plan,
+      });
+    } else {
+      const journal = new PostgresCandidateSourceSnapshotUploadJournal(
+        input.databaseUrl,
+      );
+      uploadTransport = dependencies.uploadTransportFactory({
+        bundle,
+        config,
+        journal,
+        ...(input.s3Executor ? { s3Executor: input.s3Executor } : {}),
+      });
+      summary = await dependencies.executeUploads({
+        backoff: async (attemptSequence) => {
+          await new Promise((resolve) =>
+            setTimeout(resolve, Math.min(1_000, attemptSequence * 250)),
+          );
+        },
+        executorEnabled: true,
+        journal,
+        objects: bundle.createObjects(),
+        plan: durable.plan,
+        transport: uploadTransport,
+        verifyLocalObject: async (object) =>
+          await bundle.localSource.verify(object),
+      });
+      uploadClosure = await dependencies.recordUploadClosure(
+        input.databaseUrl,
+        { approvalId: approval.approvalId, ...identity },
+      );
+    }
+    if (!remote) {
+      throw new Error("Candidate remote runtime was not initialized");
+    }
     // A first execution calls createInitialIntents exactly once; a recovery
     // runtime loads the already-advanced intents instead. In either case both
     // immutable domains must be returned prior-confirmed before the controller
@@ -616,7 +668,7 @@ export async function executeCandidateSourceSnapshotSession2(input: {
     try {
       await uploadTransport?.close?.();
     } finally {
-      await remote.close();
+      await remote?.close();
     }
   }
 }

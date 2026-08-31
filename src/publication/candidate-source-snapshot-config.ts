@@ -21,7 +21,7 @@ export interface CandidateSourceSnapshotPlanningConfig {
   executorEnabled: false;
   limits: CandidateSourceSnapshotLimits;
   pricing: CandidateSourceSnapshotPricing;
-  s3Endpoint: "https://s3.filebase.com";
+  s3Endpoint: "https://s3.filebase.io";
   targets: {
     openData: {
       bucket: string;
@@ -64,11 +64,9 @@ export function loadCandidateSourceSnapshotPlanningConfig(
   }
   if (
     required(environment, "CANDIDATE_DEMO_FILEBASE_S3_ENDPOINT") !==
-    "https://s3.filebase.com"
+    "https://s3.filebase.io"
   ) {
-    throw new Error(
-      "Source-snapshot planning requires https://s3.filebase.com",
-    );
+    throw new Error("Source-snapshot planning requires https://s3.filebase.io");
   }
   if (
     required(environment, "CANDIDATE_DEMO_FILEBASE_API_ENDPOINT") !==
@@ -160,7 +158,7 @@ export function loadCandidateSourceSnapshotPlanningConfig(
     executorEnabled: false,
     limits,
     pricing,
-    s3Endpoint: "https://s3.filebase.com",
+    s3Endpoint: "https://s3.filebase.io",
     targets,
   };
 }

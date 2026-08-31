@@ -89,7 +89,7 @@ class AwsCandidateSourceSnapshotBucketProbe implements CandidateSourceSnapshotBu
       endpoint: config.s3Endpoint,
       forcePathStyle: true,
       maxAttempts: 1,
-      region: "us-east-1",
+      region: "auto",
     });
   }
 

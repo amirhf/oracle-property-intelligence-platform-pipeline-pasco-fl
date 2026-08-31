@@ -46,7 +46,7 @@ export {
 
 export const CANDIDATE_SOURCE_SNAPSHOT_PREFLIGHT_VERSION = "1.0.0" as const;
 export const CANDIDATE_SOURCE_SNAPSHOT_S3_ENDPOINT =
-  "https://s3.filebase.com" as const;
+  "https://s3.filebase.io" as const;
 export const CANDIDATE_SOURCE_SNAPSHOT_API_ENDPOINT =
   "https://api.filebase.io" as const;
 export const CANDIDATE_SOURCE_SNAPSHOT_GATEWAY_ORIGIN =
@@ -1366,7 +1366,7 @@ export async function runCandidateSourceSnapshotReadOnlyPreflight(options: {
       endpoint: CANDIDATE_SOURCE_SNAPSHOT_S3_ENDPOINT,
       forcePathStyle: true,
       maxAttempts: config.limits.maxRetries + 1,
-      region: "us-east-1",
+      region: "auto",
     });
   const startedAt = options.startedAt ?? new Date().toISOString();
 
