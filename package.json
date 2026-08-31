@@ -35,6 +35,7 @@
     "authoritative:publication:build": "node --import tsx scripts/authoritative-publication.ts build",
     "authoritative:publication:verify": "node --import tsx scripts/authoritative-publication.ts verify",
     "authoritative:publication:determinism": "node --import tsx scripts/authoritative-publication.ts determinism",
+    "authoritative:publication:sample": "node --import tsx scripts/verify-authoritative-publication-sample.ts",
     "publication:build": "node --import tsx scripts/build-publication.ts",
     "publication:check": "node --import tsx scripts/check-publication.ts",
     "publication:determinism": "node --import tsx scripts/check-publication-determinism.ts",
