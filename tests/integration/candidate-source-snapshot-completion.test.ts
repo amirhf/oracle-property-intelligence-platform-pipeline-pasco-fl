@@ -24,7 +24,6 @@ import {
   loadCandidateSourceSnapshotIpnsIntents,
   loadCandidateSourceSnapshotIpnsIntentState,
   PostgresCandidateSourceSnapshotUploadJournal,
-  recordCandidateSourceSnapshotPreflightCycleOutcomes,
   recordCandidateSourceSnapshotPreflightRequestOutcome,
   recordCandidateSourceSnapshotDemoPlan,
   type CandidateSourceSnapshotIpnsDomain,
@@ -53,7 +52,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(databaseUrl)).toHaveLength(31);
+  expect(await runMigrations(databaseUrl)).toHaveLength(32);
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });
 
@@ -224,42 +223,13 @@ describe("candidate source-snapshot Session 2A completion", () => {
           }),
       ),
     );
-    const directResolverAdmission = remainingAdmissions.find(
-      (admission) => admission.resolver !== null,
-    )!;
-    await expect(
-      recordCandidateSourceSnapshotPreflightRequestOutcome(databaseUrl, {
-        admission: directResolverAdmission,
-        completedAt: "2026-08-31T01:02:30.000Z",
-        outcome: "succeeded",
-        receiptSha256: "8".repeat(64),
-      }),
-    ).rejects.toThrow("must be recorded as one atomic cycle");
-    for (const admission of remainingAdmissions.filter(
-      (candidate) => candidate.resolver === null,
-    )) {
+    for (const admission of remainingAdmissions) {
       await recordCandidateSourceSnapshotPreflightRequestOutcome(databaseUrl, {
         admission,
         completedAt: "2026-08-31T01:02:30.000Z",
         outcome: "succeeded",
         receiptSha256: "8".repeat(64),
       });
-    }
-    for (const domain of ["open_data", "query_table"] as const) {
-      await recordCandidateSourceSnapshotPreflightCycleOutcomes(
-        databaseUrl,
-        remainingAdmissions
-          .filter(
-            (admission) =>
-              admission.domain === domain && admission.resolver !== null,
-          )
-          .map((admission) => ({
-            admission,
-            completedAt: "2026-08-31T01:02:30.000Z",
-            outcome: "succeeded" as const,
-            receiptSha256: "8".repeat(64),
-          })),
-      );
     }
     const readySql = postgres(databaseUrl, { max: 1 });
     try {

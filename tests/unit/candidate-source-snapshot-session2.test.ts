@@ -215,6 +215,12 @@ describe("candidate source-snapshot Session 2 entry point", () => {
     const approvedAt = "2026-08-31T12:00:00.000Z";
     const approverReference = "operator_test-session-2";
     const implementationCommitSha = "a".repeat(40);
+    const preflightContinuationAuthorization = {
+      authorizationBinding: {
+        amendedImplementationCommitSha: "b".repeat(40),
+      },
+      authorizationId: `snapshotdemocontinuation_${"c".repeat(32)}`,
+    } as never;
     const authorizationStatement =
       renderCandidateSourceSnapshotAuthorizationStatement(
         bundle.build.plan,
@@ -239,6 +245,10 @@ describe("candidate source-snapshot Session 2 entry point", () => {
         state: {} as never,
       };
     });
+    const recordPreflightContinuation = vi.fn(async () => {
+      order.push("continuation");
+      return preflightContinuationAuthorization;
+    });
     const remoteRuntimeFactory = vi.fn(() => {
       order.push("runtime_constructed");
       return {
@@ -246,8 +256,13 @@ describe("candidate source-snapshot Session 2 entry point", () => {
         close,
         journal: {} as never,
         prepareIntents: vi.fn() as never,
-        readOnlyPreflight: async () => {
+        readOnlyPreflight: async (input?: {
+          continuationAuthorization?: unknown;
+        }) => {
           order.push("preflight");
+          expect(input?.continuationAuthorization).toBe(
+            preflightContinuationAuthorization,
+          );
           throw new Error("synthetic preflight failure");
         },
         recordFinalVerification: vi.fn() as never,
@@ -266,6 +281,7 @@ describe("candidate source-snapshot Session 2 entry point", () => {
           confirmerReference: "operator_test-capacity",
           intendedAt: "2026-08-31T12:01:00.000Z",
           implementationCommitSha,
+          preflightContinuationAuthorization,
         },
         databaseUrl: "postgresql://not-contacted.invalid/not-contacted",
         dependencies: {
@@ -275,6 +291,7 @@ describe("candidate source-snapshot Session 2 entry point", () => {
           prepareBundle: async () => bundle,
           recordPlan: vi.fn() as never,
           recordPlanDerivation: vi.fn() as never,
+          recordPreflightContinuation: recordPreflightContinuation as never,
           remoteRuntimeFactory: remoteRuntimeFactory as never,
           uploadTransportFactory: uploadTransportFactory as never,
         },
@@ -283,8 +300,14 @@ describe("candidate source-snapshot Session 2 entry point", () => {
       }),
     ).rejects.toThrow("synthetic preflight failure");
 
-    expect(order).toEqual(["approval", "runtime_constructed", "preflight"]);
+    expect(order).toEqual([
+      "approval",
+      "continuation",
+      "runtime_constructed",
+      "preflight",
+    ]);
     expect(approvePlan).toHaveBeenCalledOnce();
+    expect(recordPreflightContinuation).toHaveBeenCalledOnce();
     expect(uploadTransportFactory).not.toHaveBeenCalled();
     expect(close).toHaveBeenCalledOnce();
   });

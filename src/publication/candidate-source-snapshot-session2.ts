@@ -17,6 +17,10 @@ import {
   type CandidateSourceSnapshotUploadClosure,
 } from "../db/candidate-source-snapshot-completion.js";
 import { createCandidateSourceSnapshotApprovalIdentity } from "../db/candidate-source-snapshot-approval.js";
+import {
+  recordCandidateSourceSnapshotPreflightContinuation,
+  type CandidateSourceSnapshotPreflightContinuationAuthorization,
+} from "../db/candidate-source-snapshot-preflight-continuation.js";
 import { recordCompatibleCandidateSourceSnapshotPlanDerivation } from "../db/candidate-source-snapshot-plan-derivation.js";
 import {
   buildCandidateSourceSnapshotDemo,
@@ -221,6 +225,7 @@ export interface CandidateSourceSnapshotSession2Authorization {
   confirmerReference: string;
   intendedAt: string;
   implementationCommitSha: string;
+  preflightContinuationAuthorization?: CandidateSourceSnapshotPreflightContinuationAuthorization;
   replayAuthorizations?: readonly CandidateSourceSnapshotIpnsReplayAuthorization[];
   rollbackAuthorization?: CandidateSourceSnapshotIpnsRollbackAuthorization;
 }
@@ -245,7 +250,9 @@ export interface CandidateSourceSnapshotSession2RemoteRuntime {
     rollbackAuthorization?: CandidateSourceSnapshotIpnsRollbackAuthorization;
     uploadClosure: CandidateSourceSnapshotUploadClosure;
   }): Promise<readonly CandidateSourceSnapshotIpnsIntent[]>;
-  readOnlyPreflight(): Promise<void>;
+  readOnlyPreflight(input?: {
+    continuationAuthorization?: CandidateSourceSnapshotPreflightContinuationAuthorization;
+  }): Promise<void>;
   recordFinalVerification(input: {
     approvalId: string;
     localSource: CandidateSourceSnapshotLocalObjectSource;
@@ -274,6 +281,7 @@ export interface CandidateSourceSnapshotSession2Dependencies {
   recordIpnsRetryAuthorization: typeof recordCandidateSourceSnapshotIpnsRetryAuthorization;
   recordPlan: typeof recordCandidateSourceSnapshotDemoPlan;
   recordPlanDerivation: typeof recordCompatibleCandidateSourceSnapshotPlanDerivation;
+  recordPreflightContinuation: typeof recordCandidateSourceSnapshotPreflightContinuation;
   recordUploadClosure: typeof recordCandidateSourceSnapshotUploadClosure;
   remoteRuntimeFactory?: CandidateSourceSnapshotSession2RemoteRuntimeFactory;
   uploadTransportFactory: (input: {
@@ -300,6 +308,8 @@ const defaultSession2Dependencies: CandidateSourceSnapshotSession2Dependencies =
       recordCandidateSourceSnapshotIpnsRetryAuthorization,
     recordPlan: recordCandidateSourceSnapshotDemoPlan,
     recordPlanDerivation: recordCompatibleCandidateSourceSnapshotPlanDerivation,
+    recordPreflightContinuation:
+      recordCandidateSourceSnapshotPreflightContinuation,
     recordUploadClosure: recordCandidateSourceSnapshotUploadClosure,
     remoteRuntimeFactory: candidateSourceSnapshotRemoteRuntimeFactory,
     uploadTransportFactory: ({ bundle, config, s3Executor }) =>
@@ -421,6 +431,13 @@ export async function executeCandidateSourceSnapshotSession2(input: {
   ) {
     throw new Error("Durable approval replay differs from exact authorization");
   }
+  const continuationAuthorization = input.authorization
+    .preflightContinuationAuthorization
+    ? await dependencies.recordPreflightContinuation(
+        input.databaseUrl,
+        input.authorization.preflightContinuationAuthorization,
+      )
+    : undefined;
   const remote = dependencies.remoteRuntimeFactory({
     config,
     databaseUrl: input.databaseUrl,
@@ -431,11 +448,22 @@ export async function executeCandidateSourceSnapshotSession2(input: {
     // This bounded, read-only preflight follows durable approval but precedes
     // execution admission and every upload/mutation. A failure leaves the
     // exact approval available for replay with no write effect admitted.
-    await remote.readOnlyPreflight();
+    await remote.readOnlyPreflight({
+      ...(continuationAuthorization ? { continuationAuthorization } : {}),
+    });
     await dependencies.beginExecution(input.databaseUrl, {
       approvalId: approval.approvalId,
+      ...(continuationAuthorization
+        ? {
+            continuationAuthorizationId:
+              continuationAuthorization.authorizationId,
+          }
+        : {}),
       executorEnabled: true,
-      implementationCommitSha: input.authorization.implementationCommitSha,
+      implementationCommitSha: continuationAuthorization
+        ? continuationAuthorization.authorizationBinding
+            .amendedImplementationCommitSha
+        : input.authorization.implementationCommitSha,
       ...identity,
     });
     const durable = await dependencies.loadPlan(input.databaseUrl, identity);

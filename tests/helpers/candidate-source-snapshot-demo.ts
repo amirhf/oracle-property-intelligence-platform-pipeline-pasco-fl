@@ -24,7 +24,6 @@ import {
 } from "../../src/publication/candidate-source-snapshot-preflight-binding.js";
 import {
   admitCandidateSourceSnapshotPreflightRequest,
-  recordCandidateSourceSnapshotPreflightCycleOutcomes,
   recordCandidateSourceSnapshotPreflightRequestOutcome,
 } from "../../src/db/candidate-source-snapshot-demo.js";
 
@@ -329,31 +328,12 @@ export async function recordSuccessfulCandidateSourceSnapshotPreflight(
         }),
     ),
   );
-  for (const admission of admissions.filter(
-    (candidate) => candidate.resolver === null,
-  )) {
+  for (const admission of admissions) {
     await recordCandidateSourceSnapshotPreflightRequestOutcome(databaseUrl, {
       admission,
       completedAt: "2026-08-31T00:00:00.000Z",
       outcome: "succeeded",
       receiptSha256: sha("8"),
     });
-  }
-  for (const domain of ["open_data", "query_table"] as const) {
-    const cycle = admissions
-      .filter(
-        (candidate) =>
-          candidate.domain === domain && candidate.resolver !== null,
-      )
-      .map((admission) => ({
-        admission,
-        completedAt: "2026-08-31T00:00:00.000Z",
-        outcome: "succeeded" as const,
-        receiptSha256: sha("8"),
-      }));
-    await recordCandidateSourceSnapshotPreflightCycleOutcomes(
-      databaseUrl,
-      cycle,
-    );
   }
 }

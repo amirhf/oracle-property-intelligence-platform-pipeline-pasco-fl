@@ -5,13 +5,16 @@ import {
   admitCandidateSourceSnapshotPreflightRequest,
   loadCandidateSourceSnapshotIpnsIntentState,
   PostgresCandidateSourceSnapshotUploadJournal,
-  recordCandidateSourceSnapshotPreflightCycleOutcomes,
   recordCandidateSourceSnapshotPreflightRequestOutcome,
   type CandidateSourceSnapshotIpnsAttemptAdmission,
   type CandidateSourceSnapshotIpnsIntentStateRecord,
   type CandidateSourceSnapshotPreflightRequestAdmission,
   type CandidateSourceSnapshotRemoteRequestAdmission,
 } from "../db/candidate-source-snapshot-demo.js";
+import {
+  candidateSourceSnapshotPreflightContinuationAuthorizationSchema,
+  type CandidateSourceSnapshotPreflightContinuationAuthorization,
+} from "../db/candidate-source-snapshot-preflight-continuation.js";
 import {
   recordCandidateSourceSnapshotRemoteVerification,
   transitionCandidateSourceSnapshotIpnsIntent,
@@ -20,7 +23,10 @@ import { canonicalJsonSha256 } from "../lib/canonical-json.js";
 import { sha256 } from "../lib/hash.js";
 import { observeDelegatedIpnsRecord } from "./delegated-ipns.js";
 import {
+  CANDIDATE_SOURCE_SNAPSHOT_FILEBASE_IPNS_EVIDENCE_VERSION,
   CandidateSourceSnapshotFilebaseIpnsAdapter,
+  candidateSourceSnapshotDelegatedIpnsReceiptSchema,
+  candidateSourceSnapshotIpnsRequestAdmissionSchema,
   type CandidateSourceSnapshotDelegatedIpnsReceipt,
   type CandidateSourceSnapshotFilebaseIpnsEvidence,
   type CandidateSourceSnapshotFilebaseIpnsReceipt,
@@ -213,6 +219,12 @@ interface ActiveResolutionCycle {
   sequence: number;
 }
 
+interface NextPreflightRequest {
+  attemptSequence: number;
+  continuationAuthorizationId: string | null;
+  resolver: Resolver;
+}
+
 function endpointKey(
   request: Pick<
     CandidateSourceSnapshotIpnsRequestAdmission,
@@ -312,10 +324,6 @@ export class DurableIpnsBridge implements CandidateSourceSnapshotIpnsJournal {
     CandidateSourceSnapshotIpnsDomain,
     ActiveResolutionCycle
   >();
-  readonly #activePreflightCycles = new Map<
-    CandidateSourceSnapshotIpnsDomain,
-    ActiveResolutionCycle
-  >();
   readonly #lastCycleRetryable = new Map<
     CandidateSourceSnapshotIpnsDomain,
     boolean
@@ -329,6 +337,7 @@ export class DurableIpnsBridge implements CandidateSourceSnapshotIpnsJournal {
     CandidateSourceSnapshotIpnsDomain,
     ResolutionCategory
   >();
+  readonly #nextPreflightRequests = new Map<string, NextPreflightRequest>();
   readonly #pending = new Map<string, PendingAdmission>();
   readonly #plan: CandidateSourceSnapshotDemoPlan;
   readonly #states = new Map<
@@ -421,24 +430,26 @@ export class DurableIpnsBridge implements CandidateSourceSnapshotIpnsJournal {
     this.#nextResolutionCategory.set(domain, category);
   }
 
-  beginPreflightCycle(
+  beginPreflightRequest(
     domain: CandidateSourceSnapshotIpnsDomain,
+    resolver: Resolver,
     attemptSequence: number,
+    continuationAuthorizationId: string | null = null,
   ): void {
+    const key = `${domain}:${resolver}`;
     if (
       this.#mode !== "preflight" ||
-      this.#activePreflightCycles.has(domain) ||
+      this.#nextPreflightRequests.has(key) ||
       !Number.isInteger(attemptSequence) ||
       attemptSequence < 1 ||
       attemptSequence > 3
     ) {
-      throw new Error("Preflight resolution cycle admission is invalid");
+      throw new Error("Preflight request admission is invalid");
     }
-    this.#activePreflightCycles.set(domain, {
-      category: "control_public_observation",
-      intentId: "preflight",
-      receipts: new Map(),
-      sequence: attemptSequence,
+    this.#nextPreflightRequests.set(key, {
+      attemptSequence,
+      continuationAuthorizationId,
+      resolver,
     });
   }
 
@@ -481,20 +492,24 @@ export class DurableIpnsBridge implements CandidateSourceSnapshotIpnsJournal {
       throw new Error("Concurrent duplicate remote request admission rejected");
     }
     if (this.#mode === "preflight") {
-      const cycle = this.#activePreflightCycles.get(request.domain);
-      if (!cycle) {
-        throw new Error("Preflight request lacks its shared cycle");
-      }
       const resolver =
         request.endpointType === "filebase_names_api_v1"
           ? ("filebase_control" as const)
           : request.endpointType === "filebase_official_ipfs_gateway"
             ? ("filebase_gateway" as const)
             : ("delegated_ipfs" as const);
+      const nextKey = `${request.domain}:${resolver}`;
+      const next = this.#nextPreflightRequests.get(nextKey);
+      if (!next || next.resolver !== resolver) {
+        throw new Error(
+          "Preflight request lacks its exact receipt-key admission",
+        );
+      }
       const value = await admitCandidateSourceSnapshotPreflightRequest(
         this.#databaseUrl,
         {
-          attemptSequence: cycle.sequence,
+          attemptSequence: next.attemptSequence,
+          continuationAuthorizationId: next.continuationAuthorizationId,
           domain: request.domain,
           operationKind: request.operation,
           planId: this.#plan.planId,
@@ -563,11 +578,12 @@ export class DurableIpnsBridge implements CandidateSourceSnapshotIpnsJournal {
     evidence: CandidateSourceSnapshotFilebaseIpnsEvidence,
   ): Promise<void> {
     if ("evidenceSha256" in evidence) {
-      const cycles =
-        this.#mode === "preflight"
-          ? this.#activePreflightCycles
-          : this.#activeCycles;
-      const cycle = cycles.get(evidence.domain);
+      if (this.#mode === "preflight") {
+        throw new Error(
+          "Preflight evidence must be persisted independently per receipt key",
+        );
+      }
+      const cycle = this.#activeCycles.get(evidence.domain);
       if (!cycle || cycle.receipts.size !== 3) {
         throw new Error("Aggregate evidence lacks one complete resolver cycle");
       }
@@ -624,27 +640,6 @@ export class DurableIpnsBridge implements CandidateSourceSnapshotIpnsJournal {
           ),
         );
       if (
-        control.pending.kind === "preflight" &&
-        gateway.pending.kind === "preflight" &&
-        delegated.pending.kind === "preflight"
-      ) {
-        await recordCandidateSourceSnapshotPreflightCycleOutcomes(
-          this.#databaseUrl,
-          [control, gateway, delegated].map((component) => {
-            const result = component.result;
-            const cycleOutcome =
-              retryable && result.requestOutcome === "succeeded"
-                ? ("retryable_failure" as const)
-                : result.requestOutcome;
-            return {
-              admission: preflightAdmission(component.pending),
-              completedAt: result.observedAt,
-              outcome: cycleOutcome,
-              receiptSha256: result.receiptSha256,
-            };
-          }),
-        );
-      } else if (
         control.pending.kind === "resolution" &&
         gateway.pending.kind === "resolution" &&
         delegated.pending.kind === "resolution"
@@ -677,7 +672,7 @@ export class DurableIpnsBridge implements CandidateSourceSnapshotIpnsJournal {
       /* The whole resolver set is durably committed above. Never checkpoint
        * one component at a time: a crash must expose either all three exact
        * receipts or an unresolved admitted cycle that fails closed. */
-      cycles.delete(evidence.domain);
+      this.#activeCycles.delete(evidence.domain);
       this.#lastCycleRetryable.set(evidence.domain, retryable);
       if (this.#mode === "executing" && evidence.classification === "target") {
         this.#freshTargets.add(evidence.domain);
@@ -711,10 +706,6 @@ export class DurableIpnsBridge implements CandidateSourceSnapshotIpnsJournal {
       throw new Error("Remote receipt lacks its durable request admission");
     }
     const result = receiptOutcome(evidence, this.#plan);
-    const cycle =
-      pending.kind === "preflight"
-        ? this.#activePreflightCycles.get(evidence.domain)
-        : this.#activeCycles.get(evidence.domain);
     const resolver =
       pending.kind === "preflight"
         ? "delegatedEvidence" in evidence
@@ -724,21 +715,46 @@ export class DurableIpnsBridge implements CandidateSourceSnapshotIpnsJournal {
             : "filebase_gateway"
         : pending.value.resolver;
     if (
-      !cycle ||
-      cycle.sequence !==
-        (pending.kind === "preflight"
-          ? pending.value.attemptSequence
-          : pending.value.cycleSequence)
-    ) {
-      throw new Error("Resolver receipt lost its shared resolution cycle");
-    }
-    if (
       !resolver ||
       (resolver !== "filebase_control" &&
         resolver !== "filebase_gateway" &&
         resolver !== "delegated_ipfs")
     ) {
       throw new Error("Resolver receipt is outside the closed policy");
+    }
+    if (pending.kind === "preflight") {
+      const nextKey = `${evidence.domain}:${resolver}`;
+      const next = this.#nextPreflightRequests.get(nextKey);
+      if (
+        !next ||
+        next.attemptSequence !== pending.value.attemptSequence ||
+        next.continuationAuthorizationId !==
+          pending.value.continuationAuthorizationId
+      ) {
+        throw new Error(
+          "Preflight receipt lost its exact receipt-key admission",
+        );
+      }
+      await recordCandidateSourceSnapshotPreflightRequestOutcome(
+        this.#databaseUrl,
+        {
+          admission: preflightAdmission(pending),
+          completedAt: result.observedAt,
+          outcome:
+            result.requestOutcome === "succeeded" &&
+            result.classification !== "prior"
+              ? "terminal_failure"
+              : result.requestOutcome,
+          receiptSha256: result.receiptSha256,
+        },
+      );
+      this.#pending.delete(key);
+      this.#nextPreflightRequests.delete(nextKey);
+      return;
+    }
+    const cycle = this.#activeCycles.get(evidence.domain);
+    if (!cycle || cycle.sequence !== pending.value.cycleSequence) {
+      throw new Error("Resolver receipt lost its shared resolution cycle");
     }
     if (cycle.receipts.has(resolver)) {
       throw new Error("Resolver receipt conflicts within its cycle");
@@ -751,7 +767,7 @@ export class DurableIpnsBridge implements CandidateSourceSnapshotIpnsJournal {
     if (
       this.#pending.size > 0 ||
       this.#activeCycles.size > 0 ||
-      this.#activePreflightCycles.size > 0
+      this.#nextPreflightRequests.size > 0
     ) {
       throw new Error("Remote request admissions lack terminal receipts");
     }
@@ -1042,6 +1058,13 @@ async function loadIntentRecords(
 }
 
 interface PreflightKeyProgress {
+  attempts: readonly {
+    attemptSequence: number;
+    continuationAuthorizationId: string | null;
+    outcome: CandidateSourceSnapshotPreflightRequestAdmission["outcome"];
+    receiptSha256: string | null;
+    requestId: string;
+  }[];
   maximumAttempt: number;
   started: number;
   succeeded: number;
@@ -1064,37 +1087,52 @@ async function loadPreflightProgress(
       `,
       sql<
         {
+          attempt_sequence: number;
+          continuation_authorization_id: string | null;
           domain: CandidateSourceSnapshotIpnsDomain;
-          maximum_attempt: number;
           operation_kind: string;
+          outcome: CandidateSourceSnapshotPreflightRequestAdmission["outcome"];
+          receipt_sha256: string | null;
+          request_id: string;
           resolver: string | null;
-          started: number;
-          succeeded: number;
         }[]
       >`
-        SELECT domain, operation_kind, resolver,
-               max(attempt_sequence)::integer AS maximum_attempt,
-               count(*) FILTER (WHERE outcome = 'request_started')::integer
-                 AS started,
-               count(*) FILTER (WHERE outcome = 'succeeded')::integer
-                 AS succeeded
+        SELECT request_id, domain, operation_kind, resolver, attempt_sequence,
+               continuation_authorization_id, outcome, receipt_sha256
         FROM oracle_candidate_source_snapshot_demo_requests
         WHERE plan_id = ${plan.planId}
           AND request_category = 'bucket_names_preflight'
-        GROUP BY domain, operation_kind, resolver
+        ORDER BY domain, operation_kind, resolver, attempt_sequence
       `,
     ]);
+    const byKey = new Map<string, PreflightKeyProgress>();
+    for (const row of rows) {
+      const key = `${row.domain}:${row.operation_kind}:${row.resolver ?? "none"}`;
+      const current = byKey.get(key) ?? {
+        attempts: [],
+        maximumAttempt: 0,
+        started: 0,
+        succeeded: 0,
+      };
+      const attempts = [
+        ...current.attempts,
+        {
+          attemptSequence: row.attempt_sequence,
+          continuationAuthorizationId: row.continuation_authorization_id,
+          outcome: row.outcome,
+          receiptSha256: row.receipt_sha256,
+          requestId: row.request_id,
+        },
+      ];
+      byKey.set(key, {
+        attempts,
+        maximumAttempt: Math.max(current.maximumAttempt, row.attempt_sequence),
+        started: current.started + (row.outcome === "request_started" ? 1 : 0),
+        succeeded: current.succeeded + (row.outcome === "succeeded" ? 1 : 0),
+      });
+    }
     return {
-      byKey: new Map(
-        rows.map((row) => [
-          `${row.domain}:${row.operation_kind}:${row.resolver ?? "none"}`,
-          {
-            maximumAttempt: row.maximum_attempt,
-            started: row.started,
-            succeeded: row.succeeded,
-          },
-        ]),
-      ),
+      byKey,
       ready: readyRows[0]?.ready === true,
     };
   } finally {
@@ -1109,6 +1147,7 @@ async function closeInterruptedPreflightRequests(
   const sql = postgres(databaseUrl, { max: 1 });
   let rows: {
     attempt_sequence: number;
+    continuation_authorization_id: string | null;
     domain: CandidateSourceSnapshotIpnsDomain;
     operation_kind: "bucket_head" | "names_read" | "public_resolve";
     redirect_sequence: number;
@@ -1118,6 +1157,7 @@ async function closeInterruptedPreflightRequests(
     rows = await sql<
       {
         attempt_sequence: number;
+        continuation_authorization_id: string | null;
         domain: CandidateSourceSnapshotIpnsDomain;
         operation_kind: "bucket_head" | "names_read" | "public_resolve";
         redirect_sequence: number;
@@ -1125,7 +1165,7 @@ async function closeInterruptedPreflightRequests(
       }[]
     >`
       SELECT domain, operation_kind, resolver, attempt_sequence,
-             redirect_sequence
+             redirect_sequence, continuation_authorization_id
       FROM oracle_candidate_source_snapshot_demo_requests
       WHERE plan_id = ${plan.planId}
         AND request_category = 'bucket_names_preflight'
@@ -1140,6 +1180,7 @@ async function closeInterruptedPreflightRequests(
       databaseUrl,
       {
         attemptSequence: row.attempt_sequence,
+        continuationAuthorizationId: row.continuation_authorization_id,
         domain: row.domain,
         operationKind: row.operation_kind,
         planId: plan.planId,
@@ -1205,6 +1246,8 @@ class ProductionCandidateSourceSnapshotRemoteRuntime implements CandidateSourceS
   readonly #bucketProbe: CandidateSourceSnapshotBucketProbe;
   readonly #config: EnabledCandidateSourceSnapshotExecutionConfig;
   readonly #databaseUrl: string;
+  readonly #fetch: typeof fetch;
+  readonly #observeDelegated: typeof observeDelegatedIpnsRecord;
   readonly #plan: CandidateSourceSnapshotDemoPlan;
   readonly #verifier: CandidateSourceSnapshotCredentialFreeVerifier;
 
@@ -1216,32 +1259,36 @@ class ProductionCandidateSourceSnapshotRemoteRuntime implements CandidateSourceS
   }) {
     this.#config = input.config;
     this.#databaseUrl = input.databaseUrl;
+    this.#fetch = input.dependencies?.fetchImpl ?? fetch;
+    this.#observeDelegated =
+      input.dependencies?.observeDelegated ?? observeDelegatedIpnsRecord;
     this.#plan = input.plan;
     this.journal = new DurableIpnsBridge({
       databaseUrl: input.databaseUrl,
       plan: input.plan,
     });
-    this.#bucketProbe =
-      input.dependencies?.bucketProbe ??
-      new AwsCandidateSourceSnapshotBucketProbe(input.config);
     this.#verifier =
       input.dependencies?.credentialFreeVerifier ??
       new PostgresCandidateSourceSnapshotCredentialFreeVerifier({
-        fetchImpl: input.dependencies?.fetchImpl ?? fetch,
+        fetchImpl: this.#fetch,
       });
     this.boundary = new CandidateSourceSnapshotFilebaseIpnsAdapter({
       config: input.config,
       evidenceSink: {
         record: async (evidence) => this.journal.recordEvidence(evidence),
       },
-      fetchImpl: input.dependencies?.fetchImpl ?? fetch,
-      observeDelegated:
-        input.dependencies?.observeDelegated ?? observeDelegatedIpnsRecord,
+      fetchImpl: this.#fetch,
+      observeDelegated: this.#observeDelegated,
       plan: input.plan,
       requestGate: {
         beforeRequest: async (request) => this.journal.beforeRequest(request),
       },
     });
+    // Construct the only explicitly closable client last. If validation of
+    // the immutable IPNS composition fails above, no S3 client is leaked.
+    this.#bucketProbe =
+      input.dependencies?.bucketProbe ??
+      new AwsCandidateSourceSnapshotBucketProbe(input.config);
   }
 
   async close(): Promise<void> {
@@ -1269,40 +1316,161 @@ class ProductionCandidateSourceSnapshotRemoteRuntime implements CandidateSourceS
     throw new Error("Resolution retry envelope is inconsistent");
   }
 
-  async #observePreflightWithReadRetries(
+  async #observePreflightResolver(
     domain: CandidateSourceSnapshotIpnsDomain,
-    firstAttempt: number,
-  ): Promise<CandidateSourceSnapshotIpnsAggregateEvidence> {
-    const maximumAttempts = this.#config.limits.maxRetries + 1;
-    for (let attempt = firstAttempt; attempt <= maximumAttempts; attempt += 1) {
-      this.journal.beginPreflightCycle(domain, attempt);
-      const observation = await this.boundary.observeIdentity(domain);
-      const retryable = this.journal.consumeLastCycleRetryable(domain);
-      if (
-        observation.classification !== "unavailable" ||
-        !retryable ||
-        attempt === maximumAttempts
-      ) {
-        return observation;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50 * attempt));
+    resolver: Resolver,
+    attemptSequence: number,
+    continuationAuthorizationId: string | null,
+  ): Promise<ReturnType<typeof receiptOutcome>> {
+    this.journal.beginPreflightRequest(
+      domain,
+      resolver,
+      attemptSequence,
+      continuationAuthorizationId,
+    );
+    if (resolver === "filebase_control") {
+      const receipt = await this.boundary.readControlPlane(domain);
+      await this.journal.recordEvidence(receipt);
+      return receiptOutcome(receipt, this.#plan);
     }
-    throw new Error("Preflight retry envelope is inconsistent");
+    if (resolver === "filebase_gateway") {
+      const receipt = await this.boundary.observeOfficialGateway(domain);
+      await this.journal.recordEvidence(receipt);
+      return receiptOutcome(receipt, this.#plan);
+    }
+    const target =
+      domain === "open_data"
+        ? this.#plan.targets.openData
+        : this.#plan.targets.queryTable;
+    let requestCount = 0;
+    const admittedFetch: typeof fetch = async (request, init) => {
+      requestCount += 1;
+      await this.journal.beforeRequest(
+        candidateSourceSnapshotIpnsRequestAdmissionSchema.parse({
+          domain,
+          endpointType: "ipfs_delegated_routing_v1",
+          method: "GET",
+          operation: "public_resolve",
+          requestOrdinal: requestCount,
+          schemaVersion:
+            CANDIDATE_SOURCE_SNAPSHOT_FILEBASE_IPNS_EVIDENCE_VERSION,
+        }),
+      );
+      return this.#fetch(request, init);
+    };
+    const delegatedEvidence = await this.#observeDelegated({
+      expectedPriorCid: target.priorCid,
+      expectedTargetCid: target.targetCid,
+      fetchImpl: admittedFetch,
+      maxRetries: 0,
+      networkKey: target.ipnsNetworkKey,
+      timeoutMs: this.#config.limits.requestTimeoutMs,
+    });
+    const receiptInput = {
+      delegatedEvidence,
+      domain,
+      schemaVersion: CANDIDATE_SOURCE_SNAPSHOT_FILEBASE_IPNS_EVIDENCE_VERSION,
+    };
+    const receipt = candidateSourceSnapshotDelegatedIpnsReceiptSchema.parse({
+      ...receiptInput,
+      receiptSha256: canonicalJsonSha256(receiptInput),
+    });
+    await this.journal.recordEvidence(receipt);
+    return receiptOutcome(receipt, this.#plan);
   }
 
-  async readOnlyPreflight(): Promise<void> {
+  async readOnlyPreflight(input?: {
+    continuationAuthorization?: CandidateSourceSnapshotPreflightContinuationAuthorization;
+  }): Promise<void> {
+    const continuation = input?.continuationAuthorization
+      ? candidateSourceSnapshotPreflightContinuationAuthorizationSchema.parse(
+          input.continuationAuthorization,
+        )
+      : undefined;
     let initial = await loadPreflightProgress(this.#databaseUrl, this.#plan);
-    if (initial.ready) return;
+    const interruptedContinuationIds = new Set(
+      [...initial.byKey.values()].flatMap((progress) =>
+        progress.attempts
+          .filter(
+            (attempt) =>
+              attempt.outcome === "request_started" &&
+              attempt.continuationAuthorizationId !== null,
+          )
+          .map((attempt) => attempt.continuationAuthorizationId!),
+      ),
+    );
+    if (
+      interruptedContinuationIds.size > 0 &&
+      (interruptedContinuationIds.size !== 1 ||
+        !continuation ||
+        !interruptedContinuationIds.has(continuation.authorizationId))
+    ) {
+      throw new Error(
+        "Interrupted continuation requires its exact authorization replay",
+      );
+    }
     if ([...initial.byKey.values()].some((value) => value.started > 0)) {
       await closeInterruptedPreflightRequests(this.#databaseUrl, this.#plan);
       initial = await loadPreflightProgress(this.#databaseUrl, this.#plan);
     }
+    const gatewayProgress = initial.byKey.get(
+      "open_data:public_resolve:filebase_gateway",
+    );
+    const gatewayHasTerminalReceipt = gatewayProgress?.attempts.some(
+      (attempt) => attempt.outcome === "terminal_failure",
+    );
+    if (gatewayHasTerminalReceipt && !continuation) {
+      throw new Error(
+        "Preflight continuation authorization is required for this receipt history",
+      );
+    }
+    if (continuation) {
+      const binding = continuation.authorizationBinding;
+      const failed = gatewayProgress?.attempts.find(
+        (attempt) =>
+          attempt.requestId === binding.failedReceipt.requestId &&
+          attempt.attemptSequence === binding.failedReceipt.attemptSequence &&
+          attempt.outcome === binding.failedReceipt.outcome &&
+          attempt.receiptSha256 === binding.failedReceipt.receiptSha256,
+      );
+      if (
+        binding.plan.planId !== this.#plan.planId ||
+        binding.plan.planSha256 !== this.#plan.planSha256 ||
+        binding.authorizedObservation.domain !== "open_data" ||
+        binding.authorizedObservation.resolver !== "filebase_gateway" ||
+        binding.authorizedObservation.storedOperationKind !==
+          "public_resolve" ||
+        binding.authorizedObservation.ipnsNetworkKey !==
+          this.#plan.targets.openData.ipnsNetworkKey ||
+        binding.authorizedObservation.expectedPriorCid !==
+          this.#plan.targets.openData.priorCid ||
+        binding.authorizedObservation.expectedTargetCid !==
+          this.#plan.targets.openData.targetCid ||
+        !failed
+      ) {
+        throw new Error(
+          "Preflight continuation does not bind the exact failed receipt",
+        );
+      }
+    }
+    if (initial.ready) return;
     for (const domain of ["open_data", "query_table"] as const) {
       const bucket = initial.byKey.get(`${domain}:bucket_head:none`);
       if ((bucket?.started ?? 0) > 0 || (bucket?.succeeded ?? 0) > 1) {
         throw new Error("Concurrent or conflicting bucket preflight rejected");
       }
       if ((bucket?.succeeded ?? 0) === 0) {
+        if (
+          bucket?.attempts.some((attempt) =>
+            ["absent", "ambiguous", "terminal_failure"].includes(
+              attempt.outcome,
+            ),
+          )
+        ) {
+          throw new Error(
+            `Candidate ${domain} bucket preflight has a terminal receipt`,
+          );
+        }
         let succeeded = false;
         for (
           let attempt = (bucket?.maximumAttempt ?? 0) + 1;
@@ -1349,38 +1517,92 @@ class ProductionCandidateSourceSnapshotRemoteRuntime implements CandidateSourceS
           throw new Error(`Candidate ${domain} bucket preflight failed closed`);
         }
       }
-      const progress = [
-        initial.byKey.get(`${domain}:names_read:filebase_control`),
-        initial.byKey.get(`${domain}:public_resolve:filebase_gateway`),
-        initial.byKey.get(`${domain}:public_resolve:delegated_ipfs`),
-      ];
-      if (progress.some((value) => (value?.started ?? 0) > 0)) {
-        throw new Error("Concurrent or interrupted IPNS preflight rejected");
-      }
-      const successful = progress.filter(
-        (value) => value?.succeeded === 1,
-      ).length;
-      if (successful !== 0 && successful !== 3) {
-        throw new Error("Partial successful IPNS preflight cannot be replayed");
-      }
-      if (successful === 3) continue;
-      const firstAttempt =
-        Math.max(0, ...progress.map((value) => value?.maximumAttempt ?? 0)) + 1;
-      const observation = await this.#observePreflightWithReadRetries(
-        domain,
-        firstAttempt,
-      );
       const expected =
         domain === "open_data"
           ? this.#config.targets.openData.priorCid
           : this.#config.targets.queryTable.priorCid;
-      if (
-        observation.classification !== "prior" ||
-        observation.observedCid !== expected
-      ) {
-        throw new Error(
-          `Candidate ${domain} IPNS preflight did not verify its immutable prior`,
+      for (const resolver of [
+        "filebase_control",
+        "filebase_gateway",
+        "delegated_ipfs",
+      ] as const) {
+        const operation =
+          resolver === "filebase_control" ? "names_read" : "public_resolve";
+        const key = `${domain}:${operation}:${resolver}`;
+        const progress = initial.byKey.get(key);
+        if ((progress?.started ?? 0) > 0 || (progress?.succeeded ?? 0) > 1) {
+          throw new Error(
+            "Concurrent or conflicting resolver preflight rejected",
+          );
+        }
+        if ((progress?.succeeded ?? 0) === 1) {
+          continue;
+        }
+        const terminal = progress?.attempts.filter((attempt) =>
+          ["absent", "ambiguous", "terminal_failure"].includes(attempt.outcome),
         );
+        const isAuthorizedContinuation =
+          domain === "open_data" &&
+          resolver === "filebase_gateway" &&
+          continuation !== undefined;
+        if ((terminal?.length ?? 0) > 0 && !isAuthorizedContinuation) {
+          throw new Error(
+            `Candidate ${domain} ${resolver} preflight has a terminal receipt`,
+          );
+        }
+        const firstAttempt = (progress?.maximumAttempt ?? 0) + 1;
+        let continuationAuthorizationId: string | null = null;
+        let maximumAttempt = this.#config.limits.maxRetries + 1;
+        if (isAuthorizedContinuation) {
+          const binding = continuation!.authorizationBinding;
+          if (
+            terminal?.length !== 1 ||
+            progress?.attempts.length !== 1 ||
+            firstAttempt !==
+              binding.authorizedObservation.authorizedAttemptSequence
+          ) {
+            throw new Error(
+              "Preflight continuation is not the immediate exact retry",
+            );
+          }
+          continuationAuthorizationId = continuation!.authorizationId;
+          maximumAttempt = firstAttempt;
+        }
+        let succeeded = false;
+        for (
+          let attempt = firstAttempt;
+          attempt <= maximumAttempt;
+          attempt += 1
+        ) {
+          const result = await this.#observePreflightResolver(
+            domain,
+            resolver,
+            attempt,
+            continuationAuthorizationId,
+          );
+          if (
+            result.requestOutcome === "succeeded" &&
+            result.classification === "prior" &&
+            result.observedCid === expected
+          ) {
+            succeeded = true;
+            break;
+          }
+          if (
+            continuationAuthorizationId !== null ||
+            !["retryable_failure", "timeout_unknown"].includes(
+              result.requestOutcome,
+            )
+          ) {
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50 * attempt));
+        }
+        if (!succeeded) {
+          throw new Error(
+            `Candidate ${domain} ${resolver} preflight did not verify its immutable prior`,
+          );
+        }
       }
     }
     this.journal.assertSettled();

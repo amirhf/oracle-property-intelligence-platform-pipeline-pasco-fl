@@ -806,63 +806,27 @@ async function assertExactApprovalPreflight(
   transaction: postgres.TransactionSql,
   planId: string,
 ): Promise<void> {
-  const categoryRows = await transaction<
-    {
-      consumed_request_count: number;
-      planned_successful_request_count: number;
-    }[]
-  >`
-    SELECT planned_successful_request_count, consumed_request_count
+  await transaction`
+    SELECT plan_id
     FROM oracle_candidate_source_snapshot_demo_request_categories
     WHERE plan_id = ${planId}
       AND request_category = 'bucket_names_preflight'
     FOR UPDATE
   `;
-  const requests = await transaction<ApprovalPreflightRequestRow[]>`
-    SELECT logical_request_id, domain, operation_kind, resolver,
-           attempt_sequence, redirect_sequence, outcome, receipt_sha256
+  await transaction`
+    SELECT request_id
     FROM oracle_candidate_source_snapshot_demo_requests
     WHERE plan_id = ${planId}
       AND request_category = 'bucket_names_preflight'
-    ORDER BY domain, operation_kind, resolver NULLS FIRST
+    ORDER BY request_id
     FOR UPDATE
   `;
-  const category = categoryRows[0];
-  const keys = requests.map(
-    (request) =>
-      `${request.domain}:${request.operation_kind}:${request.resolver ?? "none"}`,
-  );
-  const uniqueKeys = new Set(keys);
-  const succeededKeys = requests
-    .filter((request) => request.outcome === "succeeded")
-    .map(
-      (request) =>
-        `${request.domain}:${request.operation_kind}:${request.resolver ?? "none"}`,
-    );
-  const logicalKeyPairs = new Set(
-    requests.map(
-      (request, index) => `${request.logical_request_id}:${keys[index]}`,
-    ),
-  );
-  if (
-    !category ||
-    category.planned_successful_request_count !== 8 ||
-    category.consumed_request_count !== requests.length ||
-    category.consumed_request_count < 8 ||
-    category.consumed_request_count > 48 ||
-    new Set(requests.map((request) => request.logical_request_id)).size !== 8 ||
-    uniqueKeys.size !== 8 ||
-    logicalKeyPairs.size !== 8 ||
-    keys.some((key) => !EXACT_APPROVAL_PREFLIGHT_KEYS.has(key)) ||
-    succeededKeys.length !== 8 ||
-    new Set(succeededKeys).size !== 8 ||
-    requests.some(
-      (request) =>
-        !["succeeded", "retryable_failure", "timeout_unknown"].includes(
-          request.outcome,
-        ) || request.receipt_sha256 === null,
-    )
-  ) {
+  const ready = await transaction<{ ready: boolean }[]>`
+    SELECT oracle_candidate_source_snapshot_preflight_is_execution_ready(
+      ${planId}
+    ) AS ready
+  `;
+  if (ready[0]?.ready !== true) {
     throw new DurableConflictError(
       "Candidate source-snapshot approval requires eight exact successful logical preflight receipts with closed bounded retry evidence",
     );
@@ -1041,6 +1005,7 @@ export async function beginCandidateSourceSnapshotDemoExecution(
   databaseUrl: string,
   inputValue: {
     approvalId: string;
+    continuationAuthorizationId?: string | null;
     executorEnabled: true;
     implementationCommitSha: string;
     planId: string;
@@ -1050,6 +1015,11 @@ export async function beginCandidateSourceSnapshotDemoExecution(
   const input = z
     .strictObject({
       approvalId: z.string().regex(/^snapshotdemoapproval_[a-f0-9]{32}$/),
+      continuationAuthorizationId: z
+        .string()
+        .regex(/^snapshotdemocontinuation_[a-f0-9]{32}$/)
+        .nullable()
+        .default(null),
       executorEnabled: z.literal(true),
       implementationCommitSha: z.string().regex(/^[a-f0-9]{40}$/),
       planId: z.string().regex(/^snapshotdemo_[a-f0-9]{32}$/),
@@ -1063,11 +1033,30 @@ export async function beginCandidateSourceSnapshotDemoExecution(
       const { plan, row } = await loadExactPlanRowForUpdate(transaction, input);
       await assertExactApprovalPreflight(transaction, plan.planId);
       const approvals = await transaction<{ approval_id: string }[]>`
-        SELECT approval_id
-        FROM oracle_candidate_source_snapshot_demo_approvals
-        WHERE approval_id = ${input.approvalId}
-          AND plan_id = ${plan.planId} AND plan_sha256 = ${plan.planSha256}
-          AND implementation_commit_sha = ${input.implementationCommitSha}
+        SELECT approval.approval_id
+        FROM oracle_candidate_source_snapshot_demo_approvals approval
+        LEFT JOIN oracle_candidate_source_preflight_continuation_authorizations continuation
+          ON continuation.authorization_id = ${input.continuationAuthorizationId}
+         AND continuation.plan_id = approval.plan_id
+         AND continuation.plan_sha256 = approval.plan_sha256
+         AND continuation.approval_id = approval.approval_id
+        WHERE approval.approval_id = ${input.approvalId}
+          AND approval.plan_id = ${plan.planId}
+          AND approval.plan_sha256 = ${plan.planSha256}
+          AND (
+            (${input.continuationAuthorizationId}::text IS NULL AND
+             approval.implementation_commit_sha =
+               ${input.implementationCommitSha} AND
+             NOT EXISTS (
+               SELECT 1
+               FROM oracle_candidate_source_preflight_continuation_authorizations required_continuation
+               WHERE required_continuation.plan_id = approval.plan_id
+                 AND required_continuation.plan_sha256 = approval.plan_sha256
+             )) OR
+            (${input.continuationAuthorizationId}::text IS NOT NULL AND
+             continuation.amended_implementation_commit_sha =
+               ${input.implementationCommitSha})
+          )
       `;
       if (!approvals[0]) {
         throw new DurableConflictError(
@@ -1096,7 +1085,11 @@ export async function beginCandidateSourceSnapshotDemoExecution(
       }
       await recordStateEvent(transaction, {
         eventType: "execution_started",
-        metadata: { approvalId: input.approvalId },
+        metadata: {
+          approvalId: input.approvalId,
+          continuationAuthorizationId: input.continuationAuthorizationId,
+          implementationCommitSha: input.implementationCommitSha,
+        },
         plan,
       });
       return durableState(plan, row, await counts(transaction, plan.planId));
@@ -1600,17 +1593,6 @@ interface RemoteRequestRow {
   resolver: CandidateSourceSnapshotIpnsResolver | null;
 }
 
-interface ApprovalPreflightRequestRow {
-  attempt_sequence: number;
-  domain: CandidateSourceSnapshotIpnsDomain;
-  logical_request_id: string;
-  operation_kind: z.infer<typeof preflightOperationKindSchema>;
-  outcome: string;
-  receipt_sha256: string | null;
-  redirect_sequence: number;
-  resolver: CandidateSourceSnapshotPreflightRequestAdmission["resolver"];
-}
-
 const ipnsDomainSchema = z.enum(["open_data", "query_table"]);
 const ipnsResolverSchema = z.enum([
   "filebase_control",
@@ -1677,20 +1659,10 @@ const ipnsIntentStateSchema = z.enum([
   "failed_terminal",
 ]);
 
-const EXACT_APPROVAL_PREFLIGHT_KEYS = new Set([
-  "open_data:bucket_head:none",
-  "open_data:names_read:filebase_control",
-  "open_data:public_resolve:filebase_gateway",
-  "open_data:public_resolve:delegated_ipfs",
-  "query_table:bucket_head:none",
-  "query_table:names_read:filebase_control",
-  "query_table:public_resolve:filebase_gateway",
-  "query_table:public_resolve:delegated_ipfs",
-]);
-
 export interface CandidateSourceSnapshotPreflightRequestAdmission {
   alreadyRecorded: boolean;
   attemptSequence: number;
+  continuationAuthorizationId: string | null;
   domain: CandidateSourceSnapshotIpnsDomain;
   logicalRequestId: string;
   operationKind: z.infer<typeof preflightOperationKindSchema>;
@@ -1918,6 +1890,7 @@ export async function admitCandidateSourceSnapshotPreflightRequest(
   databaseUrl: string,
   inputValue: {
     attemptSequence: number;
+    continuationAuthorizationId?: string | null;
     domain: CandidateSourceSnapshotIpnsDomain;
     operationKind: z.infer<typeof preflightOperationKindSchema>;
     planId: string;
@@ -1932,6 +1905,11 @@ export async function admitCandidateSourceSnapshotPreflightRequest(
   const input = z
     .strictObject({
       attemptSequence: z.number().int().min(1).max(3),
+      continuationAuthorizationId: z
+        .string()
+        .regex(/^snapshotdemocontinuation_[a-f0-9]{32}$/)
+        .nullable()
+        .default(null),
       domain: ipnsDomainSchema,
       operationKind: preflightOperationKindSchema,
       planId: z.string().regex(/^snapshotdemo_[a-f0-9]{32}$/),
@@ -1957,6 +1935,23 @@ export async function admitCandidateSourceSnapshotPreflightRequest(
         context.addIssue({
           code: "custom",
           message: "preflight resolver does not match its closed operation",
+        });
+      }
+      if (
+        value.continuationAuthorizationId !== null &&
+        !(
+          value.attemptSequence === 2 &&
+          value.redirectSequence === 0 &&
+          value.domain === "open_data" &&
+          value.operationKind === "public_resolve" &&
+          value.resolver === "filebase_gateway"
+        )
+      ) {
+        context.addIssue({
+          code: "custom",
+          message:
+            "continuation authorization is restricted to the exact second official-gateway observation",
+          path: ["continuationAuthorizationId"],
         });
       }
     })
@@ -1997,6 +1992,7 @@ export async function admitCandidateSourceSnapshotPreflightRequest(
       const existing = await transaction<
         {
           attempt_sequence: number;
+          continuation_authorization_id: string | null;
           domain: CandidateSourceSnapshotIpnsDomain;
           logical_request_id: string;
           operation_kind: z.infer<typeof preflightOperationKindSchema>;
@@ -2007,7 +2003,8 @@ export async function admitCandidateSourceSnapshotPreflightRequest(
         }[]
       >`
         SELECT request_id, logical_request_id, domain, operation_kind,
-               resolver, attempt_sequence, redirect_sequence, outcome
+               resolver, attempt_sequence, redirect_sequence, outcome,
+               continuation_authorization_id
         FROM oracle_candidate_source_snapshot_demo_requests
         WHERE request_id = ${id}
         FOR UPDATE
@@ -2020,7 +2017,9 @@ export async function admitCandidateSourceSnapshotPreflightRequest(
           replay.operation_kind !== input.operationKind ||
           replay.resolver !== input.resolver ||
           replay.attempt_sequence !== input.attemptSequence ||
-          replay.redirect_sequence !== input.redirectSequence
+          replay.redirect_sequence !== input.redirectSequence ||
+          replay.continuation_authorization_id !==
+            input.continuationAuthorizationId
         ) {
           throw new DurableConflictError(
             "Candidate source-snapshot preflight admission replay conflicts",
@@ -2033,6 +2032,23 @@ export async function admitCandidateSourceSnapshotPreflightRequest(
           outcome: replay.outcome,
           requestId: id,
         };
+      }
+      if (input.continuationAuthorizationId === null) {
+        const continuationHistory = await transaction<{ request_id: string }[]>`
+          SELECT request_id
+          FROM oracle_candidate_source_snapshot_demo_requests
+          WHERE plan_id = ${plan.planId}
+            AND request_category = 'bucket_names_preflight'
+            AND logical_request_id = ${logicalId}
+            AND continuation_authorization_id IS NOT NULL
+          LIMIT 1
+          FOR SHARE
+        `;
+        if (continuationHistory[0]) {
+          throw new DurableConflictError(
+            "Candidate source-snapshot continuation authorizes only its exact named observation",
+          );
+        }
       }
       const accountingRows = await transaction<AccountingRow[]>`
         SELECT request_count, class_a_mutation_count, class_b_read_count,
@@ -2089,12 +2105,14 @@ export async function admitCandidateSourceSnapshotPreflightRequest(
         INSERT INTO oracle_candidate_source_snapshot_demo_requests (
           request_id, plan_id, operation_class, operation_kind, domain,
           resolver, request_cost_usd, outcome, request_category,
-          logical_request_id, attempt_sequence, redirect_sequence
+          logical_request_id, attempt_sequence, redirect_sequence,
+          continuation_authorization_id
         ) VALUES (
           ${id}, ${plan.planId}, ${operationClass}, ${input.operationKind},
           ${input.domain}, ${input.resolver}, ${requestCostUsd},
           'request_started', 'bucket_names_preflight', ${logicalId},
-          ${input.attemptSequence}, ${input.redirectSequence}
+          ${input.attemptSequence}, ${input.redirectSequence},
+          ${input.continuationAuthorizationId}
         )
       `;
       return {
@@ -2132,6 +2150,7 @@ async function recordPreflightRequestOutcomeInTransaction(
   const rows = await transaction<
     {
       attempt_sequence: number;
+      continuation_authorization_id: string | null;
       logical_request_id: string;
       operation_kind: string;
       outcome: string;
@@ -2141,7 +2160,8 @@ async function recordPreflightRequestOutcomeInTransaction(
     }[]
   >`
     SELECT logical_request_id, operation_kind, resolver,
-           attempt_sequence, redirect_sequence, outcome, receipt_sha256
+           attempt_sequence, redirect_sequence, outcome, receipt_sha256,
+           continuation_authorization_id
     FROM oracle_candidate_source_snapshot_demo_requests
     WHERE request_id = ${admission.requestId}
       AND plan_id = ${plan.planId}
@@ -2155,7 +2175,8 @@ async function recordPreflightRequestOutcomeInTransaction(
     row.operation_kind !== admission.operationKind ||
     row.resolver !== admission.resolver ||
     row.attempt_sequence !== admission.attemptSequence ||
-    row.redirect_sequence !== admission.redirectSequence
+    row.redirect_sequence !== admission.redirectSequence ||
+    row.continuation_authorization_id !== admission.continuationAuthorizationId
   ) {
     throw new DurableConflictError(
       "Candidate source-snapshot preflight outcome lacks exact admission",
@@ -2188,65 +2209,11 @@ export async function recordCandidateSourceSnapshotPreflightRequestOutcome(
   databaseUrl: string,
   inputValue: CandidateSourceSnapshotPreflightRequestOutcomeInput,
 ): Promise<void> {
-  const resolverScoped = inputValue.admission.resolver !== null;
-  const interruptedResolverClosure =
-    resolverScoped &&
-    inputValue.admission.alreadyRecorded &&
-    inputValue.admission.outcome === "request_started" &&
-    inputValue.outcome === "timeout_unknown";
-  if (resolverScoped && !interruptedResolverClosure) {
-    throw new DurableInputError(
-      "Candidate source-snapshot resolver preflight outcomes must be recorded as one atomic cycle",
-    );
-  }
   const sql = postgres(databaseUrl, { max: 1 });
   try {
     await sql.begin(async (transaction) => {
       await lock(transaction);
       await recordPreflightRequestOutcomeInTransaction(transaction, inputValue);
-    });
-  } finally {
-    await sql.end({ timeout: 5 });
-  }
-}
-
-export async function recordCandidateSourceSnapshotPreflightCycleOutcomes(
-  databaseUrl: string,
-  inputValues: readonly CandidateSourceSnapshotPreflightRequestOutcomeInput[],
-): Promise<void> {
-  if (inputValues.length !== 3) {
-    throw new DurableInputError(
-      "Candidate source-snapshot preflight cycle requires exactly three resolver outcomes",
-    );
-  }
-  const first = inputValues[0]!.admission;
-  const resolvers = new Set(
-    inputValues.map((value) => value.admission.resolver),
-  );
-  if (
-    resolvers.size !== 3 ||
-    !["filebase_control", "filebase_gateway", "delegated_ipfs"].every(
-      (resolver) => resolvers.has(resolver as typeof first.resolver),
-    ) ||
-    inputValues.some(
-      ({ admission }) =>
-        admission.planId !== first.planId ||
-        admission.planSha256 !== first.planSha256 ||
-        admission.domain !== first.domain ||
-        admission.attemptSequence !== first.attemptSequence,
-    )
-  ) {
-    throw new DurableInputError(
-      "Candidate source-snapshot preflight cycle identity is inconsistent",
-    );
-  }
-  const sql = postgres(databaseUrl, { max: 1 });
-  try {
-    await sql.begin(async (transaction) => {
-      await lock(transaction);
-      for (const input of inputValues) {
-        await recordPreflightRequestOutcomeInTransaction(transaction, input);
-      }
     });
   } finally {
     await sql.end({ timeout: 5 });
@@ -2267,6 +2234,7 @@ export async function loadCandidateSourceSnapshotPreflightRequestOutcome(
     const rows = await sql<
       {
         attempt_sequence: number;
+        continuation_authorization_id: string | null;
         completed_at: Date | null;
         domain: CandidateSourceSnapshotIpnsDomain;
         logical_request_id: string;
@@ -2279,7 +2247,7 @@ export async function loadCandidateSourceSnapshotPreflightRequestOutcome(
     >`
       SELECT logical_request_id, domain, operation_kind, resolver,
              attempt_sequence, redirect_sequence, outcome, receipt_sha256,
-             completed_at
+             completed_at, continuation_authorization_id
       FROM oracle_candidate_source_snapshot_demo_requests
       WHERE request_id = ${admission.requestId}
         AND plan_id = ${admission.planId}
@@ -2294,6 +2262,8 @@ export async function loadCandidateSourceSnapshotPreflightRequestOutcome(
       row.resolver !== admission.resolver ||
       row.attempt_sequence !== admission.attemptSequence ||
       row.redirect_sequence !== admission.redirectSequence ||
+      row.continuation_authorization_id !==
+        admission.continuationAuthorizationId ||
       (row.outcome === "request_started") !== (row.completed_at === null) ||
       (row.outcome === "request_started") !== (row.receipt_sha256 === null)
     ) {
