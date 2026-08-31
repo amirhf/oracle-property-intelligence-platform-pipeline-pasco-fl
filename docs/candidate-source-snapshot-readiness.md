@@ -18,6 +18,67 @@ owner-assumed snapshot classification. It does not reconcile the separate
 is reported independently; permit and contractor coverage remains unavailable,
 and null must not be presented as zero.
 
+## Local Session 2A remediation status
+
+Session 2A is an implementation-only durability remediation. It does not
+approve this plan, enable an executor or authorize a remote request. The
+persistent candidate executor remains disabled. No upload, IPNS mutation,
+Filebase effect, Vercel change or deployment is performed by this checkpoint.
+
+The local remediation binds an authorization statement byte for byte to the
+immutable candidate plan through
+`candidate-source-snapshot-authorization-binding-v1` and records approvals as
+`candidate-source-snapshot-approval-v2`. The binding includes the candidate-only
+classification; exact plan ID and logical SHA-256; plan-artifact CID, byte hash
+and size; object count and exact upload bytes; reserved bytes; inventory index
+CID and full-inventory commitment; both bucket, prefix, label, k51, immutable
+prior-CID and target-CID tuples; request, retry, recovery, concurrency and
+timeout ceilings; and the maximum spending ceiling. A changed character,
+whitespace difference or changed binding is not the authorized statement.
+
+The additive approval guard independently reconstructs that statement and its
+binding from the immutable stored plan, then recomputes the statement SHA-256,
+binding SHA-256, approval SHA-256 and deterministic approval ID before an exact
+approval can be recorded. The additive completion guard derives upload closure
+from the durable object journal, admits IPNS intents only after that closure,
+and refuses completion without a separate immutable remote-verification record.
+For this exact plan, the remote-check and aggregate-verification APIs reject
+before recording evidence because its request envelope authorizes no
+credential-free artifact-read operation. The closed IPNS controller is a
+local, dependency-injected execution boundary for testing the existing-intent
+transition and recovery order. Retry and rollback commands require the journal
+to confirm the exact immutable authorization ID and SHA-256 before boundary
+access. It does not select a real remote executor or make a remote call.
+
+The supplied Session 2 authorization statement is the only admissible statement
+for the exact plan described below. Session 2A binds and tests that statement;
+it does not persist an approval or consume it to execute. Remote execution
+requires renewed direction after every remaining stop gate is resolved.
+
+### Credential-free Phase 5 and Phase 9 request-envelope blocker
+
+The immutable plan admits 325,320 successful requests and at most 975,960
+execution attempts: 325,312 Class A object mutations, four Names API
+operations and four public-resolver operations on the successful path, with
+two retries (three total object attempts). It separately admits 23,980 Class B
+ambiguous-object inspection reads and 60 recovery operations. The absolute
+ceiling is 1,000,000 requests and `freeOperations` is zero.
+
+Credential-free immutable-upload closure in Phase 5 and complete read-plane
+verification in Phase 9 require artifact and control-object reads. Those reads
+are not Names API mutations, IPNS public resolution or ambiguous S3 object
+inspections, and the approved envelope has no other operation class to charge
+them to. They therefore cannot be executed outside the journal or mislabeled
+as an existing class. The local completion tables and APIs are deliberately
+non-arming for this plan: `freeOperations` is zero, so they cannot accept a
+caller-asserted CID/hash/count report as remote evidence. A future authorized
+completion path must journal every credential-free read and durably derive its
+receipt, verify every control shard and provenance artifact, and bind graph and
+Parquet semantic checks to those receipts. Adding that read allowance would
+change approved plan semantics and requires a derived plan plus a new exact
+authorization unless a plan-consistent interpretation is first proven. Session
+2A remains stopped before remote execution on this blocker.
+
 ## Hosted read behavior
 
 The hosted service remains read-only. It resolves only the two plan-bound
@@ -181,12 +242,14 @@ Session 2 must stop before every remote effect unless all of these remain true:
    `awaiting_approval`, or `awaiting_configuration` until the account-tier
    confirmation is recorded. It contains zero approval, upload effect, IPNS
    intent or mutation records for that plan.
-5. A human returns the exact one-line approval statement generated for the
-   final plan. It must bind the plan ID/hash, object count/bytes, both buckets,
-   labels and k51 identities, both immutable priors and proposed targets,
-   plan/manifest roots, request/retry/recovery/concurrency/timeout ceilings,
-   spending ceiling and the explicit Pro-or-better confirmation. This runbook
-   and the Session 1.5 prompt are not approval.
+5. The exact one-line authorization statement supplied for the final plan is
+   the only admissible statement. It binds the plan ID/hash, object count/bytes,
+   both buckets, labels and k51 identities, both immutable priors and proposed
+   targets, plan/manifest roots, request/retry/recovery/concurrency/timeout
+   ceilings, spending ceiling and the explicit Pro-or-better confirmation. The
+   Session 2A implementation may parse, bind and test it, but must not persist
+   an approval or execute it. Any wording or binding change invalidates it and
+   requires a newly derived plan and exact human authorization.
 
 After exact approval, execution must reload the immutable plan, revalidate its
 state and all local bytes, persist upload admission, and remain within every

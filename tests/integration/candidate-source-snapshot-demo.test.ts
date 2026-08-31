@@ -2,10 +2,14 @@ import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
+  approveCandidateSourceSnapshotDemoPlan,
+  beginCandidateSourceSnapshotDemoExecution,
+  confirmCandidateSourceSnapshotDemoCapacity,
   loadCandidateSourceSnapshotDemoPlan,
   PostgresCandidateSourceSnapshotUploadJournal,
   recordCandidateSourceSnapshotDemoPlan,
 } from "../../src/db/candidate-source-snapshot-demo.js";
+import { renderCandidateSourceSnapshotAuthorizationStatement } from "../../src/db/candidate-source-snapshot-approval.js";
 import { runMigrations } from "../../src/db/migrations.js";
 import { syntheticCandidateSourceSnapshotDemo } from "../helpers/candidate-source-snapshot-demo.js";
 
@@ -22,7 +26,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(databaseUrl)).toHaveLength(26);
+  expect(await runMigrations(databaseUrl)).toHaveLength(28);
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });
 
@@ -123,7 +127,9 @@ describe("candidate source-snapshot v2 durability", () => {
             'synthetic-controller', '2026-08-31T00:00:00.000Z'
           )
         `,
-      ).rejects.toThrow("not bound to a confirmed immutable plan");
+      ).rejects.toThrow(
+        "not bound to the exact authorization and confirmed immutable plan",
+      );
     } finally {
       await sql.end({ timeout: 5 });
     }
@@ -173,57 +179,37 @@ describe("candidate source-snapshot v2 durability", () => {
     ).rejects.toThrow();
   });
 
-  it("requires a bound intent-state origin and immutable target observation before verification", async () => {
+  it("durably recovers ambiguous uploads and blocks IPNS without exact upload closure", async () => {
     const fixture = syntheticCandidateSourceSnapshotDemo();
     const sql = postgres(databaseUrl, { max: 1 });
     try {
-      await sql`
-        INSERT INTO oracle_candidate_source_snapshot_demo_capacity_confirmations (
-          confirmation_id, plan_id, plan_sha256, plan_artifact_sha256,
-          plan_artifact_cid, plan_artifact_remote_object_key,
-          plan_artifact_bytes, confirmed_plan_name, confirmer_reference,
-          confirmed_at, confirmation_sha256
-        ) VALUES (
-          ${`snapshotdemocapacity_${"a".repeat(32)}`},
-          ${fixture.plan.planId}, ${fixture.plan.planSha256},
-          ${fixture.exactUpload.planArtifact.sha256},
-          ${fixture.exactUpload.planArtifact.expectedCid},
-          ${fixture.exactUpload.planArtifact.remoteObjectKey},
-          ${fixture.exactUpload.planArtifact.byteSize}, 'Filebase Pro',
-          'synthetic-controller', '2026-08-31T00:00:00.000Z', ${"b".repeat(64)}
-        )
-      `;
-      await sql`
-        UPDATE oracle_candidate_source_snapshot_demo_plans
-        SET state = 'awaiting_approval', revision = 2
-        WHERE plan_id = ${fixture.plan.planId}
-      `;
-      await sql`
-        INSERT INTO oracle_candidate_source_snapshot_demo_approvals (
-          approval_id, plan_id, plan_sha256, plan_artifact_sha256,
-          plan_artifact_cid, plan_artifact_remote_object_key,
-          plan_artifact_bytes, approved_plan_revision,
-          approver_reference, approved_at
-        ) VALUES (
-          ${`snapshotdemoapproval_${"c".repeat(32)}`},
-          ${fixture.plan.planId}, ${fixture.plan.planSha256},
-          ${fixture.exactUpload.planArtifact.sha256},
-          ${fixture.exactUpload.planArtifact.expectedCid},
-          ${fixture.exactUpload.planArtifact.remoteObjectKey},
-          ${fixture.exactUpload.planArtifact.byteSize}, 2,
-          'synthetic-controller', '2026-08-31T00:00:00.000Z'
-        )
-      `;
-      await sql`
-        UPDATE oracle_candidate_source_snapshot_demo_plans
-        SET state = 'approved', revision = 3
-        WHERE plan_id = ${fixture.plan.planId}
-      `;
-      await sql`
-        UPDATE oracle_candidate_source_snapshot_demo_plans
-        SET state = 'executing', revision = 4
-        WHERE plan_id = ${fixture.plan.planId}
-      `;
+      await confirmCandidateSourceSnapshotDemoCapacity(databaseUrl, {
+        confirmedAt: "2026-08-31T00:00:00.000Z",
+        confirmedPlanName: "Filebase Pro",
+        confirmerReference: "synthetic-controller",
+        planId: fixture.plan.planId,
+        planSha256: fixture.plan.planSha256,
+      });
+      const approval = await approveCandidateSourceSnapshotDemoPlan(
+        databaseUrl,
+        {
+          approvedAt: "2026-08-31T00:00:01.000Z",
+          approverReference: "synthetic-controller",
+          authorizationStatement:
+            renderCandidateSourceSnapshotAuthorizationStatement(
+              fixture.plan,
+              fixture.exactUpload,
+            ),
+          planId: fixture.plan.planId,
+          planSha256: fixture.plan.planSha256,
+        },
+      );
+      await beginCandidateSourceSnapshotDemoExecution(databaseUrl, {
+        approvalId: approval.approvalId,
+        executorEnabled: true,
+        planId: fixture.plan.planId,
+        planSha256: fixture.plan.planSha256,
+      });
       const journal = new PostgresCandidateSourceSnapshotUploadJournal(
         databaseUrl,
       );
@@ -366,78 +352,23 @@ describe("candidate source-snapshot v2 durability", () => {
         inspections: 2,
         object_requests: 5,
       });
-      const target = fixture.plan.targets.openData;
       const intentId = `snapshotdemointent_${"d".repeat(32)}`;
-      await sql`
-        INSERT INTO oracle_candidate_source_snapshot_demo_ipns_intents (
-          intent_id, plan_id, plan_sha256, domain, bucket, ipns_label,
-          ipns_network_key, prior_cid, target_cid, intended_at
-        ) VALUES (
-          ${intentId}, ${fixture.plan.planId}, ${fixture.plan.planSha256},
-          'open_data', ${target.bucket}, ${target.ipnsLabel},
-          ${target.ipnsNetworkKey}, ${target.priorCid}, ${target.targetCid},
-          '2026-08-31T00:00:00.000Z'
-        )
-      `;
       await expect(
         sql`
-          INSERT INTO oracle_candidate_source_snapshot_demo_ipns_intent_state (
-            intent_id, plan_id, domain, state, revision
+          INSERT INTO oracle_candidate_source_snapshot_demo_ipns_intents (
+            intent_id, plan_id, plan_sha256, domain, bucket, ipns_label,
+            ipns_network_key, prior_cid, target_cid, intended_at
           ) VALUES (
-            ${intentId}, ${fixture.plan.planId}, 'open_data', 'verified', 1
+            ${intentId}, ${fixture.plan.planId}, ${fixture.plan.planSha256},
+            'open_data', ${fixture.plan.targets.openData.bucket},
+            ${fixture.plan.targets.openData.ipnsLabel},
+            ${fixture.plan.targets.openData.ipnsNetworkKey},
+            ${fixture.plan.targets.openData.priorCid},
+            ${fixture.plan.targets.openData.targetCid},
+            '2026-08-31T00:00:02.000Z'
           )
         `,
-      ).rejects.toThrow("must begin from its exact immutable intent");
-      await sql`
-        INSERT INTO oracle_candidate_source_snapshot_demo_ipns_intent_state (
-          intent_id, plan_id, domain, state, revision
-        ) VALUES (
-          ${intentId}, ${fixture.plan.planId}, 'open_data', 'intent_recorded', 1
-        )
-      `;
-      await expect(
-        sql`
-          UPDATE oracle_candidate_source_snapshot_demo_ipns_intent_state
-          SET state = 'prior_confirmed', revision = 2
-          WHERE intent_id = ${intentId}
-        `,
-      ).rejects.toThrow("requires one complete resolution cycle");
-      for (const [index, resolver] of (
-        ["filebase_control", "filebase_gateway", "delegated_ipfs"] as const
-      ).entries()) {
-        const request = await journal.startResolutionRequest(fixture.plan, {
-          cycleSequence: 1,
-          domain: "open_data",
-          intentId,
-          resolver,
-        });
-        await journal.recordResolutionObservation(fixture.plan, request, {
-          classification: "prior",
-          evidenceSha256: String(index + 1).repeat(64),
-          observedAt: new Date(Date.now() + index).toISOString(),
-          observedCid: target.priorCid,
-          requestOutcome: "succeeded",
-        });
-      }
-      await expect(
-        sql`
-          UPDATE oracle_candidate_source_snapshot_demo_ipns_intent_state
-          SET state = 'prior_confirmed', revision = 2
-          WHERE intent_id = ${intentId}
-        `,
-      ).resolves.toBeDefined();
-      await sql`
-        UPDATE oracle_candidate_source_snapshot_demo_ipns_intent_state
-        SET state = 'update_in_flight', revision = 3
-        WHERE intent_id = ${intentId}
-      `;
-      await expect(
-        sql`
-          UPDATE oracle_candidate_source_snapshot_demo_ipns_intent_state
-          SET state = 'target_observed', revision = 4
-          WHERE intent_id = ${intentId}
-        `,
-      ).rejects.toThrow("requires one complete resolution cycle");
+      ).rejects.toThrow("immutable upload closure");
     } finally {
       await sql.end({ timeout: 5 });
     }

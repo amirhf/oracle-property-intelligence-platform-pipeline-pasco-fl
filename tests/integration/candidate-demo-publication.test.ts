@@ -55,7 +55,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(databaseUrl)).toHaveLength(26);
+  expect(await runMigrations(databaseUrl)).toHaveLength(28);
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });
 

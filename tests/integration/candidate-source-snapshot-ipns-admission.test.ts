@@ -2,11 +2,18 @@ import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
+  approveCandidateSourceSnapshotDemoPlan,
+  beginCandidateSourceSnapshotDemoExecution,
+  confirmCandidateSourceSnapshotDemoCapacity,
+  createCandidateSourceSnapshotDemoIpnsIntents,
+  expectedCandidateSourceSnapshotUploadReceiptSha256,
   PostgresCandidateSourceSnapshotUploadJournal,
   recordCandidateSourceSnapshotDemoPlan,
   type CandidateSourceSnapshotIpnsDomain,
   type CandidateSourceSnapshotIpnsResolver,
 } from "../../src/db/candidate-source-snapshot-demo.js";
+import { recordCandidateSourceSnapshotUploadClosure } from "../../src/db/candidate-source-snapshot-completion.js";
+import { renderCandidateSourceSnapshotAuthorizationStatement } from "../../src/db/candidate-source-snapshot-approval.js";
 import { runMigrations } from "../../src/db/migrations.js";
 import { syntheticCandidateSourceSnapshotDemo } from "../helpers/candidate-source-snapshot-demo.js";
 
@@ -29,7 +36,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(databaseUrl)).toHaveLength(26);
+  expect(await runMigrations(databaseUrl)).toHaveLength(28);
 });
 
 afterAll(async () => {
@@ -49,96 +56,70 @@ describe("candidate source-snapshot IPNS request admission", () => {
     const journal = new PostgresCandidateSourceSnapshotUploadJournal(
       databaseUrl,
     );
-    const openIntentId = `snapshotdemointent_${"1".repeat(32)}`;
-    const queryIntentId = `snapshotdemointent_${"2".repeat(32)}`;
     try {
-      await sql`
-        INSERT INTO oracle_candidate_source_snapshot_demo_capacity_confirmations (
-          confirmation_id, plan_id, plan_sha256, plan_artifact_sha256,
-          plan_artifact_cid, plan_artifact_remote_object_key,
-          plan_artifact_bytes, confirmed_plan_name, confirmer_reference,
-          confirmed_at, confirmation_sha256
-        ) VALUES (
-          ${`snapshotdemocapacity_${"3".repeat(32)}`},
-          ${fixture.plan.planId}, ${fixture.plan.planSha256},
-          ${fixture.exactUpload.planArtifact.sha256},
-          ${fixture.exactUpload.planArtifact.expectedCid},
-          ${fixture.exactUpload.planArtifact.remoteObjectKey},
-          ${fixture.exactUpload.planArtifact.byteSize}, 'Filebase Pro',
-          'synthetic-controller', now(), ${"4".repeat(64)}
-        )
-      `;
-      await sql`
-        UPDATE oracle_candidate_source_snapshot_demo_plans
-        SET state = 'awaiting_approval', revision = 2
-        WHERE plan_id = ${fixture.plan.planId}
-      `;
-      await sql`
-        INSERT INTO oracle_candidate_source_snapshot_demo_approvals (
-          approval_id, plan_id, plan_sha256, plan_artifact_sha256,
-          plan_artifact_cid, plan_artifact_remote_object_key,
-          plan_artifact_bytes, approved_plan_revision, approver_reference,
-          approved_at
-        ) VALUES (
-          ${`snapshotdemoapproval_${"5".repeat(32)}`},
-          ${fixture.plan.planId}, ${fixture.plan.planSha256},
-          ${fixture.exactUpload.planArtifact.sha256},
-          ${fixture.exactUpload.planArtifact.expectedCid},
-          ${fixture.exactUpload.planArtifact.remoteObjectKey},
-          ${fixture.exactUpload.planArtifact.byteSize}, 2,
-          'synthetic-controller', now()
-        )
-      `;
-      await sql`
-        UPDATE oracle_candidate_source_snapshot_demo_plans
-        SET state = 'approved', revision = 3
-        WHERE plan_id = ${fixture.plan.planId}
-      `;
-      await sql`
-        UPDATE oracle_candidate_source_snapshot_demo_plans
-        SET state = 'executing', revision = 4
-        WHERE plan_id = ${fixture.plan.planId}
-      `;
-      await sql`
-        UPDATE oracle_candidate_source_snapshot_demo_objects
-        SET status = 'admitted', revision = 2
-        WHERE plan_id = ${fixture.plan.planId}
-      `;
-      await sql`
-        UPDATE oracle_candidate_source_snapshot_demo_objects
-        SET status = 'verified', provider_cid = expected_cid,
-            receipt_sha256 = ${"6".repeat(64)}, successful_effect_count = 1,
-            revision = 3
-        WHERE plan_id = ${fixture.plan.planId}
-      `;
-      for (const [domain, intentId] of [
-        ["open_data", openIntentId],
-        ["query_table", queryIntentId],
-      ] as const) {
-        const target =
-          domain === "open_data"
-            ? fixture.plan.targets.openData
-            : fixture.plan.targets.queryTable;
-        await sql`
-          INSERT INTO oracle_candidate_source_snapshot_demo_ipns_intents (
-            intent_id, plan_id, plan_sha256, domain, bucket, ipns_label,
-            ipns_network_key, prior_cid, target_cid, intended_at
-          ) VALUES (
-            ${intentId}, ${fixture.plan.planId}, ${fixture.plan.planSha256},
-            ${domain}, ${target.bucket}, ${target.ipnsLabel},
-            ${target.ipnsNetworkKey}, ${target.priorCid}, ${target.targetCid},
-            now()
-          )
-        `;
-        await sql`
-          INSERT INTO oracle_candidate_source_snapshot_demo_ipns_intent_state (
-            intent_id, plan_id, domain, state, revision
-          ) VALUES (
-            ${intentId}, ${fixture.plan.planId}, ${domain},
-            'intent_recorded', 1
-          )
-        `;
+      await confirmCandidateSourceSnapshotDemoCapacity(databaseUrl, {
+        confirmedAt: "2026-08-31T00:00:01.000Z",
+        confirmedPlanName: "Filebase Pro",
+        confirmerReference: "synthetic-controller",
+        planId: fixture.plan.planId,
+        planSha256: fixture.plan.planSha256,
+      });
+      const approval = await approveCandidateSourceSnapshotDemoPlan(
+        databaseUrl,
+        {
+          approvedAt: "2026-08-31T00:00:02.000Z",
+          approverReference: "synthetic-controller",
+          authorizationStatement:
+            renderCandidateSourceSnapshotAuthorizationStatement(
+              fixture.plan,
+              fixture.exactUpload,
+            ),
+          planId: fixture.plan.planId,
+          planSha256: fixture.plan.planSha256,
+        },
+      );
+      await beginCandidateSourceSnapshotDemoExecution(databaseUrl, {
+        approvalId: approval.approvalId,
+        executorEnabled: true,
+        planId: fixture.plan.planId,
+        planSha256: fixture.plan.planSha256,
+      });
+      for (const [index, object] of fixture.objects.entries()) {
+        const admission = await journal.startAttempt(fixture.plan, object, 1);
+        const responseBytes = index + 1;
+        await journal.recordVerified(fixture.plan, object, admission.attempt, {
+          providerCid: object.expectedCid,
+          providerRequestIdHash: null,
+          receiptSha256: expectedCandidateSourceSnapshotUploadReceiptSha256({
+            attempt: admission.attempt,
+            object,
+            providerCid: object.expectedCid,
+            providerRequestIdHash: null,
+            responseBytes,
+          }),
+          responseBytes,
+        });
       }
+      await recordCandidateSourceSnapshotUploadClosure(databaseUrl, {
+        approvalId: approval.approvalId,
+        planId: fixture.plan.planId,
+        planSha256: fixture.plan.planSha256,
+        verifiedAt: "2026-08-31T00:00:03.000Z",
+      });
+      const intents = await createCandidateSourceSnapshotDemoIpnsIntents(
+        databaseUrl,
+        {
+          intendedAt: "2026-08-31T00:00:04.000Z",
+          planId: fixture.plan.planId,
+          planSha256: fixture.plan.planSha256,
+        },
+      );
+      const openIntentId = intents.find(
+        (intent) => intent.domain === "open_data",
+      )!.intentId;
+      const queryIntentId = intents.find(
+        (intent) => intent.domain === "query_table",
+      )!.intentId;
 
       await expect(
         sql`
@@ -364,11 +345,11 @@ describe("candidate source-snapshot IPNS request admission", () => {
         WHERE accounting.plan_id = ${fixture.plan.planId}
       `;
       expect(rows[0]).toEqual({
-        durable_requests: 16,
+        durable_requests: 19,
         names_api_count: 7,
         public_resolver_count: 9,
-        request_cost_usd: "0.000072000000",
-        request_count: 16,
+        request_cost_usd: "0.000085500000",
+        request_count: 19,
       });
     } finally {
       await sql.end({ timeout: 5 });

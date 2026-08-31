@@ -24,6 +24,7 @@ import type {
   CandidateSourceSnapshotUploadJournal,
   CandidateSourceSnapshotUploadReceipt,
 } from "../publication/candidate-source-snapshot-upload.js";
+import { createCandidateSourceSnapshotApprovalIdentity } from "./candidate-source-snapshot-approval.js";
 
 const OBJECT_BATCH_SIZE = 500;
 
@@ -784,14 +785,20 @@ export async function approveCandidateSourceSnapshotDemoPlan(
   inputValue: {
     approvedAt: string;
     approverReference: string;
+    authorizationStatement: string;
     planId: string;
     planSha256: string;
   },
-): Promise<{ approvalId: string; state: CandidateSourceSnapshotDurableState }> {
+): Promise<{
+  approvalId: string;
+  approvalSha256: string;
+  state: CandidateSourceSnapshotDurableState;
+}> {
   const input = z
     .strictObject({
       approvedAt: operatorTimestampSchema,
       approverReference: operatorReferenceSchema,
+      authorizationStatement: z.string().min(1).max(8_192),
       planId: z.string().regex(/^snapshotdemo_[a-f0-9]{32}$/),
       planSha256: z.string().regex(/^[a-f0-9]{64}$/),
     })
@@ -802,31 +809,52 @@ export async function approveCandidateSourceSnapshotDemoPlan(
       await lock(transaction);
       const { plan, row } = await loadExactPlanRowForUpdate(transaction, input);
       const exact = planExactUploadFromRow(row);
-      const approvalId = deterministicId("snapshotdemoapproval", [
-        "candidate-source-snapshot-approval-v1",
-        plan.planId,
-        plan.planSha256,
-        input.approverReference,
-        input.approvedAt,
-      ]);
+      const approval = createCandidateSourceSnapshotApprovalIdentity({
+        approvedAt: input.approvedAt,
+        approverReference: input.approverReference,
+        exactUpload: exact,
+        plan,
+        statement: input.authorizationStatement,
+      });
       const existing = await transaction<
         {
           approval_id: string;
+          approval_sha256: string;
+          approval_version: string;
           approved_at: Date;
+          approved_at_iso: string;
           approved_plan_revision: number;
           approver_reference: string;
+          authorization_binding: unknown;
+          authorization_binding_sha256: string;
+          authorization_statement: string;
+          authorization_statement_sha256: string;
         }[]
       >`
-        SELECT approval_id, approved_plan_revision, approver_reference,
-               approved_at
+        SELECT approval_id, approval_sha256, approval_version,
+               approved_plan_revision, approver_reference, approved_at,
+               approved_at_iso, authorization_statement,
+               authorization_statement_sha256, authorization_binding,
+               authorization_binding_sha256
         FROM oracle_candidate_source_snapshot_demo_approvals
         WHERE plan_id = ${plan.planId}
       `;
       if (existing[0]) {
         if (
-          existing[0].approval_id !== approvalId ||
+          existing[0].approval_id !== approval.approvalId ||
+          existing[0].approval_sha256 !== approval.approvalSha256 ||
+          existing[0].approval_version !== approval.approvalVersion ||
           existing[0].approver_reference !== input.approverReference ||
-          existing[0].approved_at.toISOString() !== input.approvedAt
+          existing[0].approved_at.toISOString() !== input.approvedAt ||
+          existing[0].approved_at_iso !== input.approvedAt ||
+          existing[0].authorization_statement !==
+            approval.authorizationStatement ||
+          existing[0].authorization_statement_sha256 !==
+            approval.authorizationStatementSha256 ||
+          existing[0].authorization_binding_sha256 !==
+            approval.authorizationBindingSha256 ||
+          canonicalJsonSha256(existing[0].authorization_binding) !==
+            approval.authorizationBindingSha256
         ) {
           throw new DurableConflictError(
             "Candidate source-snapshot approval conflicts with immutable approval",
@@ -843,12 +871,20 @@ export async function approveCandidateSourceSnapshotDemoPlan(
             approval_id, plan_id, plan_sha256, plan_artifact_sha256,
             plan_artifact_cid, plan_artifact_remote_object_key,
             plan_artifact_bytes, approved_plan_revision,
-            approver_reference, approved_at
+            approver_reference, approved_at, approved_at_iso,
+            approval_version, approval_sha256, authorization_statement,
+            authorization_statement_sha256, authorization_binding,
+            authorization_binding_sha256
           ) VALUES (
-            ${approvalId}, ${plan.planId}, ${plan.planSha256},
+            ${approval.approvalId}, ${plan.planId}, ${plan.planSha256},
             ${exact.planArtifact.sha256}, ${exact.planArtifact.expectedCid},
             ${exact.planArtifact.remoteObjectKey}, ${exact.planArtifact.byteSize},
-            ${row.revision}, ${input.approverReference}, ${input.approvedAt}
+            ${row.revision}, ${input.approverReference}, ${input.approvedAt},
+            ${input.approvedAt}, ${approval.approvalVersion},
+            ${approval.approvalSha256}, ${approval.authorizationStatement},
+            ${approval.authorizationStatementSha256},
+            ${transaction.json(approval.authorizationBinding as postgres.JSONValue)},
+            ${approval.authorizationBindingSha256}
           )
         `;
       }
@@ -870,11 +906,16 @@ export async function approveCandidateSourceSnapshotDemoPlan(
       }
       await recordStateEvent(transaction, {
         eventType: "plan_approved",
-        metadata: { approvalId },
+        metadata: {
+          approvalId: approval.approvalId,
+          approvalSha256: approval.approvalSha256,
+          authorizationStatementSha256: approval.authorizationStatementSha256,
+        },
         plan,
       });
       return {
-        approvalId,
+        approvalId: approval.approvalId,
+        approvalSha256: approval.approvalSha256,
         state: durableState(plan, row, await counts(transaction, plan.planId)),
       };
     });
@@ -949,19 +990,27 @@ export async function beginCandidateSourceSnapshotDemoExecution(
 }
 
 export interface CandidateSourceSnapshotIpnsIntentRecord {
+  approvalId: string;
+  cutoverPosition: 1 | 2;
   domain: CandidateSourceSnapshotIpnsDomain;
   intentId: string;
   priorCid: string;
+  resolverPolicy: "candidate_source_snapshot_filebase_delegated_v1";
+  rollbackPosition: 1 | 2;
   state: "intent_recorded";
   targetCid: string;
+  uploadClosureId: string;
 }
 
 export interface CandidateSourceSnapshotDemoExecutionAdmission {
   accounting: CandidateSourceSnapshotPlanAccounting;
   approval: {
     approvalId: string;
+    approvalSha256: string;
     approvedAt: string;
     approverReference: string;
+    authorizationBindingSha256: string;
+    authorizationStatementSha256: string;
   };
   capacityConfirmation: {
     confirmationId: string;
@@ -1001,11 +1050,15 @@ export async function loadCandidateSourceSnapshotDemoExecutionAdmission(
       const approvals = await transaction<
         {
           approval_id: string;
+          approval_sha256: string;
           approved_at: Date;
           approver_reference: string;
+          authorization_binding_sha256: string;
+          authorization_statement_sha256: string;
         }[]
       >`
-        SELECT approval_id, approver_reference, approved_at
+        SELECT approval_id, approval_sha256, approver_reference, approved_at,
+               authorization_binding_sha256, authorization_statement_sha256
         FROM oracle_candidate_source_snapshot_demo_approvals
         WHERE approval_id = ${identity.approvalId}
           AND plan_id = ${plan.planId} AND plan_sha256 = ${plan.planSha256}
@@ -1028,14 +1081,21 @@ export async function loadCandidateSourceSnapshotDemoExecutionAdmission(
       }
       const intentRows = await transaction<
         {
+          approval_id: string;
+          cutover_position: 1 | 2;
           domain: CandidateSourceSnapshotIpnsDomain;
           intent_id: string;
           prior_cid: string;
+          resolver_policy: "candidate_source_snapshot_filebase_delegated_v1";
+          rollback_position: 1 | 2;
           state: string;
           target_cid: string;
+          upload_closure_id: string;
         }[]
       >`
-        SELECT intent.intent_id, intent.domain, intent.prior_cid,
+        SELECT intent.intent_id, intent.approval_id, intent.upload_closure_id,
+               intent.resolver_policy, intent.cutover_position,
+               intent.rollback_position, intent.domain, intent.prior_cid,
                intent.target_cid, intent_state.state
         FROM oracle_candidate_source_snapshot_demo_ipns_intents intent
         JOIN oracle_candidate_source_snapshot_demo_ipns_intent_state intent_state
@@ -1067,19 +1127,28 @@ export async function loadCandidateSourceSnapshotDemoExecutionAdmission(
           );
         }
         return {
+          approvalId: intent.approval_id,
+          cutoverPosition: intent.cutover_position,
           domain: intent.domain,
           intentId: intent.intent_id,
           priorCid: intent.prior_cid,
+          resolverPolicy: intent.resolver_policy,
+          rollbackPosition: intent.rollback_position,
           state: "intent_recorded" as const,
           targetCid: intent.target_cid,
+          uploadClosureId: intent.upload_closure_id,
         };
       });
       return {
         accounting: accounting(accountingRows[0]),
         approval: {
           approvalId: approvals[0].approval_id,
+          approvalSha256: approvals[0].approval_sha256,
           approvedAt: approvals[0].approved_at.toISOString(),
           approverReference: approvals[0].approver_reference,
+          authorizationBindingSha256: approvals[0].authorization_binding_sha256,
+          authorizationStatementSha256:
+            approvals[0].authorization_statement_sha256,
         },
         capacityConfirmation: {
           confirmationId: confirmations[0].confirmation_id,
@@ -1123,17 +1192,52 @@ export async function createCandidateSourceSnapshotDemoIpnsIntents(
           "Candidate source-snapshot intents require the exact executing plan",
         );
       }
+      const closureRows = await transaction<
+        { approval_id: string; closure_id: string }[]
+      >`
+        SELECT closure_id, approval_id
+        FROM oracle_candidate_source_snapshot_demo_upload_closures
+        WHERE plan_id = ${plan.planId} AND plan_sha256 = ${plan.planSha256}
+      `;
+      const closure = closureRows[0];
+      if (!closure) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot intents require immutable upload closure",
+        );
+      }
       const targets = [
-        { domain: "open_data" as const, target: plan.targets.openData },
-        { domain: "query_table" as const, target: plan.targets.queryTable },
+        {
+          cutoverPosition: 1 as const,
+          domain: "open_data" as const,
+          rollbackPosition: 2 as const,
+          target: plan.targets.openData,
+        },
+        {
+          cutoverPosition: 2 as const,
+          domain: "query_table" as const,
+          rollbackPosition: 1 as const,
+          target: plan.targets.queryTable,
+        },
       ];
       const records: CandidateSourceSnapshotIpnsIntentRecord[] = [];
-      for (const { domain, target } of targets) {
+      for (const {
+        cutoverPosition,
+        domain,
+        rollbackPosition,
+        target,
+      } of targets) {
+        const resolverPolicy =
+          "candidate_source_snapshot_filebase_delegated_v1" as const;
         const intentId = deterministicId("snapshotdemointent", [
           "candidate-source-snapshot-intent-v1",
           plan.planId,
           plan.planSha256,
+          closure.approval_id,
+          closure.closure_id,
           domain,
+          resolverPolicy,
+          String(cutoverPosition),
+          String(rollbackPosition),
           target.bucket,
           target.ipnsLabel,
           target.ipnsNetworkKey,
@@ -1143,17 +1247,25 @@ export async function createCandidateSourceSnapshotDemoIpnsIntents(
         ]);
         const existing = await transaction<
           {
+            approval_id: string;
             bucket: string;
+            cutover_position: number;
             intent_id: string;
             intended_at: Date;
             ipns_label: string;
             ipns_network_key: string;
             prior_cid: string;
+            resolver_policy: string;
+            rollback_position: number;
             state: string;
             target_cid: string;
+            upload_closure_id: string;
           }[]
         >`
-          SELECT intent.intent_id, intent.bucket, intent.ipns_label,
+          SELECT intent.intent_id, intent.approval_id,
+                 intent.upload_closure_id, intent.resolver_policy,
+                 intent.cutover_position, intent.rollback_position,
+                 intent.bucket, intent.ipns_label,
                  intent.ipns_network_key, intent.prior_cid, intent.target_cid,
                  intent.intended_at, intent_state.state
           FROM oracle_candidate_source_snapshot_demo_ipns_intents intent
@@ -1165,6 +1277,11 @@ export async function createCandidateSourceSnapshotDemoIpnsIntents(
           const prior = existing[0];
           if (
             prior.intent_id !== intentId ||
+            prior.approval_id !== closure.approval_id ||
+            prior.upload_closure_id !== closure.closure_id ||
+            prior.resolver_policy !== resolverPolicy ||
+            prior.cutover_position !== cutoverPosition ||
+            prior.rollback_position !== rollbackPosition ||
             prior.bucket !== target.bucket ||
             prior.ipns_label !== target.ipnsLabel ||
             prior.ipns_network_key !== target.ipnsNetworkKey ||
@@ -1184,10 +1301,14 @@ export async function createCandidateSourceSnapshotDemoIpnsIntents(
         } else {
           await transaction`
             INSERT INTO oracle_candidate_source_snapshot_demo_ipns_intents (
-              intent_id, plan_id, plan_sha256, domain, bucket, ipns_label,
-              ipns_network_key, prior_cid, target_cid, intended_at
+              intent_id, plan_id, plan_sha256, approval_id, upload_closure_id,
+              resolver_policy, cutover_position, rollback_position,
+              domain, bucket, ipns_label, ipns_network_key, prior_cid,
+              target_cid, intended_at
             ) VALUES (
-              ${intentId}, ${plan.planId}, ${plan.planSha256}, ${domain},
+              ${intentId}, ${plan.planId}, ${plan.planSha256},
+              ${closure.approval_id}, ${closure.closure_id}, ${resolverPolicy},
+              ${cutoverPosition}, ${rollbackPosition}, ${domain},
               ${target.bucket}, ${target.ipnsLabel}, ${target.ipnsNetworkKey},
               ${target.priorCid}, ${target.targetCid}, ${input.intendedAt}
             )
@@ -1201,11 +1322,16 @@ export async function createCandidateSourceSnapshotDemoIpnsIntents(
           `;
         }
         records.push({
+          approvalId: closure.approval_id,
+          cutoverPosition,
           domain,
           intentId,
           priorCid: target.priorCid,
+          resolverPolicy,
+          rollbackPosition,
           state: "intent_recorded",
           targetCid: target.targetCid,
+          uploadClosureId: closure.closure_id,
         });
       }
       return records;
@@ -1704,7 +1830,7 @@ async function assertInspectionAttemptForUpdate(
   }
 }
 
-function expectedUploadReceiptSha256(input: {
+export function expectedCandidateSourceSnapshotUploadReceiptSha256(input: {
   attempt: CandidateSourceSnapshotUploadAttempt;
   object: CandidateSourceSnapshotUploadObject;
   providerCid: string;
@@ -2898,7 +3024,7 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
     }
     if (
       parsedReceipt.receiptSha256 !==
-      expectedUploadReceiptSha256({
+      expectedCandidateSourceSnapshotUploadReceiptSha256({
         attempt,
         object,
         providerCid: parsedReceipt.providerCid,
