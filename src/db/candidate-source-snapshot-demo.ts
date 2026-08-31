@@ -1940,7 +1940,7 @@ export async function admitCandidateSourceSnapshotPreflightRequest(
       if (
         value.continuationAuthorizationId !== null &&
         !(
-          value.attemptSequence === 2 &&
+          [2, 3].includes(value.attemptSequence) &&
           value.redirectSequence === 0 &&
           value.domain === "open_data" &&
           value.operationKind === "public_resolve" &&
@@ -1950,7 +1950,7 @@ export async function admitCandidateSourceSnapshotPreflightRequest(
         context.addIssue({
           code: "custom",
           message:
-            "continuation authorization is restricted to the exact second official-gateway observation",
+            "continuation authorization is restricted to an exact authorized official-gateway observation",
           path: ["continuationAuthorizationId"],
         });
       }

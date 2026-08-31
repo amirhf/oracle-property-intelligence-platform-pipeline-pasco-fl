@@ -77,6 +77,7 @@ async function applyMigrationRange(
         "030_candidate_source_snapshot_ipns_crash_recovery.sql",
         "031_candidate_source_snapshot_approval_before_remote.sql",
         "032_candidate_source_snapshot_preflight_continuation.sql",
+        "033_candidate_source_snapshot_preflight_chain.sql",
       ];
       const filename = filenames.find((candidate) =>
         candidate.startsWith(prefix),
@@ -259,6 +260,7 @@ describe("migration 010 drift-safe legacy publication policy", () => {
         "030_candidate_source_snapshot_ipns_crash_recovery.sql",
         "031_candidate_source_snapshot_approval_before_remote.sql",
         "032_candidate_source_snapshot_preflight_continuation.sql",
+        "033_candidate_source_snapshot_preflight_chain.sql",
       ]);
       expect(await runMigrations(url)).toEqual([]);
     });

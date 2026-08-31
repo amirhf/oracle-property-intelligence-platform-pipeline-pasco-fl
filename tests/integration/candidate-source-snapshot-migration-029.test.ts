@@ -68,7 +68,7 @@ beforeAll(async () => {
   }
   const applied = await runMigrations(databaseUrl);
   expect(applied.at(-1)).toBe(
-    "032_candidate_source_snapshot_preflight_continuation.sql",
+    "033_candidate_source_snapshot_preflight_chain.sql",
   );
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });

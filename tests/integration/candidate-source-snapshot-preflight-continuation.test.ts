@@ -82,7 +82,7 @@ async function withDisposableDatabase(
   }
   try {
     expect((await runMigrations(isolatedDatabaseUrl)).at(-1)).toBe(
-      "032_candidate_source_snapshot_preflight_continuation.sql",
+      "033_candidate_source_snapshot_preflight_chain.sql",
     );
     await test(isolatedDatabaseUrl);
   } finally {
@@ -190,7 +190,7 @@ beforeAll(async () => {
   }
   const applied = await runMigrations(databaseUrl);
   expect(applied.at(-1)).toBe(
-    "032_candidate_source_snapshot_preflight_continuation.sql",
+    "033_candidate_source_snapshot_preflight_chain.sql",
   );
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });
@@ -383,7 +383,7 @@ describe("candidate source-snapshot preflight continuation", () => {
           resolver: "filebase_gateway",
         }),
       ).rejects.toThrow(
-        "restricted to the exact second official-gateway observation",
+        "restricted to an exact authorized official-gateway observation",
       );
 
       const incomplete = await sql<{ ready: boolean }[]>`
@@ -759,7 +759,7 @@ describe("candidate source-snapshot preflight continuation", () => {
               redirectSequence: 0,
             }),
           ).rejects.toThrow(
-            "continuation authorization is restricted to the exact second official-gateway observation",
+            "continuation authorization is restricted to an exact authorized official-gateway observation",
           );
         }
 
@@ -1015,6 +1015,118 @@ describe("candidate source-snapshot preflight continuation", () => {
           expect(blocked).toEqual([
             { query_requests: 0, ready: false, uploads: 0 },
           ]);
+        } finally {
+          await sql.end({ timeout: 5 });
+        }
+      },
+    );
+  });
+
+  it("accepts an exact attempt-3 chain and becomes ready after all eight keys succeed", async () => {
+    await withDisposableDatabase(
+      "candidate_preflight_attempt_three",
+      async (isolatedDatabaseUrl) => {
+        const { continuation, fixture } =
+          await prepareTerminalGatewayPreflight(isolatedDatabaseUrl);
+        const attemptTwo = await admitCandidateSourceSnapshotPreflightRequest(
+          isolatedDatabaseUrl,
+          {
+            attemptSequence: 2,
+            continuationAuthorizationId: continuation.authorizationId,
+            domain: "open_data",
+            operationKind: "public_resolve",
+            planId: fixture.plan.planId,
+            planSha256: fixture.plan.planSha256,
+            redirectSequence: 0,
+            resolver: "filebase_gateway",
+          },
+        );
+        await recordCandidateSourceSnapshotPreflightRequestOutcome(
+          isolatedDatabaseUrl,
+          {
+            admission: attemptTwo,
+            completedAt: "2026-08-31T01:05:00.000Z",
+            outcome: "terminal_failure",
+            receiptSha256: "5".repeat(64),
+          },
+        );
+        const secondContinuation =
+          await proposeCandidateSourceSnapshotPreflightContinuation(
+            isolatedDatabaseUrl,
+            {
+              amendedImplementationCommitSha: "3".repeat(40),
+              authorizedAt: "2026-08-31T01:06:00.000Z",
+              authorizerReference: "synthetic-continuation-controller",
+              failedRequestId: attemptTwo.requestId,
+              planId: fixture.plan.planId,
+              planSha256: fixture.plan.planSha256,
+            },
+          );
+        const recordedSecond =
+          await recordCandidateSourceSnapshotPreflightContinuation(
+            isolatedDatabaseUrl,
+            secondContinuation,
+          );
+        const attemptThree = await admitCandidateSourceSnapshotPreflightRequest(
+          isolatedDatabaseUrl,
+          {
+            attemptSequence: 3,
+            continuationAuthorizationId: recordedSecond.authorizationId,
+            domain: "open_data",
+            operationKind: "public_resolve",
+            planId: fixture.plan.planId,
+            planSha256: fixture.plan.planSha256,
+            redirectSequence: 0,
+            resolver: "filebase_gateway",
+          },
+        );
+        await recordCandidateSourceSnapshotPreflightRequestOutcome(
+          isolatedDatabaseUrl,
+          {
+            admission: attemptThree,
+            completedAt: "2026-08-31T01:07:00.000Z",
+            outcome: "succeeded",
+            receiptSha256: "6".repeat(64),
+          },
+        );
+
+        for (const [operationKind, resolver] of [
+          ["bucket_head", null],
+          ["names_read", "filebase_control"],
+          ["public_resolve", "filebase_gateway"],
+          ["public_resolve", "delegated_ipfs"],
+        ] as const) {
+          const admission = await admitCandidateSourceSnapshotPreflightRequest(
+            isolatedDatabaseUrl,
+            {
+              attemptSequence: 1,
+              domain: "query_table",
+              operationKind,
+              planId: fixture.plan.planId,
+              planSha256: fixture.plan.planSha256,
+              redirectSequence: 0,
+              resolver,
+            },
+          );
+          await recordCandidateSourceSnapshotPreflightRequestOutcome(
+            isolatedDatabaseUrl,
+            {
+              admission,
+              completedAt: "2026-08-31T01:08:00.000Z",
+              outcome: "succeeded",
+              receiptSha256: "7".repeat(64),
+            },
+          );
+        }
+
+        const sql = postgres(isolatedDatabaseUrl, { max: 1 });
+        try {
+          const result = await sql<{ ready: boolean }[]>`
+            SELECT oracle_candidate_source_snapshot_preflight_is_execution_ready(
+              ${fixture.plan.planId}
+            ) AS ready
+          `;
+          expect(result).toEqual([{ ready: true }]);
         } finally {
           await sql.end({ timeout: 5 });
         }

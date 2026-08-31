@@ -1433,6 +1433,7 @@ class ProductionCandidateSourceSnapshotRemoteRuntime implements CandidateSourceS
           attempt.outcome === binding.failedReceipt.outcome &&
           attempt.receiptSha256 === binding.failedReceipt.receiptSha256,
       );
+      const latestGatewayAttempt = gatewayProgress?.attempts.at(-1);
       if (
         binding.plan.planId !== this.#plan.planId ||
         binding.plan.planSha256 !== this.#plan.planSha256 ||
@@ -1446,7 +1447,10 @@ class ProductionCandidateSourceSnapshotRemoteRuntime implements CandidateSourceS
           this.#plan.targets.openData.priorCid ||
         binding.authorizedObservation.expectedTargetCid !==
           this.#plan.targets.openData.targetCid ||
-        !failed
+        !failed ||
+        latestGatewayAttempt?.requestId !== failed.requestId ||
+        latestGatewayAttempt.attemptSequence !== failed.attemptSequence ||
+        latestGatewayAttempt.outcome !== "terminal_failure"
       ) {
         throw new Error(
           "Preflight continuation does not bind the exact failed receipt",
@@ -1555,9 +1559,13 @@ class ProductionCandidateSourceSnapshotRemoteRuntime implements CandidateSourceS
         let maximumAttempt = this.#config.limits.maxRetries + 1;
         if (isAuthorizedContinuation) {
           const binding = continuation!.authorizationBinding;
+          const latestAttempt = progress?.attempts.at(-1);
           if (
-            terminal?.length !== 1 ||
-            progress?.attempts.length !== 1 ||
+            !latestAttempt ||
+            latestAttempt.requestId !== binding.failedReceipt.requestId ||
+            latestAttempt.attemptSequence !==
+              binding.failedReceipt.attemptSequence ||
+            latestAttempt.outcome !== "terminal_failure" ||
             firstAttempt !==
               binding.authorizedObservation.authorizedAttemptSequence
           ) {

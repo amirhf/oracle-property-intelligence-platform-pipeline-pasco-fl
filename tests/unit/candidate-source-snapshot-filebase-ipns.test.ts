@@ -424,6 +424,38 @@ describe("candidate source-snapshot Filebase IPNS adapter", () => {
     ).resolves.toMatchObject({ outcome: "redirect_rejected", requestCount: 1 });
   });
 
+  it.each(["ipfs", "ipns"] as const)(
+    "accepts the closed trailing-slash %s gateway canonicalization",
+    async (kind) => {
+      const { plan } = syntheticCandidateSourceSnapshotDemo();
+      const evidence: CandidateSourceSnapshotFilebaseIpnsEvidence[] = [];
+      const location =
+        kind === "ipfs"
+          ? `/ipfs/${plan.targets.openData.priorCid}/`
+          : `/ipns/${plan.targets.openData.ipnsNetworkKey}/`;
+      const transport = adapter({
+        evidence,
+        fetchImpl: async () =>
+          new Response(null, {
+            headers: {
+              location,
+              "x-ipfs-roots": plan.targets.openData.priorCid,
+            },
+            status: 301,
+          }),
+        plan,
+      });
+
+      await expect(
+        transport.observeOfficialGateway("open_data"),
+      ).resolves.toMatchObject({
+        observedCid: plan.targets.openData.priorCid,
+        outcome: "observed",
+        requestCount: 1,
+      });
+    },
+  );
+
   it.each([
     ["target", "target"],
     ["prior", "prior"],

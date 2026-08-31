@@ -157,4 +157,20 @@ describe("candidate source-snapshot preflight continuation authorization", () =>
       }),
     ).toThrow(/continuation attempt must immediately follow/);
   });
+
+  it("accepts an exact attempt-3 continuation bound to failed attempt 2", () => {
+    expect(
+      candidateSourceSnapshotPreflightContinuationBindingSchema.parse({
+        ...binding,
+        authorizedObservation: {
+          ...binding.authorizedObservation,
+          authorizedAttemptSequence: 3,
+        },
+        failedReceipt: {
+          ...binding.failedReceipt,
+          attemptSequence: 2,
+        },
+      }),
+    ).toBeDefined();
+  });
 });

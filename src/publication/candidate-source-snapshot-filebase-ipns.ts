@@ -458,7 +458,10 @@ function gatewayCids(response: Response, responseUrl: URL): readonly string[] {
   return [...cids].sort();
 }
 
-function validateGatewayRedirect(location: string | null): URL | null {
+function validateGatewayRedirect(
+  location: string | null,
+  target: Target,
+): URL | null {
   if (!location) return null;
   let redirect: URL;
   try {
@@ -469,6 +472,13 @@ function validateGatewayRedirect(location: string | null): URL | null {
   } catch {
     return null;
   }
+  const immutableCidPath =
+    /^\/ipfs\/(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,120})\/?$/.test(
+      redirect.pathname,
+    );
+  const exactIpnsPath =
+    redirect.pathname === `/ipns/${target.ipnsNetworkKey}` ||
+    redirect.pathname === `/ipns/${target.ipnsNetworkKey}/`;
   if (
     redirect.origin !== CANDIDATE_SOURCE_SNAPSHOT_FILEBASE_GATEWAY_ORIGIN ||
     redirect.protocol !== "https:" ||
@@ -476,9 +486,7 @@ function validateGatewayRedirect(location: string | null): URL | null {
     redirect.password !== "" ||
     redirect.search !== "" ||
     redirect.hash !== "" ||
-    !/^\/ipfs\/(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,120})$/.test(
-      redirect.pathname,
-    )
+    (!immutableCidPath && !exactIpnsPath)
   ) {
     return null;
   }
@@ -894,6 +902,7 @@ export class CandidateSourceSnapshotFilebaseIpnsAdapter implements CandidateSour
     if (response.status >= 300 && response.status < 400) {
       const redirect = validateGatewayRedirect(
         response.headers.get("location"),
+        target,
       );
       const cids = gatewayCids(response, current);
       await response.body?.cancel().catch(() => undefined);
