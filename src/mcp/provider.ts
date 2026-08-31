@@ -24,9 +24,9 @@ export interface QueryPropertyRow {
   propertyDocumentSha256: string;
   propertyId: string;
   publishedAt: string | null;
-  roofAgeBasis: string;
-  roofAgeBasisQuality: string;
-  roofAgeYears: number;
+  roofAgeBasis: string | null;
+  roofAgeBasisQuality: string | null;
+  roofAgeYears: number | null;
   siteCity: string;
 }
 
@@ -36,7 +36,8 @@ export interface DatasetMetadata {
   canonicalDocumentCount: number;
   completedAt: string;
   coordinateCount: number;
-  coverageMode: "authoritative_complete" | "partial" | "sample";
+  coverageMode:
+    "authoritative_complete" | "partial" | "sample" | "source_snapshot";
   contractorCoverage: "available" | "partial" | "unavailable";
   datasetVersion: string;
   fixtureMatches: number;
@@ -661,12 +662,12 @@ async function readQueryRows(parquetPath: string): Promise<QueryPropertyRow[]> {
         ),
         propertyId: publicPropertyId(canonicalId),
         publishedAt: asNullableString(row.published_at, "published timestamp"),
-        roofAgeBasis: stringValue(row.roof_age_basis, "roof age basis"),
-        roofAgeBasisQuality: stringValue(
+        roofAgeBasis: asNullableString(row.roof_age_basis, "roof age basis"),
+        roofAgeBasisQuality: asNullableString(
           row.roof_age_basis_quality,
           "roof age quality",
         ),
-        roofAgeYears: numberValue(row.roof_age_years, "roof age years"),
+        roofAgeYears: asNullableNumber(row.roof_age_years, "roof age years"),
         siteCity: stringValue(row.site_city, "site city"),
       };
     });

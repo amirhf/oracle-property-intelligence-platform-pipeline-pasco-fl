@@ -6,12 +6,35 @@ import { compressors } from "hyparquet-compressors";
 import type { PublicIpnsProviderConfig } from "./config.js";
 import { MCP_CONTRACT_VERSION, MCP_SCHEMA_SHA256 } from "./constants.js";
 import type { McpContractRegistry } from "./contracts.js";
+import {
+  BoundedPublicCidAsyncBuffer,
+  HttpPublicCidRangeTransport,
+  PublicCidRangeError,
+  type PublicCidRangeTransport,
+  type PublicCidStreamingVerificationBudget,
+  verifyParquetMagicByRange,
+  verifyParquetSha256ByRange,
+} from "./public-cid-range.js";
 import type {
   DatasetMetadata,
   JsonObject,
   OracleMcpProvider,
   QueryPropertyRow,
 } from "./provider.js";
+import { canonicalJsonSha256 } from "../lib/canonical-json.js";
+import {
+  type CandidateSourceSnapshotDemoPlan,
+  validateCandidateSourceSnapshotDemoPlan,
+} from "../publication/candidate-source-snapshot-demo.js";
+import {
+  type CompactPublicationManifestIndex,
+  type ControlCollectionIndex,
+  type ControlCollectionReference,
+  type ControlShardDescriptor,
+  readBoundCompactPublicationManifestIndex,
+  readBoundControlCollectionIndex,
+  readControlEntryByKey,
+} from "../publication/control-artifacts.js";
 import { CIDV0_PATTERN, verifyIpfsCid } from "../publication/ipfs-cid.js";
 import {
   observeDelegatedIpnsRecord,
@@ -128,6 +151,24 @@ function publicError(
   retryable = false,
 ): PublicReadError {
   return new PublicReadError(code, message, retryable);
+}
+
+function rangePublicError(error: PublicCidRangeError): PublicReadError {
+  const code: PublicReadErrorCode =
+    error.code === "artifact_too_large"
+      ? "artifact_too_large"
+      : error.code === "hash_mismatch" || error.code === "cid_mismatch"
+        ? "hash_mismatch"
+        : error.code === "configuration_invalid"
+          ? "configuration_invalid"
+          : error.code === "redirect_rejected"
+            ? "redirect_rejected"
+            : error.code === "timeout"
+              ? "timeout"
+              : error.code === "transport_unavailable"
+                ? "transport_unavailable"
+                : "artifact_invalid";
+  return publicError(code, error.message, error.retryable);
 }
 
 function combinedSignal(
@@ -743,7 +784,9 @@ function validateConfig(config: PublicIpnsProviderConfig): void {
   }
   const candidateBindingsValid =
     config.resolverPolicy === "candidate_filebase_delegated_v2" &&
-    /^demo_[a-f0-9]{32}$/.test(config.candidateDemoPlanId ?? "") &&
+    /^(?:demo|snapshotdemo)_[a-f0-9]{32}$/.test(
+      config.candidateDemoPlanId ?? "",
+    ) &&
     SHA256_PATTERN.test(config.candidateDemoPlanSha256 ?? "") &&
     SHA256_PATTERN.test(config.candidateDemoSourcePlanSha256 ?? "");
   const canonicalBindingsValid =
@@ -816,14 +859,65 @@ async function resolveExpected(
   }
 }
 
-interface GraphEntry {
+export interface PublicSourceSnapshotGraphEntry {
   byteSize: number;
   canonicalPropertyId: string;
   cid: string;
+  objectKey?: string;
   parcelIdentifier: string;
+  position?: number;
   publicPropertyId: string;
   sha256: string;
 }
+
+type GraphEntry = PublicSourceSnapshotGraphEntry;
+
+export interface PublicSourceSnapshotQueryTableResult {
+  entries: readonly PublicSourceSnapshotGraphEntry[];
+  queryRows: readonly QueryPropertyRow[];
+}
+
+export interface PublicIpnsProviderCreateOptions {
+  rangeTransport?: PublicCidRangeTransport;
+  /** Narrow test seam; production always uses the range-backed implementation. */
+  sourceSnapshotQueryTableReader?: (
+    options: PublicSourceSnapshotQueryTableReadOptions,
+  ) => Promise<PublicSourceSnapshotQueryTableResult>;
+}
+
+export interface PublicSourceSnapshotQueryTableReadOptions {
+  compactManifest: CompactPublicationManifestIndex;
+  config: PublicIpnsProviderConfig;
+  plan: CandidateSourceSnapshotDemoPlan;
+  rangeTransport: PublicCidRangeTransport;
+  signal?: AbortSignal;
+}
+
+interface CandidateInventoryObject {
+  byteSize: number;
+  domain: "open_data" | "query_table";
+  expectedCid: string;
+  logicalObjectKey: string;
+  remoteObjectKey: string;
+  sha256: string;
+}
+
+interface CandidateSourceSnapshotReadContext {
+  compactManifest: CompactPublicationManifestIndex;
+  graphEdgesIndex: ControlCollectionIndex;
+  manifestEntriesIndex: ControlCollectionIndex;
+  objectInventoryIndex: ControlCollectionIndex;
+  plan: CandidateSourceSnapshotDemoPlan;
+}
+
+interface CandidateSourceSnapshotQueryState {
+  entriesByPublicId: ReadonlyMap<string, GraphEntry>;
+  queryRows: readonly QueryPropertyRow[];
+}
+
+type CandidateSourceSnapshotQueryLoader = (
+  signal?: AbortSignal,
+) => Promise<CandidateSourceSnapshotQueryState>;
 
 function publicPropertyId(canonicalPropertyId: string): string {
   const match = canonicalPropertyId.match(/^property_([a-f0-9]{32})$/);
@@ -1037,6 +1131,264 @@ async function readPublicQueryRowsUnchecked(
   );
 }
 
+function validateRequiredParquetSchema(metadata: {
+  schema: ReadonlyArray<{
+    converted_type?: string;
+    name?: string;
+    type?: string;
+  }>;
+}): void {
+  const actual = new Map(
+    metadata.schema
+      .slice(1)
+      .map((entry) => [
+        entry.name,
+        `${entry.type ?? ""}:${entry.converted_type ?? ""}`,
+      ]),
+  );
+  for (const [column, expected] of Object.entries(REQUIRED_PARQUET_SCHEMA)) {
+    if (actual.get(column) !== expected) {
+      throw publicError(
+        "schema_mismatch",
+        `Published Parquet column ${column} is missing or incompatible`,
+      );
+    }
+  }
+}
+
+function sourceSnapshotRangeBudgets(options: {
+  byteLength: number;
+  config: PublicIpnsProviderConfig;
+  plan: CandidateSourceSnapshotDemoPlan;
+}): {
+  decode: PublicCidStreamingVerificationBudget;
+  verify: PublicCidStreamingVerificationBudget;
+} {
+  const maximumObjectBytes = Math.min(
+    options.config.limits.maxParquetBytes,
+    options.plan.limits.maxObjectBytes,
+  );
+  const maximumRangeBytes = 8 * 1024 * 1024;
+  const verifyRanges = Math.ceil(options.byteLength / maximumRangeBytes);
+  const maximumAggregateRanges = Math.min(
+    options.plan.limits.maxRequests,
+    Math.max(verifyRanges + 1, 8_192),
+  );
+  const decodeRanges = maximumAggregateRanges - verifyRanges;
+  const decodeBytes = Math.min(
+    options.plan.limits.maxTotalBytes - options.byteLength,
+    options.byteLength * 4,
+    maximumRangeBytes * decodeRanges,
+  );
+  if (
+    options.byteLength > maximumObjectBytes ||
+    verifyRanges <= 0 ||
+    decodeRanges <= 0 ||
+    decodeBytes < maximumRangeBytes
+  ) {
+    throw publicError(
+      "artifact_too_large",
+      "Published Parquet exceeds its immutable hosted-read envelope",
+    );
+  }
+  const shared = {
+    maximumBufferedBytes: 32 * 1024 * 1024,
+    maximumConcurrency: 4,
+    maximumObjectBytes,
+    maximumRangeBytes,
+  } as const;
+  return {
+    decode: {
+      ...shared,
+      maximumRanges: decodeRanges,
+      maximumTotalRangeBytes: decodeBytes,
+    },
+    verify: {
+      ...shared,
+      maximumRanges: verifyRanges,
+      maximumTotalRangeBytes: options.byteLength,
+    },
+  };
+}
+
+function nullableIso(value: unknown, label: string): string | null {
+  return value === null ? null : iso(value, label);
+}
+
+export async function readPublicSourceSnapshotQueryTable(
+  options: PublicSourceSnapshotQueryTableReadOptions,
+): Promise<PublicSourceSnapshotQueryTableResult> {
+  try {
+    const query = options.compactManifest.queryTable;
+    const budgets = sourceSnapshotRangeBudgets({
+      byteLength: query.byteSize,
+      config: options.config,
+      plan: options.plan,
+    });
+    await verifyParquetSha256ByRange({
+      budget: budgets.verify,
+      cid: query.expectedCid,
+      expectedByteLength: query.byteSize,
+      expectedSha256: query.sha256,
+      ...(options.signal ? { signal: options.signal } : {}),
+      transport: options.rangeTransport,
+    });
+    const file = await BoundedPublicCidAsyncBuffer.create({
+      budget: budgets.decode,
+      cid: query.expectedCid,
+      expectedByteLength: query.byteSize,
+      ...(options.signal ? { signal: options.signal } : {}),
+      transport: options.rangeTransport,
+    });
+    await verifyParquetMagicByRange(file);
+    const metadata = await parquetMetadataAsync(file);
+    validateRequiredParquetSchema(metadata);
+    if (metadata.num_rows !== BigInt(query.propertyCount)) {
+      throw publicError(
+        "schema_mismatch",
+        "Published source-snapshot Parquet cardinality is inconsistent",
+      );
+    }
+    const values = await parquetReadObjects({
+      columns: [
+        "property_id",
+        "property_cid",
+        "request_identifier",
+        "latitude",
+        "longitude",
+        "roof_age_years",
+        "roof_age_basis",
+        "roof_age_basis_quality",
+        "open_roofing_permit_count",
+        "maximum_open_roofing_permit_days",
+        "property_document_sha256",
+        "site_city",
+        "observed_at",
+        "published_at",
+        "coverage_mode",
+        "coverage_scope_id",
+        "source_run_id",
+        "source_snapshot_id",
+        "selection_hash",
+        "permit_source_availability",
+        "contractor_source_availability",
+      ],
+      compressors,
+      file,
+    });
+    const entries: PublicSourceSnapshotGraphEntry[] = [];
+    const queryRows: QueryPropertyRow[] = [];
+    let previousOrderKey: string | null = null;
+    let coordinates = 0;
+    let roofSignals = 0;
+    const canonicalIds = new Set<string>();
+    const publicIds = new Set<string>();
+    for (const [position, value] of values.entries()) {
+      const row = record(value, "source-snapshot Parquet row");
+      const canonicalPropertyId = stringValue(
+        row.property_id,
+        "Parquet property ID",
+      );
+      const parcelIdentifier = stringValue(
+        row.request_identifier,
+        "Parquet request identifier",
+      );
+      const cid = stringValue(row.property_cid, "Parquet property CID");
+      const propertySha256 = stringValue(
+        row.property_document_sha256,
+        "Parquet property hash",
+      );
+      const publicId = publicPropertyId(canonicalPropertyId);
+      const orderKey = `${parcelIdentifier}\u0000${canonicalPropertyId}`;
+      const roofAgeYears = nullableNumber(row.roof_age_years, "roof age years");
+      const roofAgeBasis = nullableString(row.roof_age_basis, "roof age basis");
+      const roofAgeBasisQuality = nullableString(
+        row.roof_age_basis_quality,
+        "roof age quality",
+      );
+      const latitude = nullableNumber(row.latitude, "latitude");
+      const longitude = nullableNumber(row.longitude, "longitude");
+      if (
+        !CIDV0_PATTERN.test(cid) ||
+        !SHA256_PATTERN.test(propertySha256) ||
+        FIXTURE_PROPERTY_IDS.has(canonicalPropertyId) ||
+        canonicalIds.has(canonicalPropertyId) ||
+        publicIds.has(publicId) ||
+        (previousOrderKey !== null && previousOrderKey >= orderKey) ||
+        row.coverage_mode !== "source_snapshot" ||
+        row.coverage_scope_id !== options.compactManifest.source.scopeId ||
+        row.source_run_id !== options.compactManifest.source.runId ||
+        row.source_snapshot_id !== options.compactManifest.source.snapshotId ||
+        row.selection_hash !== options.compactManifest.source.selectionSha256 ||
+        row.permit_source_availability !== "unavailable" ||
+        row.contractor_source_availability !== "unavailable" ||
+        row.open_roofing_permit_count !== null ||
+        row.maximum_open_roofing_permit_days !== null ||
+        (latitude === null) !== (longitude === null) ||
+        (roofAgeYears === null) !== (roofAgeBasis === null) ||
+        (roofAgeYears === null) !== (roofAgeBasisQuality === null) ||
+        (roofAgeYears !== null &&
+          (roofAgeBasis !== "year_built_proxy" ||
+            roofAgeBasisQuality !== "proxy"))
+      ) {
+        throw publicError(
+          "artifact_invalid",
+          "Published source-snapshot Parquet row is not bound to its sealed source",
+        );
+      }
+      canonicalIds.add(canonicalPropertyId);
+      publicIds.add(publicId);
+      previousOrderKey = orderKey;
+      if (latitude !== null) coordinates += 1;
+      if (roofAgeYears !== null) roofSignals += 1;
+      entries.push({
+        byteSize: 0,
+        canonicalPropertyId,
+        cid,
+        parcelIdentifier,
+        position,
+        publicPropertyId: publicId,
+        sha256: propertySha256,
+      });
+      queryRows.push({
+        canonicalPropertyId,
+        latitude,
+        longitude,
+        maximumOpenRoofingPermitDays: null,
+        observedAt: iso(row.observed_at, "observed timestamp"),
+        openRoofingPermitCount: null,
+        propertyDocumentSha256: propertySha256,
+        propertyId: publicId,
+        publishedAt: nullableIso(row.published_at, "published timestamp"),
+        roofAgeBasis,
+        roofAgeBasisQuality,
+        roofAgeYears,
+        siteCity: nullableString(row.site_city, "site city") ?? "",
+      });
+    }
+    if (
+      entries.length !== query.propertyCount ||
+      coordinates !==
+        options.compactManifest.coverage.coordinates.availableProperties ||
+      roofSignals !==
+        options.compactManifest.coverage.buildings.yearBuiltProxyProperties
+    ) {
+      throw publicError(
+        "artifact_invalid",
+        "Published source-snapshot query coverage is inconsistent",
+      );
+    }
+    return { entries, queryRows };
+  } catch (error) {
+    if (error instanceof PublicReadError) throw error;
+    if (error instanceof PublicCidRangeError) throw rangePublicError(error);
+    throw publicError(
+      "artifact_invalid",
+      "Published source-snapshot Parquet could not be decoded",
+    );
+  }
+}
+
 function collectEvidenceReferences(
   value: unknown,
   references: Set<string>,
@@ -1057,14 +1409,991 @@ function collectEvidenceReferences(
   }
 }
 
+function sameCanonicalValue(left: unknown, right: unknown): boolean {
+  return canonicalJsonSha256(left) === canonicalJsonSha256(right);
+}
+
+function validateControlNamespace(options: {
+  collection: ControlCollectionReference["collection"];
+  index: ControlCollectionIndex;
+  plan: CandidateSourceSnapshotDemoPlan;
+  reference: ControlCollectionReference;
+}): void {
+  const prefix = options.plan.targets.controlPrefix;
+  const expectedIndex = `${prefix}${options.collection}/index.json`;
+  if (options.reference.indexArtifact.objectKey !== expectedIndex) {
+    throw publicError(
+      "artifact_invalid",
+      "Publication control index is outside its immutable namespace",
+    );
+  }
+  for (const descriptor of options.index.shards) {
+    const expected = `${prefix}${options.collection}/part-${String(
+      descriptor.shardIndex,
+    ).padStart(6, "0")}.ndjson`;
+    if (descriptor.objectKey !== expected) {
+      throw publicError(
+        "artifact_invalid",
+        "Publication control shard is outside its immutable namespace",
+      );
+    }
+  }
+}
+
+async function readCandidateControlIndex(options: {
+  config: PublicIpnsProviderConfig;
+  plan: CandidateSourceSnapshotDemoPlan;
+  reference: ControlCollectionReference;
+  signal?: AbortSignal;
+  transport: PublicReadTransport;
+}): Promise<ControlCollectionIndex> {
+  const binding = options.reference.indexArtifact;
+  if (binding.byteSize > options.config.limits.maxJsonObjectBytes) {
+    throw publicError(
+      "artifact_too_large",
+      "Publication control index exceeds its hosted bound",
+    );
+  }
+  const bytes = await options.transport.readCid(
+    binding.expectedCid,
+    binding.byteSize,
+    options.signal,
+  );
+  try {
+    const index = await readBoundControlCollectionIndex({
+      bytes,
+      reference: options.reference,
+    });
+    validateControlNamespace({
+      collection: options.reference.collection,
+      index,
+      plan: options.plan,
+      reference: options.reference,
+    });
+    return index;
+  } catch (error) {
+    if (error instanceof PublicReadError) throw error;
+    throw publicError(
+      "artifact_invalid",
+      "Publication control index failed its immutable binding",
+    );
+  }
+}
+
+function sourceSnapshotLimitations(
+  plan: CandidateSourceSnapshotDemoPlan,
+  manifest: CompactPublicationManifestIndex,
+): string[] {
+  return [
+    plan.disclaimer,
+    "Coverage is complete only for membership represented by the exact hash-bound source snapshot and is exposed as source_snapshot, not authoritative_complete.",
+    `${manifest.coverage.coordinates.missingProperties} source-snapshot properties have unavailable coordinates and are excluded from radius search.`,
+    "Permit and contractor sources are unavailable; null is not zero.",
+    "Owner-assumed snapshot authority is not independent Pasco certification and does not reconcile the separately published parcel statistic.",
+  ];
+}
+
+async function initializeCandidateSourceSnapshot(options: {
+  config: PublicIpnsProviderConfig;
+  onStage?: (stage: PublicProviderInitializationStage) => void;
+  planValue: JsonObject;
+  rangeTransport?: PublicCidRangeTransport;
+  signal?: AbortSignal;
+  sourceSnapshotQueryTableReader?: (
+    options: PublicSourceSnapshotQueryTableReadOptions,
+  ) => Promise<PublicSourceSnapshotQueryTableResult>;
+  transport: PublicReadTransport;
+}): Promise<{
+  metadata: DatasetMetadata;
+  sourceSnapshotQueryLoader: CandidateSourceSnapshotQueryLoader;
+  sourceSnapshotContext: CandidateSourceSnapshotReadContext;
+}> {
+  let plan: CandidateSourceSnapshotDemoPlan;
+  try {
+    plan = validateCandidateSourceSnapshotDemoPlan(options.planValue);
+  } catch {
+    throw publicError(
+      "contract_mismatch",
+      "Published source-snapshot plan failed strict validation",
+    );
+  }
+  const manifestBinding = plan.controlArtifacts.manifestIndex;
+  if (
+    plan.planId !== options.config.candidateDemoPlanId ||
+    plan.planSha256 !== options.config.candidateDemoPlanSha256 ||
+    plan.source.sourcePlanSha256 !==
+      options.config.candidateDemoSourcePlanSha256 ||
+    plan.targets.openData.ipnsNetworkKey !== options.config.openDataIpns ||
+    plan.targets.queryTable.ipnsNetworkKey !== options.config.queryTableIpns ||
+    plan.targets.openData.targetCid !==
+      options.config.expectedOpenDataRootCid ||
+    plan.targets.queryTable.targetCid !==
+      options.config.expectedQueryTableRootCid ||
+    manifestBinding.expectedCid !== options.config.expectedManifestCid ||
+    manifestBinding.sha256 !== options.config.expectedManifestSha256 ||
+    manifestBinding.objectKey !== `${plan.targets.controlPrefix}manifest.json`
+  ) {
+    throw publicError(
+      "configuration_invalid",
+      "Configured source-snapshot identity does not match its immutable plan",
+    );
+  }
+
+  options.onStage?.("manifest");
+  if (manifestBinding.byteSize > options.config.limits.maxJsonObjectBytes) {
+    throw publicError(
+      "artifact_too_large",
+      "Compact publication manifest exceeds its hosted bound",
+    );
+  }
+  const compactManifestBytes = await options.transport.readCid(
+    manifestBinding.expectedCid,
+    manifestBinding.byteSize,
+    options.signal,
+  );
+  let compactManifest: CompactPublicationManifestIndex;
+  try {
+    compactManifest = await readBoundCompactPublicationManifestIndex({
+      binding: manifestBinding,
+      bytes: compactManifestBytes,
+    });
+  } catch {
+    throw publicError(
+      "artifact_invalid",
+      "Compact publication manifest failed its immutable binding",
+    );
+  }
+  if (
+    compactManifest.contracts.mcp.version !== MCP_CONTRACT_VERSION ||
+    compactManifest.contracts.mcp.sha256 !== MCP_SCHEMA_SHA256 ||
+    compactManifest.contracts.canonical.sha256 !== CANONICAL_SCHEMA_SHA256 ||
+    compactManifest.classification.publicationClass !==
+      plan.classification.publicationClass ||
+    compactManifest.graph.openDataRootCid !==
+      options.config.expectedOpenDataRootCid ||
+    compactManifest.queryTable.expectedCid !==
+      options.config.expectedQueryTableRootCid ||
+    compactManifest.coverage.propertyCount !== plan.coverage.activeProperties ||
+    compactManifest.coverage.coordinates.availableProperties !==
+      plan.coverage.coordinateProperties ||
+    compactManifest.coverage.coordinates.missingProperties !==
+      plan.coverage.missingCoordinateProperties ||
+    compactManifest.coverage.buildings.facts !== plan.coverage.buildingFacts ||
+    compactManifest.coverage.buildings.properties !==
+      plan.coverage.buildingProperties ||
+    compactManifest.coverage.buildings.yearBuiltProxyProperties !==
+      plan.coverage.yearBuiltProxyProperties ||
+    compactManifest.coverage.ownership.sourceRows !==
+      plan.coverage.ownershipSourceRows ||
+    compactManifest.coverage.ownership.acceptedRows !==
+      plan.coverage.ownershipAcceptedRows ||
+    compactManifest.coverage.ownership.malformedRows !==
+      plan.coverage.ownershipMalformedRows ||
+    compactManifest.coverage.ownership.properties !==
+      plan.coverage.ownershipProperties ||
+    compactManifest.coverage.siteAddresses.sourceRows !==
+      plan.coverage.siteAddressRows ||
+    compactManifest.coverage.siteAddresses.usableProperties !==
+      plan.coverage.siteAddressProperties ||
+    compactManifest.source.authorityId !== plan.source.authorityId ||
+    compactManifest.source.materializationId !==
+      plan.source.materializationId ||
+    compactManifest.source.materializationSha256 !==
+      plan.source.materializationSha256 ||
+    compactManifest.source.runId !== plan.source.workflowRunId ||
+    compactManifest.source.scopeId !== plan.source.scopeId ||
+    compactManifest.source.snapshotId !== plan.source.snapshotId ||
+    compactManifest.source.selectionSha256 !== plan.source.folioSetSha256 ||
+    !sameCanonicalValue(
+      compactManifest.manifestEntries,
+      plan.controlArtifacts.manifestEntries,
+    )
+  ) {
+    throw publicError(
+      "contract_mismatch",
+      "Compact publication manifest does not match its source-snapshot plan",
+    );
+  }
+
+  options.onStage?.("graph");
+  const [manifestEntriesIndex, graphEdgesIndex, objectInventoryIndex] =
+    await Promise.all([
+      readCandidateControlIndex({
+        config: options.config,
+        plan,
+        reference: plan.controlArtifacts.manifestEntries,
+        ...(options.signal ? { signal: options.signal } : {}),
+        transport: options.transport,
+      }),
+      readCandidateControlIndex({
+        config: options.config,
+        plan,
+        reference: plan.controlArtifacts.graphEdges,
+        ...(options.signal ? { signal: options.signal } : {}),
+        transport: options.transport,
+      }),
+      readCandidateControlIndex({
+        config: options.config,
+        plan,
+        reference: plan.controlArtifacts.objectInventory,
+        ...(options.signal ? { signal: options.signal } : {}),
+        transport: options.transport,
+      }),
+    ]);
+  if (
+    manifestEntriesIndex.entryCount !== plan.coverage.activeProperties ||
+    graphEdgesIndex.entryCount < plan.coverage.activeProperties ||
+    objectInventoryIndex.entryCount !== plan.controlArtifacts.payloadObjectCount
+  ) {
+    throw publicError(
+      "artifact_invalid",
+      "Publication control cardinalities are inconsistent",
+    );
+  }
+
+  const rangeTransport =
+    options.rangeTransport ??
+    new HttpPublicCidRangeTransport(
+      options.config.resolverPolicy,
+      options.config.limits,
+    );
+  const reader =
+    options.sourceSnapshotQueryTableReader ??
+    readPublicSourceSnapshotQueryTable;
+  const sourceSnapshotQueryLoader: CandidateSourceSnapshotQueryLoader = async (
+    signal,
+  ) => {
+    options.onStage?.("parquet");
+    const query = await reader({
+      compactManifest,
+      config: options.config,
+      plan,
+      rangeTransport,
+      ...(signal ? { signal } : {}),
+    });
+    const entriesByPublicId = new Map<string, GraphEntry>();
+    const positions = new Set<number>();
+    for (const entry of query.entries) {
+      if (
+        entry.position === undefined ||
+        !Number.isSafeInteger(entry.position) ||
+        entry.position < 0 ||
+        entry.position >= plan.coverage.activeProperties ||
+        positions.has(entry.position) ||
+        entriesByPublicId.has(entry.publicPropertyId)
+      ) {
+        throw publicError(
+          "artifact_invalid",
+          "Source-snapshot query bindings are invalid",
+        );
+      }
+      positions.add(entry.position);
+      entriesByPublicId.set(entry.publicPropertyId, { ...entry });
+    }
+    if (
+      entriesByPublicId.size !== plan.coverage.activeProperties ||
+      query.queryRows.length !== plan.coverage.activeProperties ||
+      query.queryRows.some((row) => {
+        const entry = entriesByPublicId.get(row.propertyId);
+        return (
+          entry === undefined ||
+          entry.canonicalPropertyId !== row.canonicalPropertyId ||
+          entry.sha256 !== row.propertyDocumentSha256
+        );
+      })
+    ) {
+      throw publicError(
+        "artifact_invalid",
+        "Source-snapshot query cardinality is inconsistent",
+      );
+    }
+    return { entriesByPublicId, queryRows: query.queryRows };
+  };
+  const sourceCounts = {
+    building: {
+      accepted: plan.coverage.buildingFacts,
+      parsed: plan.coverage.buildingFacts,
+      rejected: 0,
+      source: plan.coverage.buildingFacts,
+    },
+    owners: {
+      accepted: plan.coverage.ownershipAcceptedRows,
+      parsed: plan.coverage.ownershipSourceRows,
+      rejected: plan.coverage.ownershipMalformedRows,
+      source: plan.coverage.ownershipSourceRows,
+    },
+    parcel: {
+      accepted: plan.coverage.activeProperties,
+      parsed: plan.coverage.activeProperties,
+      rejected: 0,
+      source: plan.coverage.activeProperties,
+    },
+    siteAddresses: {
+      accepted: plan.coverage.siteAddressRows,
+      parsed: plan.coverage.siteAddressRows,
+      rejected: 0,
+      source: plan.coverage.siteAddressRows,
+    },
+  };
+  const runSummary = {
+    county: "pasco",
+    resultCounts: {
+      acceptedProperties: plan.coverage.activeProperties,
+      changedProperties: 0,
+      coordinates: plan.coverage.coordinateProperties,
+      duplicateProperties: plan.coverage.duplicatePropertyIdentities,
+      elapsedMs: 0,
+      newProperties: 0,
+      roofSignals: plan.coverage.yearBuiltProxyProperties,
+      selectionSize: plan.coverage.activeProperties,
+      sourceCounts,
+      unchangedProperties: 0,
+    },
+    runId: plan.source.workflowRunId,
+    workflowId: plan.source.workflowRunId,
+  };
+  return {
+    metadata: {
+      artifactCids: [
+        options.config.expectedOpenDataRootCid,
+        options.config.expectedQueryTableRootCid,
+        options.config.expectedManifestCid,
+        options.config.expectedPlanCid,
+      ],
+      asOf: compactManifest.freshness.asOf,
+      canonicalDocumentCount: plan.coverage.activeProperties,
+      completedAt: compactManifest.freshness.loadedAt,
+      coordinateCount: plan.coverage.coordinateProperties,
+      coverageMode: "source_snapshot",
+      contractorCoverage: "unavailable",
+      datasetVersion: `pasco-source-snapshot-${plan.planSha256.slice(0, 16)}`,
+      fixtureMatches: plan.coverage.fixtureMatches,
+      limitations: sourceSnapshotLimitations(plan, compactManifest),
+      manifestSha256: manifestBinding.sha256,
+      objectCount: plan.inventory.objectCount,
+      parquetSha256: compactManifest.queryTable.sha256,
+      permitCoverage: "unavailable",
+      plan: {
+        sourceWatermark: {
+          appraiserObservedDate: compactManifest.freshness.observedAt.slice(
+            0,
+            10,
+          ),
+          asOf: compactManifest.freshness.asOf,
+          coverageMode: "source_snapshot",
+          loadedAt: compactManifest.freshness.loadedAt,
+          runId: plan.source.workflowRunId,
+          scopeId: plan.source.scopeId,
+          snapshotId: plan.source.snapshotId,
+          workflowId: plan.source.workflowRunId,
+        },
+      },
+      providerMode: "public-ipns",
+      publication: {
+        candidateDemoPlanId: plan.planId,
+        candidateDemoPlanSha256: plan.planSha256,
+        manifestCid: manifestBinding.expectedCid,
+        openDataIpns: options.config.openDataIpns,
+        openDataRootCid: options.config.expectedOpenDataRootCid,
+        planCid: options.config.expectedPlanCid,
+        planSha256: plan.planSha256,
+        queryTableIpns: options.config.queryTableIpns,
+        queryTableRootCid: options.config.expectedQueryTableRootCid,
+        resolverPolicy: options.config.resolverPolicy,
+        scopeId: plan.source.scopeId,
+        selectionHash: plan.source.folioSetSha256,
+        sourceSnapshotId: plan.source.snapshotId,
+      },
+      runId: plan.source.workflowRunId,
+      runSummary,
+      startedAt: compactManifest.freshness.loadedAt,
+      workflowId: plan.source.workflowRunId,
+    },
+    sourceSnapshotQueryLoader,
+    sourceSnapshotContext: {
+      compactManifest,
+      graphEdgesIndex,
+      manifestEntriesIndex,
+      objectInventoryIndex,
+      plan,
+    },
+  };
+}
+
+async function readCandidateControlEntry(options: {
+  index: ControlCollectionIndex;
+  key: string;
+  signal?: AbortSignal;
+  transport: PublicReadTransport;
+}): Promise<unknown> {
+  try {
+    const value = await readControlEntryByKey({
+      index: options.index,
+      key: options.key,
+      readShard: (descriptor: ControlShardDescriptor) =>
+        options.transport.readCid(
+          descriptor.expectedCid,
+          descriptor.byteSize,
+          options.signal,
+        ),
+    });
+    if (value === null) {
+      throw publicError(
+        "artifact_invalid",
+        "Publication control entry is missing",
+      );
+    }
+    return value;
+  } catch (error) {
+    if (error instanceof PublicReadError) throw error;
+    throw publicError(
+      "artifact_invalid",
+      "Publication control entry failed its immutable binding",
+    );
+  }
+}
+
+function candidateInventoryObject(
+  value: unknown,
+  key: string,
+  plan: CandidateSourceSnapshotDemoPlan,
+): CandidateInventoryObject {
+  const item = record(value, "candidate object inventory entry");
+  const domain = stringValue(item.domain, "inventory domain");
+  const logicalObjectKey = stringValue(
+    item.logicalObjectKey,
+    "inventory logical object key",
+  );
+  const remoteObjectKey = stringValue(
+    item.remoteObjectKey,
+    "inventory remote object key",
+  );
+  if (
+    (domain !== "open_data" && domain !== "query_table") ||
+    key !== `${domain}:${logicalObjectKey}` ||
+    (domain === "open_data"
+      ? remoteObjectKey !==
+        `${plan.targets.openData.immutablePrefix}${logicalObjectKey}`
+      : remoteObjectKey !==
+        `${plan.targets.queryTable.immutablePrefix}${logicalObjectKey.replace(
+          /^query-tables\/pasco\//,
+          "",
+        )}`)
+  ) {
+    throw publicError(
+      "artifact_invalid",
+      "Publication object inventory namespace is invalid",
+    );
+  }
+  const parsed = {
+    byteSize: numberValue(item.byteSize, "inventory byte size"),
+    domain,
+    expectedCid: stringValue(item.expectedCid, "inventory CID"),
+    logicalObjectKey,
+    remoteObjectKey,
+    sha256: stringValue(item.sha256, "inventory hash"),
+  } as CandidateInventoryObject;
+  if (
+    !Number.isSafeInteger(parsed.byteSize) ||
+    parsed.byteSize <= 0 ||
+    !CIDV0_PATTERN.test(parsed.expectedCid) ||
+    !SHA256_PATTERN.test(parsed.sha256)
+  ) {
+    throw publicError(
+      "artifact_invalid",
+      "Publication object inventory entry is invalid",
+    );
+  }
+  return parsed;
+}
+
+async function candidateInventoryEntry(options: {
+  context: CandidateSourceSnapshotReadContext;
+  key: string;
+  signal?: AbortSignal;
+  transport: PublicReadTransport;
+}): Promise<CandidateInventoryObject> {
+  return candidateInventoryObject(
+    await readCandidateControlEntry({
+      index: options.context.objectInventoryIndex,
+      key: options.key,
+      ...(options.signal ? { signal: options.signal } : {}),
+      transport: options.transport,
+    }),
+    options.key,
+    options.context.plan,
+  );
+}
+
+async function readCandidateObject(options: {
+  binding: CandidateInventoryObject;
+  maximumBytes: number;
+  signal?: AbortSignal;
+  transport: PublicReadTransport;
+}): Promise<Uint8Array> {
+  if (options.binding.byteSize > options.maximumBytes) {
+    throw publicError(
+      "artifact_too_large",
+      "Published artifact exceeds its hosted JSON bound",
+    );
+  }
+  const bytes = await options.transport.readCid(
+    options.binding.expectedCid,
+    options.binding.byteSize,
+    options.signal,
+  );
+  if (bytes.byteLength !== options.binding.byteSize) {
+    throw publicError(
+      "artifact_invalid",
+      "Published artifact byte size is inconsistent",
+    );
+  }
+  await verifyBytes(bytes, {
+    cid: options.binding.expectedCid,
+    sha256: options.binding.sha256,
+  });
+  return bytes;
+}
+
+function candidateManifestEntry(
+  value: unknown,
+  expected: GraphEntry,
+  plan: CandidateSourceSnapshotDemoPlan,
+): GraphEntry {
+  const item = record(value, "candidate manifest entry");
+  const objectKey = stringValue(item.objectKey, "manifest object key");
+  const parsed: GraphEntry = {
+    byteSize: numberValue(item.bytes, "manifest property bytes"),
+    canonicalPropertyId: stringValue(item.propertyId, "manifest property ID"),
+    cid: stringValue(item.cid, "manifest property CID"),
+    objectKey,
+    parcelIdentifier: stringValue(
+      item.parcelIdentifier,
+      "manifest parcel identifier",
+    ),
+    ...(expected.position === undefined ? {} : { position: expected.position }),
+    publicPropertyId: expected.publicPropertyId,
+    sha256: stringValue(item.sha256, "manifest property hash"),
+  };
+  if (
+    !objectKey.startsWith(
+      `${plan.targets.openData.immutablePrefix}properties/`,
+    ) ||
+    !objectKey.endsWith(`/${parsed.canonicalPropertyId}.json`) ||
+    objectKey.includes("..") ||
+    parsed.canonicalPropertyId !== expected.canonicalPropertyId ||
+    parsed.cid !== expected.cid ||
+    parsed.parcelIdentifier !== expected.parcelIdentifier ||
+    parsed.sha256 !== expected.sha256 ||
+    !Number.isSafeInteger(parsed.byteSize) ||
+    parsed.byteSize <= 0
+  ) {
+    throw publicError(
+      "artifact_invalid",
+      "Manifest entry does not match the query-table binding",
+    );
+  }
+  return parsed;
+}
+
+function candidateGraphEdge(value: unknown): {
+  childCid: string;
+  childKey: string;
+  jsonPointer: string;
+  parentKey: string;
+} {
+  const item = record(value, "candidate graph edge");
+  return {
+    childCid: stringValue(item.childCid, "graph child CID"),
+    childKey: stringValue(item.childKey, "graph child key"),
+    jsonPointer: stringValue(item.jsonPointer, "graph JSON pointer"),
+    parentKey: stringValue(item.parentKey, "graph parent key"),
+  };
+}
+
+function validateSourceSnapshotProvenance(
+  provenance: JsonObject,
+  plan: CandidateSourceSnapshotDemoPlan,
+): void {
+  const authority = record(provenance.authority, "provenance authority");
+  const classification = record(
+    provenance.publicationClassification,
+    "provenance publication classification",
+  );
+  const watermark = record(
+    provenance.sourceWatermark,
+    "provenance source watermark",
+  );
+  if (
+    authority.authorityClass !== plan.source.authorityClass ||
+    authority.authorityRecordId !== plan.source.authorityId ||
+    authority.exactCsvSha256 !== plan.source.csvSha256 ||
+    authority.exactZipSha256 !== plan.source.zipSha256 ||
+    authority.independentlyCertifiedByPasco !== false ||
+    classification.coverageMode !== "source_snapshot" ||
+    classification.publicationClass !== plan.classification.publicationClass ||
+    classification.resourceOwner !== "candidate" ||
+    classification.canonical !== false ||
+    classification.elephantOwned !== false ||
+    classification.ownerControlled !== false ||
+    classification.independentlyPascoCertified !== false ||
+    watermark.coverageMode !== "source_snapshot" ||
+    watermark.runId !== plan.source.workflowRunId ||
+    watermark.scopeId !== plan.source.scopeId ||
+    watermark.snapshotId !== plan.source.snapshotId
+  ) {
+    throw publicError(
+      "artifact_invalid",
+      "Published provenance does not match the source-snapshot plan",
+    );
+  }
+  if (!Array.isArray(provenance.sources) || provenance.sources.length === 0) {
+    throw publicError(
+      "artifact_invalid",
+      "Published provenance metadata is incomplete",
+    );
+  }
+  let csvSourceCount = 0;
+  let zipSourceCount = 0;
+  for (const value of provenance.sources) {
+    const source = record(value, "provenance source");
+    const sourceId = stringValue(source.sourceId, "provenance source ID");
+    const filename = stringValue(source.filename, "provenance filename");
+    const sourceIdentifier = stringValue(
+      source.sourceIdentifier,
+      "provenance source identifier",
+    );
+    const observedAt = nullableString(
+      source.observedAt,
+      "provenance observed timestamp",
+    );
+    const lastModified = nullableString(
+      source.lastModified,
+      "provenance last-modified timestamp",
+    );
+    const derivedFromSha256 = nullableString(
+      source.derivedFromSha256,
+      "provenance parent hash",
+    );
+    if (
+      !/^source_[a-f0-9]{32}$/.test(sourceId) ||
+      filename.length > 255 ||
+      filename.includes("/") ||
+      filename.includes("\\") ||
+      sourceIdentifier.length > 2_048 ||
+      !Number.isSafeInteger(source.byteSize) ||
+      Number(source.byteSize) < 0 ||
+      !SHA256_PATTERN.test(
+        stringValue(source.sha256, "provenance source hash"),
+      ) ||
+      (derivedFromSha256 !== null && !SHA256_PATTERN.test(derivedFromSha256)) ||
+      !["downloaded_source", "extracted_source"].includes(
+        stringValue(source.stage, "provenance source stage"),
+      ) ||
+      !["oracle_owner_authority", "pasco_appraiser", "pasco_gis"].includes(
+        stringValue(source.sourceSystem, "provenance source system"),
+      )
+    ) {
+      throw publicError(
+        "artifact_invalid",
+        "Published provenance source binding is invalid",
+      );
+    }
+    if (observedAt !== null) iso(observedAt, "provenance observed timestamp");
+    if (lastModified !== null)
+      iso(lastModified, "provenance last-modified timestamp");
+    if (source.sha256 === plan.source.csvSha256) csvSourceCount += 1;
+    if (source.sha256 === plan.source.zipSha256) zipSourceCount += 1;
+  }
+  if (csvSourceCount !== 1 || zipSourceCount !== 1) {
+    throw publicError(
+      "artifact_invalid",
+      "Published provenance omits or duplicates the exact source archive binding",
+    );
+  }
+}
+
+function isSourceSnapshotEvidenceUri(
+  value: string,
+  snapshotId: string,
+): boolean {
+  const prefix = `artifact://pasco/projection/${snapshotId}/`;
+  if (!value.startsWith(prefix)) return false;
+  return /^(?:factversion_[a-f0-9]{32}|propertyversion_[a-f0-9]{32}\/(?:parcel|site-address))$/.test(
+    value.slice(prefix.length),
+  );
+}
+
+async function readSourceSnapshotCanonicalProperty(options: {
+  context: CandidateSourceSnapshotReadContext;
+  entry: GraphEntry;
+  maximumJsonBytes: number;
+  signal?: AbortSignal;
+  transport: PublicReadTransport;
+}): Promise<{ property: JsonObject; provenanceArtifactUris: Set<string> }> {
+  const position = options.entry.position;
+  if (position === undefined) {
+    throw publicError("artifact_invalid", "Property position is unavailable");
+  }
+  const manifestKey = `entry:${String(position).padStart(9, "0")}:${options.entry.canonicalPropertyId}`;
+  const manifest = candidateManifestEntry(
+    await readCandidateControlEntry({
+      index: options.context.manifestEntriesIndex,
+      key: manifestKey,
+      ...(options.signal ? { signal: options.signal } : {}),
+      transport: options.transport,
+    }),
+    options.entry,
+    options.context.plan,
+  );
+  const rootBinding = await candidateInventoryEntry({
+    context: options.context,
+    key: "open_data:index.json",
+    ...(options.signal ? { signal: options.signal } : {}),
+    transport: options.transport,
+  });
+  if (
+    rootBinding.expectedCid !==
+    options.context.compactManifest.graph.openDataRootCid
+  ) {
+    throw publicError(
+      "artifact_invalid",
+      "Publication root does not match the compact manifest",
+    );
+  }
+  const root = parseJson(
+    await readCandidateObject({
+      binding: rootBinding,
+      maximumBytes: options.maximumJsonBytes,
+      ...(options.signal ? { signal: options.signal } : {}),
+      transport: options.transport,
+    }),
+    "source-snapshot root",
+  );
+  if (
+    root.schemaVersion !== "1" ||
+    root.county !== "pasco" ||
+    root.propertyCount !== options.context.plan.coverage.activeProperties ||
+    root.shardSize !== 10_000 ||
+    !Array.isArray(root.shards)
+  ) {
+    throw publicError("artifact_invalid", "Publication root is invalid");
+  }
+  let propertyTotal = 0;
+  let previousTo: string | null = null;
+  let selectedReference: JsonObject | null = null;
+  for (const [index, value] of root.shards.entries()) {
+    const reference = record(value, "root shard reference");
+    const from = stringValue(reference.fromParcel, "root range start");
+    const to = stringValue(reference.toParcel, "root range end");
+    const count = numberValue(reference.count, "root shard count");
+    if (
+      reference.shardIndex !== index ||
+      !Number.isSafeInteger(count) ||
+      count <= 0 ||
+      from > to ||
+      (previousTo !== null && previousTo >= from)
+    ) {
+      throw publicError(
+        "artifact_invalid",
+        "Publication root shard ranges are invalid",
+      );
+    }
+    previousTo = to;
+    propertyTotal += count;
+    if (
+      options.entry.parcelIdentifier >= from &&
+      options.entry.parcelIdentifier <= to
+    ) {
+      if (selectedReference !== null) {
+        throw publicError(
+          "artifact_invalid",
+          "Property resolves to overlapping publication shards",
+        );
+      }
+      selectedReference = reference;
+    }
+  }
+  if (
+    propertyTotal !== options.context.plan.coverage.activeProperties ||
+    selectedReference === null
+  ) {
+    throw publicError(
+      "artifact_invalid",
+      "Publication root traversal is incomplete",
+    );
+  }
+  const shardIndex = numberValue(
+    selectedReference.shardIndex,
+    "selected shard index",
+  );
+  const shardLogicalKey = `shards/shard-${String(shardIndex).padStart(4, "0")}.json`;
+  const shardBinding = await candidateInventoryEntry({
+    context: options.context,
+    key: `open_data:${shardLogicalKey}`,
+    ...(options.signal ? { signal: options.signal } : {}),
+    transport: options.transport,
+  });
+  if (shardBinding.expectedCid !== selectedReference.shardCid) {
+    throw publicError(
+      "artifact_invalid",
+      "Root shard CID does not match the inventory",
+    );
+  }
+  const shard = parseJson(
+    await readCandidateObject({
+      binding: shardBinding,
+      maximumBytes: options.maximumJsonBytes,
+      ...(options.signal ? { signal: options.signal } : {}),
+      transport: options.transport,
+    }),
+    "source-snapshot shard",
+  );
+  if (
+    shard.schemaVersion !== "1" ||
+    shard.shardIndex !== shardIndex ||
+    shard.count !== selectedReference.count ||
+    !Array.isArray(shard.entries) ||
+    shard.entries.length !== shard.count
+  ) {
+    throw publicError("artifact_invalid", "Publication shard is invalid");
+  }
+  const shardEntryIndex = shard.entries.findIndex(
+    (value) =>
+      record(value, "shard property entry").propertyId ===
+      manifest.canonicalPropertyId,
+  );
+  if (shardEntryIndex < 0) {
+    throw publicError(
+      "artifact_invalid",
+      "Publication shard does not contain the requested property",
+    );
+  }
+  const shardEntry = record(
+    shard.entries[shardEntryIndex],
+    "shard property entry",
+  );
+  if (
+    shardEntry.cid !== manifest.cid ||
+    shardEntry.fileSizeBytes !== manifest.byteSize ||
+    shardEntry.parcelIdentifier !== manifest.parcelIdentifier
+  ) {
+    throw publicError(
+      "artifact_invalid",
+      "Publication shard entry does not match its manifest entry",
+    );
+  }
+  const prefix = options.context.plan.targets.openData.immutablePrefix;
+  const propertyRemoteKey = manifest.objectKey;
+  if (
+    propertyRemoteKey === undefined ||
+    !propertyRemoteKey.startsWith(prefix)
+  ) {
+    throw publicError(
+      "artifact_invalid",
+      "Manifest property object key is unavailable",
+    );
+  }
+  const propertyLogicalKey = propertyRemoteKey.slice(prefix.length);
+  const propertyBinding = await candidateInventoryEntry({
+    context: options.context,
+    key: `open_data:${propertyLogicalKey}`,
+    ...(options.signal ? { signal: options.signal } : {}),
+    transport: options.transport,
+  });
+  if (
+    propertyBinding.expectedCid !== manifest.cid ||
+    propertyBinding.sha256 !== manifest.sha256 ||
+    propertyBinding.byteSize !== manifest.byteSize ||
+    propertyBinding.remoteObjectKey !== propertyRemoteKey
+  ) {
+    throw publicError(
+      "artifact_invalid",
+      "Manifest property does not match the immutable object inventory",
+    );
+  }
+  const [propertyEdgeValue, rootEdgeValue] = await Promise.all([
+    readCandidateControlEntry({
+      index: options.context.graphEdgesIndex,
+      key: `edge:${String(position).padStart(9, "0")}`,
+      ...(options.signal ? { signal: options.signal } : {}),
+      transport: options.transport,
+    }),
+    readCandidateControlEntry({
+      index: options.context.graphEdgesIndex,
+      key: `edge:${String(
+        options.context.plan.coverage.activeProperties + shardIndex,
+      ).padStart(9, "0")}`,
+      ...(options.signal ? { signal: options.signal } : {}),
+      transport: options.transport,
+    }),
+  ]);
+  const propertyEdge = candidateGraphEdge(propertyEdgeValue);
+  const rootEdge = candidateGraphEdge(rootEdgeValue);
+  if (
+    propertyEdge.childCid !== manifest.cid ||
+    propertyEdge.childKey !== propertyRemoteKey ||
+    propertyEdge.parentKey !== `${prefix}${shardLogicalKey}` ||
+    propertyEdge.jsonPointer !== `/entries/${shardEntryIndex}/cid` ||
+    rootEdge.childCid !== shardBinding.expectedCid ||
+    rootEdge.childKey !== `${prefix}${shardLogicalKey}` ||
+    rootEdge.parentKey !== `${prefix}index.json` ||
+    rootEdge.jsonPointer !== `/shards/${shardIndex}/shardCid`
+  ) {
+    throw publicError(
+      "artifact_invalid",
+      "Publication graph edges do not match root-to-property traversal",
+    );
+  }
+  const propertyBytes = await readCandidateObject({
+    binding: propertyBinding,
+    maximumBytes: options.maximumJsonBytes,
+    ...(options.signal ? { signal: options.signal } : {}),
+    transport: options.transport,
+  });
+  const property = parseJson(propertyBytes, "canonical property");
+
+  const provenanceBinding = await candidateInventoryEntry({
+    context: options.context,
+    key: "open_data:provenance.json",
+    ...(options.signal ? { signal: options.signal } : {}),
+    transport: options.transport,
+  });
+  const provenance = parseJson(
+    await readCandidateObject({
+      binding: provenanceBinding,
+      maximumBytes: options.maximumJsonBytes,
+      ...(options.signal ? { signal: options.signal } : {}),
+      transport: options.transport,
+    }),
+    "source-snapshot provenance",
+  );
+  if (!Array.isArray(provenance.sources) || provenance.sources.length === 0) {
+    throw publicError(
+      "artifact_invalid",
+      "Published provenance metadata is incomplete",
+    );
+  }
+  validateSourceSnapshotProvenance(provenance, options.context.plan);
+  return {
+    property,
+    provenanceArtifactUris: new Set(),
+  };
+}
+
 export class PublicIpnsProvider implements OracleMcpProvider {
   readonly #contracts: McpContractRegistry;
   readonly #entriesByPublicId: ReadonlyMap<string, GraphEntry>;
   readonly #metadata: DatasetMetadata;
   readonly #provenanceArtifactUris: ReadonlySet<string>;
   readonly #queryRows: readonly QueryPropertyRow[];
+  readonly #sourceSnapshotQueryLoader: CandidateSourceSnapshotQueryLoader | null;
+  readonly #sourceSnapshotContext: CandidateSourceSnapshotReadContext | null;
   readonly #transport: PublicReadTransport;
   readonly #maximumJsonBytes: number;
+  #sourceSnapshotQueryInFlight: Promise<CandidateSourceSnapshotQueryState> | null =
+    null;
+  #sourceSnapshotQueryState: CandidateSourceSnapshotQueryState | null = null;
 
   private constructor(options: {
     contracts: McpContractRegistry;
@@ -1073,6 +2402,8 @@ export class PublicIpnsProvider implements OracleMcpProvider {
     metadata: DatasetMetadata;
     provenanceArtifactUris: ReadonlySet<string>;
     queryRows: readonly QueryPropertyRow[];
+    sourceSnapshotQueryLoader?: CandidateSourceSnapshotQueryLoader;
+    sourceSnapshotContext?: CandidateSourceSnapshotReadContext;
     transport: PublicReadTransport;
   }) {
     this.#contracts = options.contracts;
@@ -1081,6 +2412,8 @@ export class PublicIpnsProvider implements OracleMcpProvider {
     this.#metadata = options.metadata;
     this.#provenanceArtifactUris = options.provenanceArtifactUris;
     this.#queryRows = options.queryRows;
+    this.#sourceSnapshotQueryLoader = options.sourceSnapshotQueryLoader ?? null;
+    this.#sourceSnapshotContext = options.sourceSnapshotContext ?? null;
     this.#transport = options.transport;
   }
 
@@ -1090,6 +2423,7 @@ export class PublicIpnsProvider implements OracleMcpProvider {
     transport?: PublicReadTransport,
     signal?: AbortSignal,
     onStage?: (stage: PublicProviderInitializationStage) => void,
+    createOptions: PublicIpnsProviderCreateOptions = {},
   ): Promise<PublicIpnsProvider> {
     validateConfig(config);
     const activeTransport =
@@ -1125,9 +2459,39 @@ export class PublicIpnsProvider implements OracleMcpProvider {
       cid: config.expectedPlanCid,
       sha256: config.expectedPlanSha256,
     });
+    const planValue = parseJson(planBytes, "plan");
+    if (planValue.version === "2.0.0") {
+      const initialized = await initializeCandidateSourceSnapshot({
+        config,
+        ...(onStage ? { onStage } : {}),
+        planValue,
+        ...(createOptions.rangeTransport
+          ? { rangeTransport: createOptions.rangeTransport }
+          : {}),
+        ...(signal ? { signal } : {}),
+        ...(createOptions.sourceSnapshotQueryTableReader
+          ? {
+              sourceSnapshotQueryTableReader:
+                createOptions.sourceSnapshotQueryTableReader,
+            }
+          : {}),
+        transport: activeTransport,
+      });
+      return new PublicIpnsProvider({
+        contracts,
+        entriesByPublicId: new Map(),
+        maximumJsonBytes: config.limits.maxJsonObjectBytes,
+        metadata: initialized.metadata,
+        provenanceArtifactUris: new Set(),
+        queryRows: [],
+        sourceSnapshotQueryLoader: initialized.sourceSnapshotQueryLoader,
+        sourceSnapshotContext: initialized.sourceSnapshotContext,
+        transport: activeTransport,
+      });
+    }
     let plan: PublicationPlan;
     try {
-      plan = validatePublicationPlan(parseJson(planBytes, "plan"));
+      plan = validatePublicationPlan(planValue);
     } catch (error) {
       if (error instanceof PublicReadError) throw error;
       throw publicError(
@@ -1478,6 +2842,32 @@ export class PublicIpnsProvider implements OracleMcpProvider {
     propertyId: string,
     signal?: AbortSignal,
   ): Promise<JsonObject | null> {
+    if (this.#sourceSnapshotContext !== null) {
+      const query = await this.#loadSourceSnapshotQuery(signal);
+      const entry = query.entriesByPublicId.get(propertyId);
+      if (!entry) return null;
+      const resolved = await readSourceSnapshotCanonicalProperty({
+        context: this.#sourceSnapshotContext,
+        entry,
+        maximumJsonBytes: this.#maximumJsonBytes,
+        ...(signal ? { signal } : {}),
+        transport: this.#transport,
+      });
+      if (
+        resolved.property.propertyId !== entry.canonicalPropertyId ||
+        this.#contracts.validateCanonical(resolved.property).length > 0
+      ) {
+        throw publicError(
+          "contract_mismatch",
+          "Published property failed canonical contract validation",
+        );
+      }
+      this.#verifyPropertyProvenance(
+        resolved.property,
+        resolved.provenanceArtifactUris,
+      );
+      return resolved.property;
+    }
     const entry = this.#entriesByPublicId.get(propertyId);
     if (!entry) return null;
     const bytes = await this.#transport.readCid(
@@ -1517,10 +2907,56 @@ export class PublicIpnsProvider implements OracleMcpProvider {
     signal?: AbortSignal,
   ): Promise<readonly QueryPropertyRow[]> {
     if (signal?.aborted) throw signal.reason;
+    if (this.#sourceSnapshotQueryLoader !== null) {
+      return (await this.#loadSourceSnapshotQuery(signal)).queryRows;
+    }
     return this.#queryRows;
   }
 
-  #verifyPropertyProvenance(property: JsonObject): void {
+  #loadSourceSnapshotQuery(
+    signal?: AbortSignal,
+  ): Promise<CandidateSourceSnapshotQueryState> {
+    if (signal?.aborted) {
+      return Promise.reject(signal.reason ?? new Error("Operation aborted"));
+    }
+    if (this.#sourceSnapshotQueryState !== null) {
+      return Promise.resolve(this.#sourceSnapshotQueryState);
+    }
+    if (this.#sourceSnapshotQueryInFlight !== null) {
+      return this.#sourceSnapshotQueryInFlight;
+    }
+    if (this.#sourceSnapshotQueryLoader === null) {
+      return Promise.reject(
+        publicError(
+          "configuration_invalid",
+          "Source-snapshot query loader is unavailable",
+        ),
+      );
+    }
+
+    const attempt = this.#sourceSnapshotQueryLoader(signal).then(
+      (result) => {
+        this.#sourceSnapshotQueryState = result;
+        if (this.#sourceSnapshotQueryInFlight === attempt) {
+          this.#sourceSnapshotQueryInFlight = null;
+        }
+        return result;
+      },
+      (error: unknown) => {
+        if (this.#sourceSnapshotQueryInFlight === attempt) {
+          this.#sourceSnapshotQueryInFlight = null;
+        }
+        throw error;
+      },
+    );
+    this.#sourceSnapshotQueryInFlight = attempt;
+    return attempt;
+  }
+
+  #verifyPropertyProvenance(
+    property: JsonObject,
+    provenanceArtifactUris = this.#provenanceArtifactUris,
+  ): void {
     const evidence = property.evidence;
     if (!Array.isArray(evidence) || evidence.length === 0) {
       throw publicError(
@@ -1540,8 +2976,17 @@ export class PublicIpnsProvider implements OracleMcpProvider {
         item.sourceRecordHash,
         "evidence record hash",
       );
+      const resolves =
+        this.#sourceSnapshotContext === null
+          ? provenanceArtifactUris.has(artifactUri)
+          : isSourceSnapshotEvidenceUri(
+              artifactUri,
+              this.#sourceSnapshotContext.plan.source.snapshotId,
+            );
       if (
-        !this.#provenanceArtifactUris.has(artifactUri) ||
+        (this.#sourceSnapshotContext !== null &&
+          !/^evidence_[a-f0-9]{32}$/.test(evidenceId)) ||
+        !resolves ||
         !/^sha256:[a-f0-9]{64}$/.test(sourceRecordHash)
       ) {
         throw publicError(

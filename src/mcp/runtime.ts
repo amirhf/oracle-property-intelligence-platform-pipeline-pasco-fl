@@ -595,6 +595,7 @@ function candidateReasons(
       row.roofAgeBasisQuality === "direct";
     const matches =
       basisMatches &&
+      row.roofAgeYears !== null &&
       compare(
         filters.roofAge.operator,
         row.roofAgeYears,
@@ -648,7 +649,8 @@ function sortCandidates(
     if (sort === "distance_asc") {
       difference = left.distanceMeters - right.distanceMeters;
     } else if (sort === "roof_age_desc") {
-      difference = right.row.roofAgeYears - left.row.roofAgeYears;
+      difference =
+        (right.row.roofAgeYears ?? -1) - (left.row.roofAgeYears ?? -1);
     } else {
       difference =
         (right.row.maximumOpenRoofingPermitDays ?? -1) -

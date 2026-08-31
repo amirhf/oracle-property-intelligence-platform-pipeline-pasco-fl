@@ -43,7 +43,11 @@
     "candidate-demo:plan": "node --import tsx scripts/build-candidate-demo-plan.ts",
     "candidate-demo:execute": "node --import tsx scripts/execute-candidate-demo.ts",
     "candidate-demo:recover": "node --import tsx scripts/execute-candidate-demo.ts --recover",
-    "candidate-demo:complete-delegated": "node --import tsx scripts/finalize-candidate-delegated-policy.ts"
+    "candidate-demo:complete-delegated": "node --import tsx scripts/finalize-candidate-delegated-policy.ts",
+    "candidate-source-snapshot:build": "node --import tsx scripts/build-candidate-source-snapshot-demo.ts",
+    "candidate-source-snapshot:determinism": "node --import tsx scripts/build-candidate-source-snapshot-demo.ts --no-record",
+    "candidate-source-snapshot-demo:preflight": "node --import tsx scripts/preflight-candidate-source-snapshot-demo.ts",
+    "candidate-source-snapshot-demo:execute": "node --import tsx scripts/execute-candidate-source-snapshot-demo.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1054.0",

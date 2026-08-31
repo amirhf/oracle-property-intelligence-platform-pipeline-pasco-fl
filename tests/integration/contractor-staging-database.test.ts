@@ -323,7 +323,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(24);
+  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(26);
   const sql = postgres(schemaDatabaseUrl, { max: 1 });
   try {
     await sql`

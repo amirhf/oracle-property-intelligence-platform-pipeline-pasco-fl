@@ -168,14 +168,24 @@ export async function explorerBootstrap(
     throw new Error("Explorer metadata is unavailable");
   }
   const hasCandidateDemo = metadata.publication.candidateDemoPlanId !== null;
+  const isSourceSnapshotPlan =
+    metadata.publication.candidateDemoPlanId?.startsWith("snapshotdemo_") ===
+    true;
   const candidateObjectCount =
-    metadata.objectCount + (metadata.publication.planCid === null ? 0 : 1);
+    metadata.objectCount +
+    (metadata.publication.planCid === null || isSourceSnapshotPlan ? 0 : 1);
   const limitations = hasCandidateDemo
     ? metadata.limitations
         .filter((limitation) => !HISTORICAL_NO_REMOTE_EFFECT.test(limitation))
         .concat(
-          "The active public demo uses candidate-owned Filebase objects and candidate-owned IPNS identities.",
-          "No Filebase or IPNS mutation occurred during the recent routing and explorer-display deployments; the earlier candidate publication effects are reported separately.",
+          isSourceSnapshotPlan
+            ? [
+                "This target-bound candidate plan is locally validated but unapproved; its public metadata records no Filebase upload or IPNS mutation.",
+              ]
+            : [
+                "The active public demo uses candidate-owned Filebase objects and candidate-owned IPNS identities.",
+                "No Filebase or IPNS mutation occurred during the recent routing and explorer-display deployments; the earlier candidate publication effects are reported separately.",
+              ],
         )
     : metadata.limitations;
   return {
@@ -192,10 +202,14 @@ export async function explorerBootstrap(
             planSha256: metadata.publication.candidateDemoPlanSha256,
             propertyCount: metadata.canonicalDocumentCount,
             providerCidVerification: {
-              description: `All ${candidateObjectCount} provider-returned CIDs matched deterministic local CIDs.`,
-              matchedObjectCount: candidateObjectCount,
-              mismatchCount: 0,
-              status: "all_matched",
+              description: isSourceSnapshotPlan
+                ? "Deterministic local CIDs are plan-bound. Provider-returned CID receipts do not yet exist for this unapproved plan."
+                : `All ${candidateObjectCount} provider-returned CIDs matched deterministic local CIDs.`,
+              matchedObjectCount: isSourceSnapshotPlan
+                ? null
+                : candidateObjectCount,
+              mismatchCount: isSourceSnapshotPlan ? null : 0,
+              status: isSourceSnapshotPlan ? "not_executed" : "all_matched",
             },
             publicationTimestamp: {
               availability: "unavailable",
@@ -206,18 +220,25 @@ export async function explorerBootstrap(
               filebase: {
                 objectCount: candidateObjectCount,
                 ownership: "candidate_owned",
-                status: "uploaded_and_cid_verified",
+                status: isSourceSnapshotPlan
+                  ? "planned_not_uploaded"
+                  : "uploaded_and_cid_verified",
               },
               ipns: {
                 identityCount: 2,
                 ownership: "candidate_owned",
-                status: "updated_and_publicly_resolved",
+                status: isSourceSnapshotPlan
+                  ? "planned_not_mutated"
+                  : "updated_and_publicly_resolved",
               },
             },
-            remoteStatus: "candidate_filebase_ipns_active",
+            remoteStatus: isSourceSnapshotPlan
+              ? "awaiting_configuration_unpublished"
+              : "candidate_filebase_ipns_active",
             resolverPolicy: metadata.publication.resolverPolicy,
-            disclosure:
-              "Temporary candidate-owned Filebase demonstration of protocol compatibility. The buckets and IPNS identities are candidate-controlled and are not represented as Elephant-owned, owner-approved, authoritative-complete, or the final canonical assessment publication.",
+            disclosure: isSourceSnapshotPlan
+              ? "Candidate-owned, noncanonical Filebase demonstration of the complete parcel membership represented by the exact hash-bound August 23, 2026 Pasco Property Appraiser source snapshot under owner-assumed snapshot authority. It is not represented as Elephant-owned, owner-controlled, independently Pasco-certified, or complete under other Pasco reporting definitions. GIS, coordinate, related-fact, permit, and contractor coverage is measured and reported separately."
+              : "Temporary candidate-owned Filebase demonstration of protocol compatibility. The buckets and IPNS identities are candidate-controlled and are not represented as Elephant-owned, owner-approved, authoritative-complete, or the final canonical assessment publication.",
           },
       coverageMode: metadata.coverageMode,
       coordinateCount: metadata.coordinateCount,
@@ -355,7 +376,9 @@ const plot = opportunities => {
 fetch('/explorer/api/bootstrap').then(response => response.json()).then(value => {
   document.getElementById('coverage').textContent = value.publication.coverageMode === 'authoritative_complete'
     ? 'Authoritative-complete coverage for the displayed sealed scope.'
-    : value.publication.coverageMode + ' coverage only. This is not complete Pasco County coverage.';
+    : value.publication.coverageMode === 'source_snapshot'
+      ? 'Complete membership of the exact hash-bound source snapshot only. This candidate-owned demonstration is not authoritative-complete Pasco County coverage.'
+      : value.publication.coverageMode + ' coverage only. This is not complete Pasco County coverage.';
   if (value.publication.candidateDemo) {
     const disclosure = document.getElementById('candidate-disclosure');
     disclosure.hidden = false;

@@ -78,6 +78,55 @@ The expected CIDs are deterministic local artifact identities. Remote execution 
 
 Publication plans use schema version `1.1.0`. The plan binds the exact sealed projection materialization (or isolated historical sample run), graph edges and roots, CID and Parquet profiles, complete object inventory and both remote target identities. Sample plans create no authoritative head and are never approvable for authoritative IPNS publication.
 
+## Candidate source-snapshot control representation
+
+The candidate-owned full-source-snapshot demonstration uses a separate,
+noncanonical version `2.0.0` plan. It does not relabel the source as
+`authoritative_complete`: public coverage is `source_snapshot`, meaning the
+complete membership represented by the exact bound source snapshot under the
+owner-assumed source classification. The unresolved difference between the
+published Pasco statistic and the source snapshot remains disclosed.
+
+Large property inventories are represented as deterministic control
+collections rather than one unbounded plan or manifest array. The compact plan
+binds a compact manifest and three collections: object inventory, graph edges,
+and manifest entries. Each collection has a JSON index containing strictly
+ordered, non-overlapping shard ranges and each shard's count, byte size,
+SHA-256, expected CID and immutable object key. Shards are newline-delimited
+canonical JSON and are limited to 8 MiB; compact indexes are limited to 16 MiB.
+The plan binds the collection roots and one full-inventory commitment. Missing,
+duplicated, reordered, overlapping, oversized or byte/hash/CID-mismatched
+control objects fail closed.
+
+Hosted cold initialization is intended to read only the compact plan, compact
+manifest and three bound collection indexes. A property lookup fetches only
+the applicable bound inventory/edge/manifest shard plus its root, graph shard
+and property objects. Complete local verification streams every control shard
+in order and recomputes the collection and full-inventory commitments. The
+query-table reader may still materialize the complete 325,213-row query
+projection on its first query-table hydration. That first-query memory,
+duration and range-request profile must be measured successfully under the
+selected Vercel Function limits before a hosted cutover; compact controls alone
+do not prove hosted readiness.
+
+The source-snapshot Parquet is bound by exact byte size, SHA-256, CID and schema
+hash. Its candidate-specific rows use the same truthful `source_snapshot`
+classification as the compact plan and coverage/provenance controls. Hosted
+access uses bounded HTTP byte ranges through a concurrency-limited
+`AsyncBuffer`; a streaming ordered range pass verifies the complete SHA-256 and
+both `PAR1` boundaries without retaining the complete file. Range size, count,
+concurrency, total transferred bytes, redirects, retries and aggregate buffered
+bytes are bounded by the plan/runtime profile. A server that ignores a required
+range, returns a mismatched range, or exceeds a bound is rejected.
+
+The compact representation changes the target-bound plan identity and requires
+one new exact approval before any upload or IPNS mutation. Building or
+validating it does not authorize a remote effect, alter the protected
+25-property candidate publication, or weaken owner/canonical publication gates.
+The candidate-only Vercel environment allowlist, firewall configuration and
+Session 2 stop gates are recorded in
+[candidate source-snapshot readiness](./candidate-source-snapshot-readiness.md).
+
 ## Approval and invalidation
 
 Amir is the execution approver only after:

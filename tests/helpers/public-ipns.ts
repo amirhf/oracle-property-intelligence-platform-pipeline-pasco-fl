@@ -67,12 +67,14 @@ function unavailable(evidenceId: string) {
   } as const;
 }
 
-function property(index: number, fixture = false) {
+function property(index: number, fixture = false, sourceSnapshot = false) {
   const suffix = fixture
     ? "e72ba795455c19d71ce4cb11f6177a5e"
     : String(index).padStart(32, "0");
   const propertyId = `property_${suffix}`;
-  const evidenceId = `evidence_synthetic_${index}`;
+  const evidenceId = sourceSnapshot
+    ? `evidence_${String(index).padStart(32, "0")}`
+    : `evidence_synthetic_${index}`;
   const coordinates =
     index === 2
       ? unavailable(evidenceId)
@@ -131,7 +133,9 @@ function property(index: number, fixture = false) {
         sourceName: "Synthetic appraiser source",
         sourceRecordKey: `SYNTH-${index}`,
         sourceUrl: "https://example.invalid/public-source",
-        sourceArtifactUri: "ipfs://synthetic-source-artifact",
+        sourceArtifactUri: sourceSnapshot
+          ? `artifact://pasco/projection/snapshot_${"7".repeat(32)}/propertyversion_${String(index).padStart(32, "0")}/parcel`
+          : "ipfs://synthetic-source-artifact",
         sourceRecordHash: `sha256:${String(index).repeat(64).slice(0, 64)}`,
         observedAt: TIMESTAMP,
         retrievedAt: TIMESTAMP,
@@ -316,11 +320,15 @@ export async function syntheticPublicSet(
     fixtureProperty?: boolean;
     mcpHash?: string;
     omitParquetColumn?: string;
+    sourceSnapshotBindings?: boolean;
     wrongPropertyCid?: boolean;
   } = {},
 ): Promise<SyntheticPublicSet> {
   const objects = new Map<string, Uint8Array>();
-  const properties = [property(1, options.fixtureProperty), property(2)];
+  const properties = [
+    property(1, options.fixtureProperty, options.sourceSnapshotBindings),
+    property(2, false, options.sourceSnapshotBindings),
+  ];
   const graph = await buildPublicationGraph({
     completedAt: TIMESTAMP,
     exportedAt: TIMESTAMP,
@@ -394,25 +402,79 @@ export async function syntheticPublicSet(
       sunbiz: { availability: "unavailable", reason: "source_not_collected" },
       warning: "Unavailable does not mean zero.",
     },
-    provenance: {
-      county: "pasco",
-      sources: [
-        {
-          artifactUri: "ipfs://synthetic-source-artifact",
-          files: [{ path: "synthetic/source.bin", sha256: "d".repeat(64) }],
-          sourceSystem: "pasco_appraiser",
+    provenance: options.sourceSnapshotBindings
+      ? {
+          authority: {
+            authorityClass: "owner_assumed_authoritative_snapshot",
+            authorityRecordId: `authority_${"1".repeat(32)}`,
+            exactCsvSha256: "d".repeat(64),
+            exactZipSha256: "e".repeat(64),
+            independentlyCertifiedByPasco: false,
+          },
+          county: "pasco",
+          publicationClassification: {
+            canonical: false,
+            coverageMode: "source_snapshot",
+            elephantOwned: false,
+            independentlyPascoCertified: false,
+            ownerControlled: false,
+            publicationClass: "candidate_owned_source_snapshot_demo",
+            resourceOwner: "candidate",
+          },
+          sources: [
+            {
+              byteSize: 1,
+              derivedFromSha256: null,
+              filename: "parcel.csv",
+              lastModified: null,
+              observedAt: null,
+              sha256: "d".repeat(64),
+              sourceId: `source_${"1".repeat(32)}`,
+              sourceIdentifier: "pasco_appraiser",
+              sourceSystem: "pasco_appraiser",
+              stage: "extracted_source",
+            },
+            {
+              byteSize: 1,
+              derivedFromSha256: null,
+              filename: "parcel.zip",
+              lastModified: null,
+              observedAt: null,
+              sha256: "e".repeat(64),
+              sourceId: `source_${"2".repeat(32)}`,
+              sourceIdentifier: "pasco_appraiser",
+              sourceSystem: "pasco_appraiser",
+              stage: "downloaded_source",
+            },
+          ],
+          sourceWatermark: {
+            coverageMode: "source_snapshot",
+            runId: RUN_ID,
+            scopeId: SCOPE_ID,
+            snapshotId: `snapshot_${"7".repeat(32)}`,
+            workflowId: WORKFLOW_ID,
+          },
+          version: "1.0.0",
+        }
+      : {
+          county: "pasco",
+          sources: [
+            {
+              artifactUri: "ipfs://synthetic-source-artifact",
+              files: [{ path: "synthetic/source.bin", sha256: "d".repeat(64) }],
+              sourceSystem: "pasco_appraiser",
+            },
+          ],
+          sourceWatermark: {
+            appraiserObservedDate: "2026-08-29",
+            coverageMode: "sample",
+            runId: RUN_ID,
+            scopeId: SCOPE_ID,
+            snapshotId: null,
+            workflowId: WORKFLOW_ID,
+          },
+          version: "1.0.0",
         },
-      ],
-      sourceWatermark: {
-        appraiserObservedDate: "2026-08-29",
-        coverageMode: "sample",
-        runId: RUN_ID,
-        scopeId: SCOPE_ID,
-        snapshotId: null,
-        workflowId: WORKFLOW_ID,
-      },
-      version: "1.0.0",
-    },
     runSummary: {
       county: "pasco",
       resultCounts: {

@@ -9,7 +9,11 @@ import { McpContractRegistry } from "../../src/mcp/contracts.js";
 import { MCP_TOOL_NAMES } from "../../src/mcp/constants.js";
 import { PublicIpnsProvider } from "../../src/mcp/public-ipns-provider.js";
 import { OracleMcpRuntime } from "../../src/mcp/runtime.js";
-import { explorerProperty, explorerSearch } from "../../src/mcp/explorer.js";
+import {
+  explorerBootstrap,
+  explorerProperty,
+  explorerSearch,
+} from "../../src/mcp/explorer.js";
 import {
   createOracleMcpHttpServer,
   listenOracleMcpServer,
@@ -355,5 +359,77 @@ describe("privacy-safe public Oracle explorer", () => {
     ];
     expect(calls).toHaveLength(6);
     expect(calls.filter((call) => call.isError === true)).toHaveLength(1);
+  });
+});
+
+describe("candidate source-snapshot explorer status", () => {
+  it("does not turn a locally prepared plan into a claimed remote effect", async () => {
+    const execute = async () => ({
+      isError: false,
+      result: { data: {} },
+    });
+    const runtime = {
+      execute,
+      provider: {
+        getMetadata: async () => ({
+          artifactCids: [],
+          asOf: "2026-08-23T11:07:02.000Z",
+          canonicalDocumentCount: 325_213,
+          completedAt: "2026-08-30T20:52:19.835Z",
+          coordinateCount: 24_995,
+          coverageMode: "source_snapshot",
+          contractorCoverage: "unavailable",
+          datasetVersion: "snapshotdemo_1",
+          fixtureMatches: 0,
+          limitations: [],
+          manifestSha256: "1".repeat(64),
+          objectCount: 325_312,
+          parquetSha256: "2".repeat(64),
+          plan: {},
+          providerMode: "public-ipns",
+          publication: {
+            candidateDemoPlanId: `snapshotdemo_${"1".repeat(32)}`,
+            candidateDemoPlanSha256: "3".repeat(64),
+            manifestCid: `Qm${"1".repeat(44)}`,
+            openDataIpns: `k51${"1".repeat(59)}`,
+            openDataRootCid: `Qm${"2".repeat(44)}`,
+            planCid: `Qm${"3".repeat(44)}`,
+            planSha256: "4".repeat(64),
+            queryTableIpns: `k51${"2".repeat(59)}`,
+            queryTableRootCid: `Qm${"4".repeat(44)}`,
+            resolverPolicy: "candidate_filebase_delegated_v2",
+            scopeId: "scope_1",
+            selectionHash: "5".repeat(64),
+            sourceSnapshotId: "snapshot_1",
+          },
+          permitCoverage: "unavailable",
+          runId: "run_1",
+          runSummary: {},
+          startedAt: "2026-08-30T20:52:19.835Z",
+          workflowId: "workflow_1",
+        }),
+      },
+    } as unknown as OracleMcpRuntime;
+
+    const value = await explorerBootstrap(runtime);
+    expect(value.publication).toMatchObject({
+      candidateDemo: {
+        providerCidVerification: {
+          matchedObjectCount: null,
+          mismatchCount: null,
+          status: "not_executed",
+        },
+        remoteResources: {
+          filebase: { status: "planned_not_uploaded" },
+          ipns: { status: "planned_not_mutated" },
+        },
+        remoteStatus: "awaiting_configuration_unpublished",
+      },
+      coverageMode: "source_snapshot",
+    });
+    const serialized = JSON.stringify(value);
+    expect(serialized).not.toContain("uploaded_and_cid_verified");
+    expect(serialized).not.toContain("updated_and_publicly_resolved");
+    expect(serialized).not.toContain("provider-returned CIDs matched");
   });
 });
