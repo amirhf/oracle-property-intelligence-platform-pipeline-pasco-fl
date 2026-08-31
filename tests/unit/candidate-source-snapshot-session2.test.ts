@@ -209,6 +209,208 @@ describe("candidate source-snapshot Session 2 entry point", () => {
     expect(environment.CANDIDATE_DEMO_REMOTE_EXECUTOR_ENABLED).toBe("false");
   });
 
+  it("durably approves before constructing or calling the remote runtime", async () => {
+    const bundle = syntheticBundle();
+    const fixture = syntheticCandidateSourceSnapshotDemo();
+    const approvedAt = "2026-08-31T12:00:00.000Z";
+    const approverReference = "operator_test-session-2";
+    const implementationCommitSha = "a".repeat(40);
+    const authorizationStatement =
+      renderCandidateSourceSnapshotAuthorizationStatement(
+        bundle.build.plan,
+        fixture.exactUpload,
+        implementationCommitSha,
+      );
+    const identity = createCandidateSourceSnapshotApprovalIdentity({
+      approvedAt,
+      approverReference,
+      exactUpload: fixture.exactUpload,
+      implementationCommitSha,
+      plan: bundle.build.plan,
+      statement: authorizationStatement,
+    });
+    const order: string[] = [];
+    const close = vi.fn(async () => undefined);
+    const approvePlan = vi.fn(async () => {
+      order.push("approval");
+      return {
+        approvalId: identity.approvalId,
+        approvalSha256: identity.approvalSha256,
+        state: {} as never,
+      };
+    });
+    const remoteRuntimeFactory = vi.fn(() => {
+      order.push("runtime_constructed");
+      return {
+        boundary: {} as never,
+        close,
+        journal: {} as never,
+        prepareIntents: vi.fn() as never,
+        readOnlyPreflight: async () => {
+          order.push("preflight");
+          throw new Error("synthetic preflight failure");
+        },
+        recordFinalVerification: vi.fn() as never,
+      };
+    });
+    const uploadTransportFactory = vi.fn();
+
+    await expect(
+      executeCandidateSourceSnapshotSession2({
+        authorization: {
+          approvedAt,
+          approverReference,
+          authorizationStatement,
+          confirmedAt: "2026-08-31T11:59:00.000Z",
+          confirmedPlanName: "Filebase Pro or better",
+          confirmerReference: "operator_test-capacity",
+          intendedAt: "2026-08-31T12:01:00.000Z",
+          implementationCommitSha,
+        },
+        databaseUrl: "postgresql://not-contacted.invalid/not-contacted",
+        dependencies: {
+          approvePlan: approvePlan as never,
+          confirmCapacity: vi.fn() as never,
+          loadCompletedReplay: vi.fn(async () => null),
+          prepareBundle: async () => bundle,
+          recordPlan: vi.fn() as never,
+          recordPlanDerivation: vi.fn() as never,
+          remoteRuntimeFactory: remoteRuntimeFactory as never,
+          uploadTransportFactory: uploadTransportFactory as never,
+        },
+        descriptor: {} as CandidateSourceSnapshotBuildDescriptor,
+        environment: enabledEnvironment(bundle, identity.approvalId),
+      }),
+    ).rejects.toThrow("synthetic preflight failure");
+
+    expect(order).toEqual(["approval", "runtime_constructed", "preflight"]);
+    expect(approvePlan).toHaveBeenCalledOnce();
+    expect(uploadTransportFactory).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("closes the upload transport and remote runtime once on stopped and failed execution", async () => {
+    for (const uploadOutcome of ["stopped", "failed"] as const) {
+      const bundle = syntheticBundle();
+      const fixture = syntheticCandidateSourceSnapshotDemo();
+      const approvedAt = "2026-08-31T12:00:00.000Z";
+      const approverReference = "operator_test-session-2";
+      const implementationCommitSha = "a".repeat(40);
+      const authorizationStatement =
+        renderCandidateSourceSnapshotAuthorizationStatement(
+          bundle.build.plan,
+          fixture.exactUpload,
+          implementationCommitSha,
+        );
+      const identity = createCandidateSourceSnapshotApprovalIdentity({
+        approvedAt,
+        approverReference,
+        exactUpload: fixture.exactUpload,
+        implementationCommitSha,
+        plan: bundle.build.plan,
+        statement: authorizationStatement,
+      });
+      const remoteClose = vi.fn(async () => undefined);
+      const transportClose = vi.fn(async () => undefined);
+      const uploadClosure = {
+        admittedRequestCostUsd: 0,
+        admittedRequestCount: fixture.exactUpload.exactObjectCount,
+        approvalId: identity.approvalId,
+        closureId: `snapshotdemouploadclosure_${"b".repeat(32)}`,
+        closureSha256: "c".repeat(64),
+        exactObjectCount: fixture.exactUpload.exactObjectCount,
+        exactTotalBytes: fixture.exactUpload.exactTotalBytes,
+        planId: bundle.build.plan.planId,
+        planSha256: bundle.build.plan.planSha256,
+        verifiedAt: "2026-08-31T12:02:00.000Z",
+      };
+      const summary = {
+        attemptedRequests: fixture.exactUpload.exactObjectCount,
+        recoveredByInspection: 0,
+        requestCostUsd: 0,
+        skippedVerified: 0,
+        totalObjects: fixture.exactUpload.exactObjectCount,
+        uploadedAndVerified: fixture.exactUpload.exactObjectCount,
+      };
+      const cutover = {
+        openData: "prior" as const,
+        planId: bundle.build.plan.planId,
+        planSha256: bundle.build.plan.planSha256,
+        queryTable: "not_attempted" as const,
+        reason: "open_data_prior_observed" as const,
+        rollback: "not_attempted" as const,
+        status: "stopped" as const,
+      };
+      const remote = {
+        boundary: {} as never,
+        close: remoteClose,
+        journal: {} as never,
+        prepareIntents: vi.fn(async () => []),
+        readOnlyPreflight: vi.fn(async () => undefined),
+        recordFinalVerification: vi.fn(async () => undefined),
+      };
+      const transport = {
+        close: transportClose,
+        inspectExistingOnce: vi.fn() as never,
+        uploadOnce: vi.fn() as never,
+      };
+      const executeUploads = vi.fn(async () => {
+        if (uploadOutcome === "failed") {
+          throw new Error("synthetic upload failure");
+        }
+        return summary;
+      });
+      const execution = executeCandidateSourceSnapshotSession2({
+        authorization: {
+          approvedAt,
+          approverReference,
+          authorizationStatement,
+          confirmedAt: "2026-08-31T11:59:00.000Z",
+          confirmedPlanName: "Filebase Pro or better",
+          confirmerReference: "operator_test-capacity",
+          intendedAt: "2026-08-31T12:01:00.000Z",
+          implementationCommitSha,
+        },
+        databaseUrl: "postgresql://not-contacted.invalid/not-contacted",
+        dependencies: {
+          approvePlan: vi.fn(async () => ({
+            approvalId: identity.approvalId,
+            approvalSha256: identity.approvalSha256,
+            state: {} as never,
+          })) as never,
+          beginExecution: vi.fn() as never,
+          confirmCapacity: vi.fn() as never,
+          executeIpnsController: vi.fn(async () => cutover) as never,
+          executeUploads: executeUploads as never,
+          loadCompletedReplay: vi.fn(async () => null),
+          loadPlan: vi.fn(async () => ({
+            exactUpload: fixture.exactUpload,
+            plan: bundle.build.plan,
+            state: { approvalCount: 1, state: "executing" },
+          })) as never,
+          prepareBundle: async () => bundle,
+          recordPlan: vi.fn() as never,
+          recordPlanDerivation: vi.fn() as never,
+          recordUploadClosure: vi.fn(async () => uploadClosure) as never,
+          remoteRuntimeFactory: vi.fn(() => remote) as never,
+          uploadTransportFactory: vi.fn(() => transport) as never,
+        },
+        descriptor: {} as CandidateSourceSnapshotBuildDescriptor,
+        environment: enabledEnvironment(bundle, identity.approvalId),
+      });
+
+      if (uploadOutcome === "failed") {
+        await expect(execution).rejects.toThrow("synthetic upload failure");
+      } else {
+        await expect(execution).resolves.toMatchObject({
+          status: "recovery_required",
+        });
+      }
+      expect(transportClose).toHaveBeenCalledOnce();
+      expect(remoteClose).toHaveBeenCalledOnce();
+    }
+  });
+
   it("returns an exact completed replay without constructing a remote adapter", async () => {
     const bundle = syntheticBundle();
     const fixture = syntheticCandidateSourceSnapshotDemo();

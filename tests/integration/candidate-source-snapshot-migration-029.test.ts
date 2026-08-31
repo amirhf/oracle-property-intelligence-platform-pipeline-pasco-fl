@@ -68,7 +68,7 @@ beforeAll(async () => {
   }
   const applied = await runMigrations(databaseUrl);
   expect(applied.at(-1)).toBe(
-    "030_candidate_source_snapshot_ipns_crash_recovery.sql",
+    "031_candidate_source_snapshot_approval_before_remote.sql",
   );
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });
@@ -300,14 +300,35 @@ describe("candidate source-snapshot migration 029", () => {
             'oracle_candidate_source_snapshot_authorization_binding_v2',
             'oracle_candidate_source_snapshot_derivation_is_approval_ready',
             'oracle_candidate_source_snapshot_preflight_is_approval_ready',
+            'oracle_candidate_source_snapshot_preflight_is_execution_ready',
             'oracle_guard_candidate_source_snapshot_approval_insert',
             'oracle_guard_candidate_source_snapshot_plan_derivation',
+            'oracle_guard_candidate_source_snapshot_request_category',
             'oracle_guard_candidate_source_snapshot_request_insert',
             'oracle_guard_candidate_source_snapshot_remote_read_receipt',
             'oracle_guard_candidate_source_snapshot_remote_verification_receipts'
           )
       `;
-      expect(guards).toHaveLength(8);
+      expect(guards).toHaveLength(10);
+      const guardByName = new Map(
+        guards.map((guard) => [guard.name, guard.definition]),
+      );
+      for (const name of [
+        "oracle_guard_candidate_source_snapshot_request_category",
+        "oracle_guard_candidate_source_snapshot_request_insert",
+      ]) {
+        const definition = guardByName.get(name)!;
+        expect(definition).toContain("plan_row.state = 'approved'");
+        expect(definition).toContain(
+          "NEW.request_category = 'bucket_names_preflight'",
+        );
+        expect(definition).toContain(
+          "plan_row.state IS DISTINCT FROM 'approved'",
+        );
+        expect(definition).not.toContain(
+          "plan_row.state IN ('awaiting_configuration', 'awaiting_approval')",
+        );
+      }
       const definitions = guards.map((guard) => guard.definition).join("\n");
       expect(definitions).toContain("candidate-source-snapshot-approval-v3");
       expect(definitions).toContain(

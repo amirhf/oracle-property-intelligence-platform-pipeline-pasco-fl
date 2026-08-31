@@ -225,6 +225,7 @@ export interface CandidateSourceSnapshotS3CommandExecutor {
 
 export class AwsCandidateSourceSnapshotS3CommandExecutor implements CandidateSourceSnapshotS3CommandExecutor {
   readonly #client: S3Client;
+  #closed = false;
 
   constructor(config: EnabledCandidateSourceSnapshotExecutionConfig) {
     if (!config.enabled || config.s3Endpoint !== "https://s3.filebase.com") {
@@ -288,6 +289,12 @@ export class AwsCandidateSourceSnapshotS3CommandExecutor implements CandidateSou
       throw new Error("S3 client performed an unjournaled internal retry");
     }
     return { output, responseHeaders };
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#client.destroy();
   }
 }
 
@@ -365,7 +372,9 @@ function inspectionReceipt(value: unknown): string {
 export class RealCandidateSourceSnapshotFilebaseTransport implements CandidateSourceSnapshotUploadTransport {
   readonly #config: EnabledCandidateSourceSnapshotExecutionConfig;
   readonly #executor: CandidateSourceSnapshotS3CommandExecutor;
+  readonly #ownedExecutor: AwsCandidateSourceSnapshotS3CommandExecutor | null;
   readonly #source: CandidateSourceSnapshotLocalObjectSource;
+  #closed = false;
 
   constructor(input: {
     config: EnabledCandidateSourceSnapshotExecutionConfig;
@@ -376,10 +385,17 @@ export class RealCandidateSourceSnapshotFilebaseTransport implements CandidateSo
       throw new Error("Candidate source-snapshot executor is disabled");
     }
     this.#config = input.config;
-    this.#executor =
-      input.executor ??
-      new AwsCandidateSourceSnapshotS3CommandExecutor(input.config);
+    this.#ownedExecutor = input.executor
+      ? null
+      : new AwsCandidateSourceSnapshotS3CommandExecutor(input.config);
+    this.#executor = input.executor ?? this.#ownedExecutor!;
     this.#source = input.source;
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#ownedExecutor?.close();
   }
 
   #bucket(

@@ -261,11 +261,20 @@ export type CandidateSourceSnapshotSession2RemoteRuntimeFactory = (input: {
 }) => CandidateSourceSnapshotSession2RemoteRuntime;
 
 export interface CandidateSourceSnapshotSession2Dependencies {
+  approvePlan: typeof approveCandidateSourceSnapshotDemoPlan;
+  beginExecution: typeof beginCandidateSourceSnapshotDemoExecution;
+  completePlan: typeof completeCandidateSourceSnapshotDemoPlan;
   confirmCapacity: typeof confirmCandidateSourceSnapshotDemoCapacity;
+  createIntents: typeof createCandidateSourceSnapshotDemoIpnsIntents;
+  executeIpnsController: typeof executeCandidateSourceSnapshotIpnsController;
+  executeUploads: typeof executeCandidateSourceSnapshotUploads;
   loadCompletedReplay: typeof loadCompletedCandidateSourceSnapshotDemoReplay;
+  loadPlan: typeof loadCandidateSourceSnapshotDemoPlan;
   prepareBundle: typeof prepareCandidateSourceSnapshotExecutionBundle;
+  recordIpnsRetryAuthorization: typeof recordCandidateSourceSnapshotIpnsRetryAuthorization;
   recordPlan: typeof recordCandidateSourceSnapshotDemoPlan;
   recordPlanDerivation: typeof recordCompatibleCandidateSourceSnapshotPlanDerivation;
+  recordUploadClosure: typeof recordCandidateSourceSnapshotUploadClosure;
   remoteRuntimeFactory?: CandidateSourceSnapshotSession2RemoteRuntimeFactory;
   uploadTransportFactory: (input: {
     bundle: CandidateSourceSnapshotExecutionBundle;
@@ -277,11 +286,21 @@ export interface CandidateSourceSnapshotSession2Dependencies {
 
 const defaultSession2Dependencies: CandidateSourceSnapshotSession2Dependencies =
   {
+    approvePlan: approveCandidateSourceSnapshotDemoPlan,
+    beginExecution: beginCandidateSourceSnapshotDemoExecution,
+    completePlan: completeCandidateSourceSnapshotDemoPlan,
     confirmCapacity: confirmCandidateSourceSnapshotDemoCapacity,
+    createIntents: createCandidateSourceSnapshotDemoIpnsIntents,
+    executeIpnsController: executeCandidateSourceSnapshotIpnsController,
+    executeUploads: executeCandidateSourceSnapshotUploads,
     loadCompletedReplay: loadCompletedCandidateSourceSnapshotDemoReplay,
+    loadPlan: loadCandidateSourceSnapshotDemoPlan,
     prepareBundle: prepareCandidateSourceSnapshotExecutionBundle,
+    recordIpnsRetryAuthorization:
+      recordCandidateSourceSnapshotIpnsRetryAuthorization,
     recordPlan: recordCandidateSourceSnapshotDemoPlan,
     recordPlanDerivation: recordCompatibleCandidateSourceSnapshotPlanDerivation,
+    recordUploadClosure: recordCandidateSourceSnapshotUploadClosure,
     remoteRuntimeFactory: candidateSourceSnapshotRemoteRuntimeFactory,
     uploadTransportFactory: ({ bundle, config, s3Executor }) =>
       new RealCandidateSourceSnapshotFilebaseTransport({
@@ -386,43 +405,40 @@ export async function executeCandidateSourceSnapshotSession2(input: {
       status: "completed",
     };
   }
+  // Persist and exactly replay the human approval while the composition is
+  // still local-only. No remote adapter may be constructed before this row is
+  // durable and byte-for-byte consistent with the supplied authorization.
+  const approval = await dependencies.approvePlan(input.databaseUrl, {
+    approvedAt: input.authorization.approvedAt,
+    approverReference: input.authorization.approverReference,
+    authorizationStatement: input.authorization.authorizationStatement,
+    implementationCommitSha: input.authorization.implementationCommitSha,
+    ...identity,
+  });
+  if (
+    approval.approvalId !== approvalIdentity.approvalId ||
+    approval.approvalSha256 !== approvalIdentity.approvalSha256
+  ) {
+    throw new Error("Durable approval replay differs from exact authorization");
+  }
   const remote = dependencies.remoteRuntimeFactory({
     config,
     databaseUrl: input.databaseUrl,
     plan: bundle.build.plan,
   });
+  let uploadTransport: CandidateSourceSnapshotUploadTransport | null = null;
   try {
-    // This bounded, read-only preflight precedes durable approval and every
-    // upload/mutation. Any failure leaves the plan unapproved.
+    // This bounded, read-only preflight follows durable approval but precedes
+    // execution admission and every upload/mutation. A failure leaves the
+    // exact approval available for replay with no write effect admitted.
     await remote.readOnlyPreflight();
-    const approval = await approveCandidateSourceSnapshotDemoPlan(
-      input.databaseUrl,
-      {
-        approvedAt: input.authorization.approvedAt,
-        approverReference: input.authorization.approverReference,
-        authorizationStatement: input.authorization.authorizationStatement,
-        implementationCommitSha: input.authorization.implementationCommitSha,
-        ...identity,
-      },
-    );
-    if (
-      approval.approvalId !== approvalIdentity.approvalId ||
-      approval.approvalSha256 !== approvalIdentity.approvalSha256
-    ) {
-      throw new Error(
-        "Durable approval replay differs from exact authorization",
-      );
-    }
-    await beginCandidateSourceSnapshotDemoExecution(input.databaseUrl, {
+    await dependencies.beginExecution(input.databaseUrl, {
       approvalId: approval.approvalId,
       executorEnabled: true,
       implementationCommitSha: input.authorization.implementationCommitSha,
       ...identity,
     });
-    const durable = await loadCandidateSourceSnapshotDemoPlan(
-      input.databaseUrl,
-      identity,
-    );
+    const durable = await dependencies.loadPlan(input.databaseUrl, identity);
     if (
       durable.plan.planId !== bundle.build.plan.planId ||
       durable.plan.planSha256 !== bundle.build.plan.planSha256 ||
@@ -446,13 +462,13 @@ export async function executeCandidateSourceSnapshotSession2(input: {
     const journal = new PostgresCandidateSourceSnapshotUploadJournal(
       input.databaseUrl,
     );
-    const transport = dependencies.uploadTransportFactory({
+    uploadTransport = dependencies.uploadTransportFactory({
       bundle,
       config,
       journal,
       ...(input.s3Executor ? { s3Executor: input.s3Executor } : {}),
     });
-    const summary = await executeCandidateSourceSnapshotUploads({
+    const summary = await dependencies.executeUploads({
       backoff: async (attemptSequence) => {
         await new Promise((resolve) =>
           setTimeout(resolve, Math.min(1_000, attemptSequence * 250)),
@@ -462,11 +478,11 @@ export async function executeCandidateSourceSnapshotSession2(input: {
       journal,
       objects: bundle.createObjects(),
       plan: durable.plan,
-      transport,
+      transport: uploadTransport,
       verifyLocalObject: async (object) =>
         await bundle.localSource.verify(object),
     });
-    const uploadClosure = await recordCandidateSourceSnapshotUploadClosure(
+    const uploadClosure = await dependencies.recordUploadClosure(
       input.databaseUrl,
       {
         approvalId: approval.approvalId,
@@ -479,7 +495,7 @@ export async function executeCandidateSourceSnapshotSession2(input: {
     // may perform its first mutation.
     const intents = await remote.prepareIntents({
       createInitialIntents: async () =>
-        await createCandidateSourceSnapshotDemoIpnsIntents(input.databaseUrl, {
+        await dependencies.createIntents(input.databaseUrl, {
           ...identity,
           intendedAt: input.authorization!.intendedAt,
         }),
@@ -492,14 +508,14 @@ export async function executeCandidateSourceSnapshotSession2(input: {
     });
     for (const authorization of input.authorization.replayAuthorizations ??
       []) {
-      await recordCandidateSourceSnapshotIpnsRetryAuthorization(
+      await dependencies.recordIpnsRetryAuthorization(
         input.databaseUrl,
         durable.plan,
         { authorization, direction: "update" },
       );
     }
     if (input.authorization.rollbackAuthorization) {
-      await recordCandidateSourceSnapshotIpnsRetryAuthorization(
+      await dependencies.recordIpnsRetryAuthorization(
         input.databaseUrl,
         durable.plan,
         {
@@ -508,7 +524,7 @@ export async function executeCandidateSourceSnapshotSession2(input: {
         },
       );
     }
-    const cutover = await executeCandidateSourceSnapshotIpnsController({
+    const cutover = await dependencies.executeIpnsController({
       approvalId: approval.approvalId,
       boundary: remote.boundary,
       executorEnabled: true,
@@ -537,15 +553,12 @@ export async function executeCandidateSourceSnapshotSession2(input: {
       plan: durable.plan,
       uploadClosure,
     });
-    const completed = await completeCandidateSourceSnapshotDemoPlan(
-      input.databaseUrl,
-      {
-        cutover,
-        summary,
-        uploadClosure,
-        ...identity,
-      },
-    );
+    const completed = await dependencies.completePlan(input.databaseUrl, {
+      cutover,
+      summary,
+      uploadClosure,
+      ...identity,
+    });
     const storedResult = await dependencies.loadCompletedReplay(
       input.databaseUrl,
       {
@@ -569,8 +582,13 @@ export async function executeCandidateSourceSnapshotSession2(input: {
       status: "completed",
     };
   } finally {
-    // The opt-in exists only in this process. Closing the runtime guarantees
-    // that no adapter survives a successful, stopped, or failed execution.
-    await remote.close();
+    // The opt-in exists only in this process. Close both independently-owned
+    // resources on every exit. The concrete upload transport destroys only
+    // the S3 client it constructed; an injected executor remains caller-owned.
+    try {
+      await uploadTransport?.close?.();
+    } finally {
+      await remote.close();
+    }
   }
 }

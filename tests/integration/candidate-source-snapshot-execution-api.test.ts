@@ -2,6 +2,7 @@ import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
+  admitCandidateSourceSnapshotPreflightRequest,
   approveCandidateSourceSnapshotDemoPlan,
   beginCandidateSourceSnapshotDemoExecution,
   confirmCandidateSourceSnapshotDemoCapacity,
@@ -84,7 +85,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(databaseUrl)).toHaveLength(30);
+  expect(await runMigrations(databaseUrl)).toHaveLength(31);
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });
 
@@ -120,11 +121,6 @@ describe("candidate source-snapshot guarded execution API", () => {
     await expect(
       confirmCandidateSourceSnapshotDemoCapacity(databaseUrl, capacityRequest),
     ).resolves.toEqual(capacity);
-    await recordSuccessfulCandidateSourceSnapshotPreflight(
-      databaseUrl,
-      fixture.plan,
-    );
-
     const approvalRequest = {
       approvedAt: "2026-08-31T00:02:00.000Z",
       approverReference: "synthetic-human-approver",
@@ -146,8 +142,45 @@ describe("candidate source-snapshot guarded execution API", () => {
       plan: fixture.plan,
       statement: approvalRequest.authorizationStatement,
     });
+    await expect(
+      admitCandidateSourceSnapshotPreflightRequest(databaseUrl, {
+        attemptSequence: 1,
+        domain: "open_data",
+        operationKind: "bucket_head",
+        planId: fixture.plan.planId,
+        planSha256: fixture.plan.planSha256,
+        redirectSequence: 0,
+        resolver: null,
+      }),
+    ).rejects.toThrow("requires an eligible exact plan");
     const sql = postgres(databaseUrl, { max: 1 });
     try {
+      await expect(
+        sql`
+          UPDATE oracle_candidate_source_snapshot_demo_request_categories
+          SET consumed_request_count = consumed_request_count + 1,
+              request_cost_usd = request_cost_usd + 0.0000045,
+              revision = revision + 1
+          WHERE plan_id = ${fixture.plan.planId}
+            AND request_category = 'bucket_names_preflight'
+        `,
+      ).rejects.toThrow("request category admission is invalid");
+      await expect(
+        sql`
+          INSERT INTO oracle_candidate_source_snapshot_demo_requests (
+            request_id, plan_id, operation_class, operation_kind, domain,
+            request_cost_usd, outcome, request_category, logical_request_id,
+            attempt_sequence, redirect_sequence
+          ) VALUES (
+            ${`snapshotdemorequest_${"e".repeat(32)}`},
+            ${fixture.plan.planId}, 'class_b_read', 'bucket_head', 'open_data',
+            0.0000045, 'request_started', 'bucket_names_preflight',
+            ${`snapshotdemologicalrequest_${"d".repeat(32)}`}, 1, 0
+          )
+        `,
+      ).rejects.toThrow(
+        "requires the executing v2.1 plan or its bounded intent-free preflight",
+      );
       await expect(
         sql`
           INSERT INTO oracle_candidate_source_snapshot_demo_approvals (
@@ -206,6 +239,48 @@ describe("candidate source-snapshot guarded execution API", () => {
         authorizationStatement: `${approvalRequest.authorizationStatement} `,
       }),
     ).rejects.toThrow("does not exactly match");
+
+    const beforePreflightSql = postgres(databaseUrl, { max: 1 });
+    try {
+      const beforePreflight = await beforePreflightSql<
+        { effects: number; requests: number; state: string }[]
+      >`
+        SELECT plan.state,
+               (SELECT count(*)::integer
+                FROM oracle_candidate_source_snapshot_demo_requests request
+                WHERE request.plan_id = plan.plan_id) AS requests,
+               (SELECT count(*)::integer
+                FROM oracle_candidate_source_snapshot_demo_upload_attempts effect
+                WHERE effect.plan_id = plan.plan_id) AS effects
+        FROM oracle_candidate_source_snapshot_demo_plans plan
+        WHERE plan.plan_id = ${fixture.plan.planId}
+      `;
+      expect(beforePreflight).toEqual([
+        { effects: 0, requests: 0, state: "approved" },
+      ]);
+      await expect(
+        beforePreflightSql`
+          UPDATE oracle_candidate_source_snapshot_demo_plans
+          SET state = 'executing', revision = revision + 1
+          WHERE plan_id = ${fixture.plan.planId}
+        `,
+      ).rejects.toThrow("complete preflight evidence");
+    } finally {
+      await beforePreflightSql.end({ timeout: 5 });
+    }
+    await expect(
+      beginCandidateSourceSnapshotDemoExecution(databaseUrl, {
+        approvalId: approved.approvalId,
+        executorEnabled: true,
+        implementationCommitSha,
+        planId: fixture.plan.planId,
+        planSha256: fixture.plan.planSha256,
+      }),
+    ).rejects.toThrow("eight exact successful logical preflight receipts");
+    await recordSuccessfulCandidateSourceSnapshotPreflight(
+      databaseUrl,
+      fixture.plan,
+    );
 
     const verificationSql = postgres(databaseUrl, { max: 1 });
     try {

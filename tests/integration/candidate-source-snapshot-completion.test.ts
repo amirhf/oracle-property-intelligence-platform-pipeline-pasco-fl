@@ -53,7 +53,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(databaseUrl)).toHaveLength(30);
+  expect(await runMigrations(databaseUrl)).toHaveLength(31);
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });
 
@@ -79,18 +79,6 @@ describe("candidate source-snapshot Session 2A completion", () => {
       redirectSequence: 0,
       resolver: null,
     };
-    const concurrentPreflightAdmissions = await Promise.all([
-      admitCandidateSourceSnapshotPreflightRequest(databaseUrl, preflightInput),
-      admitCandidateSourceSnapshotPreflightRequest(databaseUrl, preflightInput),
-    ]);
-    expect(
-      concurrentPreflightAdmissions
-        .map((admission) => admission.alreadyRecorded)
-        .sort(),
-    ).toEqual([false, true]);
-    const preflightAdmission = concurrentPreflightAdmissions.find(
-      (admission) => !admission.alreadyRecorded,
-    )!;
     await confirmCandidateSourceSnapshotDemoCapacity(databaseUrl, {
       confirmedAt: "2026-08-31T01:00:00.000Z",
       confirmedPlanName: "Filebase Pro or better",
@@ -111,25 +99,49 @@ describe("candidate source-snapshot Session 2A completion", () => {
       planId: fixture.plan.planId,
       planSha256: fixture.plan.planSha256,
     };
-    await expect(
-      approveCandidateSourceSnapshotDemoPlan(databaseUrl, approvalInput),
-    ).rejects.toThrow("eight exact successful logical preflight receipts");
-
     const preflightSql = postgres(databaseUrl, { max: 1 });
     try {
-      const readinessBefore = await preflightSql<{ ready: boolean }[]>`
-        SELECT oracle_candidate_source_snapshot_preflight_is_approval_ready(
-          ${fixture.plan.planId}
-        ) AS ready
+      const readinessBefore = await preflightSql<
+        { approval_ready: boolean; execution_ready: boolean }[]
+      >`
+        SELECT
+          oracle_candidate_source_snapshot_preflight_is_approval_ready(
+            ${fixture.plan.planId}
+          ) AS approval_ready,
+          oracle_candidate_source_snapshot_preflight_is_execution_ready(
+            ${fixture.plan.planId}
+          ) AS execution_ready
       `;
-      expect(readinessBefore[0]?.ready).toBe(false);
+      expect(readinessBefore[0]).toEqual({
+        approval_ready: true,
+        execution_ready: false,
+      });
     } finally {
       await preflightSql.end({ timeout: 5 });
     }
+    await expect(
+      admitCandidateSourceSnapshotPreflightRequest(databaseUrl, preflightInput),
+    ).rejects.toThrow("requires an eligible exact plan");
+    const approved = await approveCandidateSourceSnapshotDemoPlan(
+      databaseUrl,
+      approvalInput,
+    );
+    const concurrentPreflightAdmissions = await Promise.all([
+      admitCandidateSourceSnapshotPreflightRequest(databaseUrl, preflightInput),
+      admitCandidateSourceSnapshotPreflightRequest(databaseUrl, preflightInput),
+    ]);
+    expect(
+      concurrentPreflightAdmissions
+        .map((admission) => admission.alreadyRecorded)
+        .sort(),
+    ).toEqual([false, true]);
+    const preflightAdmission = concurrentPreflightAdmissions.find(
+      (admission) => !admission.alreadyRecorded,
+    )!;
 
     await recordCandidateSourceSnapshotPreflightRequestOutcome(databaseUrl, {
       admission: preflightAdmission,
-      completedAt: "2026-08-31T00:59:00.000Z",
+      completedAt: "2026-08-31T01:02:00.000Z",
       outcome: "timeout_unknown",
       receiptSha256: "9".repeat(64),
     });
@@ -139,7 +151,7 @@ describe("candidate source-snapshot Session 2A completion", () => {
         preflightAdmission,
       ),
     ).resolves.toEqual({
-      completedAt: "2026-08-31T00:59:00.000Z",
+      completedAt: "2026-08-31T01:02:00.000Z",
       outcome: "timeout_unknown",
       receiptSha256: "9".repeat(64),
       requestId: preflightAdmission.requestId,
@@ -153,14 +165,14 @@ describe("candidate source-snapshot Session 2A completion", () => {
     );
     await recordCandidateSourceSnapshotPreflightRequestOutcome(databaseUrl, {
       admission: retryAdmission,
-      completedAt: "2026-08-31T00:59:10.000Z",
+      completedAt: "2026-08-31T01:02:10.000Z",
       outcome: "retryable_failure",
       receiptSha256: "7".repeat(64),
     });
     const incompleteSql = postgres(databaseUrl, { max: 1 });
     try {
       const incomplete = await incompleteSql<{ ready: boolean }[]>`
-        SELECT oracle_candidate_source_snapshot_preflight_is_approval_ready(
+        SELECT oracle_candidate_source_snapshot_preflight_is_execution_ready(
           ${fixture.plan.planId}
         ) AS ready
       `;
@@ -175,7 +187,7 @@ describe("candidate source-snapshot Session 2A completion", () => {
       });
     const preflightOutcome = {
       admission: successfulAdmission,
-      completedAt: "2026-08-31T00:59:20.000Z",
+      completedAt: "2026-08-31T01:02:20.000Z",
       outcome: "succeeded" as const,
       receiptSha256: "6".repeat(64),
     };
@@ -218,7 +230,7 @@ describe("candidate source-snapshot Session 2A completion", () => {
     await expect(
       recordCandidateSourceSnapshotPreflightRequestOutcome(databaseUrl, {
         admission: directResolverAdmission,
-        completedAt: "2026-08-31T00:59:00.000Z",
+        completedAt: "2026-08-31T01:02:30.000Z",
         outcome: "succeeded",
         receiptSha256: "8".repeat(64),
       }),
@@ -228,7 +240,7 @@ describe("candidate source-snapshot Session 2A completion", () => {
     )) {
       await recordCandidateSourceSnapshotPreflightRequestOutcome(databaseUrl, {
         admission,
-        completedAt: "2026-08-31T00:59:00.000Z",
+        completedAt: "2026-08-31T01:02:30.000Z",
         outcome: "succeeded",
         receiptSha256: "8".repeat(64),
       });
@@ -243,7 +255,7 @@ describe("candidate source-snapshot Session 2A completion", () => {
           )
           .map((admission) => ({
             admission,
-            completedAt: "2026-08-31T00:59:00.000Z",
+            completedAt: "2026-08-31T01:02:30.000Z",
             outcome: "succeeded" as const,
             receiptSha256: "8".repeat(64),
           })),
@@ -252,7 +264,7 @@ describe("candidate source-snapshot Session 2A completion", () => {
     const readySql = postgres(databaseUrl, { max: 1 });
     try {
       const readinessAfter = await readySql<{ ready: boolean }[]>`
-        SELECT oracle_candidate_source_snapshot_preflight_is_approval_ready(
+        SELECT oracle_candidate_source_snapshot_preflight_is_execution_ready(
           ${fixture.plan.planId}
         ) AS ready
       `;
@@ -260,9 +272,6 @@ describe("candidate source-snapshot Session 2A completion", () => {
     } finally {
       await readySql.end({ timeout: 5 });
     }
-    const approved = await approveCandidateSourceSnapshotDemoPlan(databaseUrl, {
-      ...approvalInput,
-    });
     await beginCandidateSourceSnapshotDemoExecution(databaseUrl, {
       approvalId: approved.approvalId,
       executorEnabled: true,

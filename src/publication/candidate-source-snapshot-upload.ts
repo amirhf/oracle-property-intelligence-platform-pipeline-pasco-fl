@@ -134,6 +134,8 @@ export interface CandidateSourceSnapshotUploadJournal {
 }
 
 export interface CandidateSourceSnapshotUploadTransport {
+  /** Releases transport-owned clients. Injected provider clients remain caller-owned. */
+  close?(): Promise<void> | void;
   /** Exactly one bounded Class-B provider read; never mutates the object. */
   inspectExistingOnce(
     plan: CandidateSourceSnapshotDemoPlan,

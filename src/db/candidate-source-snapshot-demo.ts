@@ -916,7 +916,6 @@ export async function approveCandidateSourceSnapshotDemoPlan(
       await lock(transaction);
       const { plan, row } = await loadExactPlanRowForUpdate(transaction, input);
       await assertExactApprovalDerivation(transaction, plan.planId);
-      await assertExactApprovalPreflight(transaction, plan.planId);
       const exact = planExactUploadFromRow(row);
       const approval = createCandidateSourceSnapshotApprovalIdentity({
         approvedAt: input.approvedAt,
@@ -1062,6 +1061,7 @@ export async function beginCandidateSourceSnapshotDemoExecution(
     return await sql.begin(async (transaction) => {
       await lock(transaction);
       const { plan, row } = await loadExactPlanRowForUpdate(transaction, input);
+      await assertExactApprovalPreflight(transaction, plan.planId);
       const approvals = await transaction<{ approval_id: string }[]>`
         SELECT approval_id
         FROM oracle_candidate_source_snapshot_demo_approvals
@@ -1966,11 +1966,7 @@ export async function admitCandidateSourceSnapshotPreflightRequest(
     return await sql.begin(async (transaction) => {
       await lock(transaction);
       const { plan, row } = await loadExactPlanRowForUpdate(transaction, input);
-      if (
-        !["awaiting_configuration", "awaiting_approval", "executing"].includes(
-          row.state,
-        )
-      ) {
+      if (row.state !== "approved") {
         throw new DurableConflictError(
           "Candidate source-snapshot preflight requires an eligible exact plan",
         );

@@ -1058,7 +1058,7 @@ async function loadPreflightProgress(
   try {
     const [readyRows, rows] = await Promise.all([
       sql<{ ready: boolean }[]>`
-        SELECT oracle_candidate_source_snapshot_preflight_is_approval_ready(
+        SELECT oracle_candidate_source_snapshot_preflight_is_execution_ready(
           ${plan.planId}
         ) AS ready
       `,

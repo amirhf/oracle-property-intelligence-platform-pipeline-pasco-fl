@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   HeadObjectCommand,
   PutObjectCommand,
+  S3Client,
   type HeadObjectCommandOutput,
   type PutObjectCommandOutput,
 } from "@aws-sdk/client-s3";
@@ -15,6 +16,7 @@ import { sha256 } from "../../src/lib/hash.js";
 import { loadCandidateSourceSnapshotExecutionConfig } from "../../src/publication/candidate-source-snapshot-executor-config.js";
 import {
   BoundCandidateSourceSnapshotLocalObjectSource,
+  AwsCandidateSourceSnapshotS3CommandExecutor,
   RealCandidateSourceSnapshotFilebaseTransport,
   createCandidateSourceSnapshotFilebaseTransport,
   type CandidateSourceSnapshotLocalObjectSource,
@@ -275,6 +277,35 @@ describe("candidate source-snapshot Session 2 boundary", () => {
       responseBytes: 12,
     });
     expect(JSON.stringify(receipt)).not.toContain("raw-provider-request-id");
+  });
+
+  it("destroys only an owned S3 client and makes transport shutdown idempotent", () => {
+    const { plan } = syntheticCandidateSourceSnapshotDemo();
+    const destroy = vi
+      .spyOn(S3Client.prototype, "destroy")
+      .mockImplementation(() => undefined);
+    const owned = new AwsCandidateSourceSnapshotS3CommandExecutor(
+      enabledConfig(plan),
+    );
+    owned.close();
+    owned.close();
+    expect(destroy).toHaveBeenCalledOnce();
+    destroy.mockRestore();
+
+    const injected = new FakeS3({
+      output: { $metadata: { attempts: 1 } },
+      responseHeaders: {},
+    });
+    const injectedClose = vi.fn();
+    Object.assign(injected, { close: injectedClose });
+    const transport = new RealCandidateSourceSnapshotFilebaseTransport({
+      config: enabledConfig(plan),
+      executor: injected,
+      source: new FakeSource(Buffer.from("{}\n")),
+    });
+    transport.close();
+    transport.close();
+    expect(injectedClose).not.toHaveBeenCalled();
   });
 
   it("verifies HeadObject metadata and classifies bounded transient errors", async () => {

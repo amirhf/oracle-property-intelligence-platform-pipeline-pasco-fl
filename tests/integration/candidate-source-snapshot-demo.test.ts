@@ -29,7 +29,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(databaseUrl)).toHaveLength(30);
+  expect(await runMigrations(databaseUrl)).toHaveLength(31);
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });
 
@@ -193,10 +193,6 @@ describe("candidate source-snapshot v2 durability", () => {
         planId: fixture.plan.planId,
         planSha256: fixture.plan.planSha256,
       });
-      await recordSuccessfulCandidateSourceSnapshotPreflight(
-        databaseUrl,
-        fixture.plan,
-      );
       const approval = await approveCandidateSourceSnapshotDemoPlan(
         databaseUrl,
         {
@@ -212,6 +208,10 @@ describe("candidate source-snapshot v2 durability", () => {
           planId: fixture.plan.planId,
           planSha256: fixture.plan.planSha256,
         },
+      );
+      await recordSuccessfulCandidateSourceSnapshotPreflight(
+        databaseUrl,
+        fixture.plan,
       );
       await beginCandidateSourceSnapshotDemoExecution(databaseUrl, {
         approvalId: approval.approvalId,
