@@ -1,4 +1,8 @@
 import type { McpToolName } from "./constants.js";
+import {
+  CANDIDATE_SOURCE_SNAPSHOT_PUBLICATION_EVIDENCE_SHA256,
+  validatedCandidateSourceSnapshotPublicationEvidence,
+} from "./candidate-source-snapshot-publication-evidence.js";
 import type { JsonObject } from "./provider.js";
 import type { OracleMcpRuntime, ToolExecutionResult } from "./runtime.js";
 
@@ -171,6 +175,11 @@ export async function explorerBootstrap(
   const isSourceSnapshotPlan =
     metadata.publication.candidateDemoPlanId?.startsWith("snapshotdemo_") ===
     true;
+  const sourceSnapshotPublicationEvidence = isSourceSnapshotPlan
+    ? validatedCandidateSourceSnapshotPublicationEvidence(metadata)
+    : null;
+  const sourceSnapshotPublicationIsActive =
+    sourceSnapshotPublicationEvidence !== null;
   const candidateObjectCount =
     metadata.objectCount +
     (metadata.publication.planCid === null || isSourceSnapshotPlan ? 0 : 1);
@@ -179,9 +188,15 @@ export async function explorerBootstrap(
         .filter((limitation) => !HISTORICAL_NO_REMOTE_EFFECT.test(limitation))
         .concat(
           isSourceSnapshotPlan
-            ? [
-                "This target-bound candidate plan is locally validated but unapproved; its public metadata records no Filebase upload or IPNS mutation.",
-              ]
+            ? sourceSnapshotPublicationIsActive
+              ? [
+                  "The active public demo uses two candidate-owned Filebase CAR roots and two candidate-owned IPNS identities; exact logical inventory membership is verified by individual receipts or immutable CAR bulk evidence.",
+                  "The historical local plan and dry-run status is retained separately and does not describe the active remote candidate publication.",
+                  "No Filebase or IPNS mutation occurred during the read-plane metadata and cold-property correction deployments.",
+                ]
+              : [
+                  "Active remote publication evidence is unavailable for this source-snapshot plan.",
+                ]
             : [
                 "The active public demo uses candidate-owned Filebase objects and candidate-owned IPNS identities.",
                 "No Filebase or IPNS mutation occurred during the recent routing and explorer-display deployments; the earlier candidate publication effects are reported separately.",
@@ -196,24 +211,66 @@ export async function explorerBootstrap(
       candidateDemo: !hasCandidateDemo
         ? null
         : {
+            activeCandidatePublication: isSourceSnapshotPlan
+              ? sourceSnapshotPublicationIsActive
+              : true,
             coordinateCount: metadata.coordinateCount,
+            evidence:
+              sourceSnapshotPublicationEvidence === null
+                ? null
+                : {
+                    artifactSetSha256:
+                      sourceSnapshotPublicationEvidence.artifactSetSha256,
+                    carBulkVerificationCount:
+                      sourceSnapshotPublicationEvidence.carVerifications.length,
+                    closureId:
+                      sourceSnapshotPublicationEvidence.uploadClosure.closureId,
+                    closureSha256:
+                      sourceSnapshotPublicationEvidence.uploadClosure
+                        .closureSha256,
+                    schemaVersion:
+                      sourceSnapshotPublicationEvidence.schemaVersion,
+                    sha256:
+                      CANDIDATE_SOURCE_SNAPSHOT_PUBLICATION_EVIDENCE_SHA256,
+                  },
+            historicalPreExecutionEvidence: isSourceSnapshotPlan
+              ? {
+                  activePublicationStatus: false,
+                  description:
+                    "The pipeline publicationArtifacts fields are historical local plan/dry-run evidence and are not the active candidate Filebase/IPNS status.",
+                  evidenceScope: "historical_local_source_plan",
+                }
+              : null,
             objectCount: candidateObjectCount,
             planId: metadata.publication.candidateDemoPlanId,
             planSha256: metadata.publication.candidateDemoPlanSha256,
             propertyCount: metadata.canonicalDocumentCount,
             providerCidVerification: {
               description: isSourceSnapshotPlan
-                ? "Deterministic local CIDs are plan-bound. Provider-returned CID receipts do not yet exist for this unapproved plan."
+                ? sourceSnapshotPublicationIsActive
+                  ? `All ${candidateObjectCount} logical inventory members are verified through valid individual receipt linkage or exact immutable CAR membership backed by two recursively pinned roots; this does not claim one provider receipt per object.`
+                  : "Active provider verification evidence is unavailable."
                 : `All ${candidateObjectCount} provider-returned CIDs matched deterministic local CIDs.`,
               matchedObjectCount: isSourceSnapshotPlan
-                ? null
+                ? sourceSnapshotPublicationIsActive
+                  ? candidateObjectCount
+                  : null
                 : candidateObjectCount,
-              mismatchCount: isSourceSnapshotPlan ? null : 0,
-              status: isSourceSnapshotPlan ? "not_executed" : "all_matched",
+              mismatchCount: isSourceSnapshotPlan
+                ? (sourceSnapshotPublicationEvidence?.uploadClosure
+                    .providerCidMismatchCount ?? null)
+                : 0,
+              status: isSourceSnapshotPlan
+                ? sourceSnapshotPublicationIsActive
+                  ? "inventory_verified"
+                  : "evidence_unavailable"
+                : "all_matched",
             },
             publicationTimestamp: {
               availability: "unavailable",
-              reason: "not_recorded_in_public_candidate_metadata",
+              reason: isSourceSnapshotPlan
+                ? "ipns_cutover_timestamp_not_durably_bound_in_public_runtime_evidence"
+                : "not_recorded_in_public_candidate_metadata",
               value: null,
             },
             remoteResources: {
@@ -221,19 +278,25 @@ export async function explorerBootstrap(
                 objectCount: candidateObjectCount,
                 ownership: "candidate_owned",
                 status: isSourceSnapshotPlan
-                  ? "planned_not_uploaded"
+                  ? sourceSnapshotPublicationIsActive
+                    ? "roots_pinned_and_bulk_membership_verified"
+                    : "evidence_unavailable"
                   : "uploaded_and_cid_verified",
               },
               ipns: {
                 identityCount: 2,
                 ownership: "candidate_owned",
                 status: isSourceSnapshotPlan
-                  ? "planned_not_mutated"
+                  ? sourceSnapshotPublicationIsActive
+                    ? "active_and_runtime_signed_resolved"
+                    : "evidence_unavailable"
                   : "updated_and_publicly_resolved",
               },
             },
             remoteStatus: isSourceSnapshotPlan
-              ? "awaiting_configuration_unpublished"
+              ? sourceSnapshotPublicationIsActive
+                ? "candidate_filebase_ipns_active"
+                : "candidate_publication_evidence_unavailable"
               : "candidate_filebase_ipns_active",
             resolverPolicy: metadata.publication.resolverPolicy,
             disclosure: isSourceSnapshotPlan

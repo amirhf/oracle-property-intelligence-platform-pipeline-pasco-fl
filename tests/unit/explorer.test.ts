@@ -363,7 +363,7 @@ describe("privacy-safe public Oracle explorer", () => {
 });
 
 describe("candidate source-snapshot explorer status", () => {
-  it("does not turn a locally prepared plan into a claimed remote effect", async () => {
+  it("separates active remote evidence from historical local-plan status", async () => {
     const execute = async () => ({
       isError: false,
       result: { data: {} },
@@ -388,15 +388,20 @@ describe("candidate source-snapshot explorer status", () => {
           plan: {},
           providerMode: "public-ipns",
           publication: {
-            candidateDemoPlanId: `snapshotdemo_${"1".repeat(32)}`,
-            candidateDemoPlanSha256: "3".repeat(64),
+            candidateDemoPlanId:
+              "snapshotdemo_87e3253348cedf80ecba1d716791dd16",
+            candidateDemoPlanSha256:
+              "1f98bdf9fa8269fd64b26314fd93aa9bbbf7850390176612366a8989975583ee",
             manifestCid: `Qm${"1".repeat(44)}`,
-            openDataIpns: `k51${"1".repeat(59)}`,
-            openDataRootCid: `Qm${"2".repeat(44)}`,
-            planCid: `Qm${"3".repeat(44)}`,
-            planSha256: "4".repeat(64),
-            queryTableIpns: `k51${"2".repeat(59)}`,
-            queryTableRootCid: `Qm${"4".repeat(44)}`,
+            openDataIpns:
+              "k51qzi5uqu5dme2zfev56k5s15i20si9ke4l6mjnv6qpgd4disfprli0gr66x6",
+            openDataRootCid: "QmVqEfh8BwE8QXAyhoNSVprSB726eYynfQtZWUxXh3r1sy",
+            planCid: "QmcxZWB8W2asaZDNNXi1WyprzQT8cMKmen7FW8fbGiivTW",
+            planSha256:
+              "1f98bdf9fa8269fd64b26314fd93aa9bbbf7850390176612366a8989975583ee",
+            queryTableIpns:
+              "k51qzi5uqu5dlj11ik6bpomd7581ipkp9h2sm6gpadwqx6zkjyl2h32osd7rgm",
+            queryTableRootCid: "QmPH58KURSVWdbmBMb3gBTexs5a1EKxKpKD4QfTdW24Cdw",
             resolverPolicy: "candidate_filebase_delegated_v2",
             scopeId: "scope_1",
             selectionHash: "5".repeat(64),
@@ -414,22 +419,34 @@ describe("candidate source-snapshot explorer status", () => {
     const value = await explorerBootstrap(runtime);
     expect(value.publication).toMatchObject({
       candidateDemo: {
+        activeCandidatePublication: true,
+        evidence: {
+          carBulkVerificationCount: 2,
+          closureId:
+            "snapshotdemouploadclosure_95a8b6c2a3a8a6ff4825d3fb2286ab8b",
+          sha256:
+            "cdf73f2a7bf3a31cf8dd7333d5b04e7e34da33227dd90997feb4502e2526a591",
+        },
         providerCidVerification: {
-          matchedObjectCount: null,
-          mismatchCount: null,
-          status: "not_executed",
+          matchedObjectCount: 325_312,
+          mismatchCount: 0,
+          status: "inventory_verified",
         },
         remoteResources: {
-          filebase: { status: "planned_not_uploaded" },
-          ipns: { status: "planned_not_mutated" },
+          filebase: { status: "roots_pinned_and_bulk_membership_verified" },
+          ipns: { status: "active_and_runtime_signed_resolved" },
         },
-        remoteStatus: "awaiting_configuration_unpublished",
+        remoteStatus: "candidate_filebase_ipns_active",
       },
       coverageMode: "source_snapshot",
     });
     const serialized = JSON.stringify(value);
-    expect(serialized).not.toContain("uploaded_and_cid_verified");
-    expect(serialized).not.toContain("updated_and_publicly_resolved");
-    expect(serialized).not.toContain("provider-returned CIDs matched");
+    expect(serialized).toContain("historical_local_source_plan");
+    expect(serialized).toContain(
+      "individual receipt linkage or exact immutable CAR membership",
+    );
+    expect(serialized).not.toContain("planned_not_uploaded");
+    expect(serialized).not.toContain("planned_not_mutated");
+    expect(serialized).not.toContain("awaiting_configuration_unpublished");
   });
 });

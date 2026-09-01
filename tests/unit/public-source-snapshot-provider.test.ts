@@ -310,6 +310,19 @@ describe("compact candidate source-snapshot public provider", () => {
     expect(coldReads.has(source.config.expectedOpenDataRootCid)).toBe(false);
     expect(coldReads.has(shardCid)).toBe(false);
 
+    const coldProperty = await provider.getCanonicalProperty(
+      bindings[0]!.publicPropertyId,
+    );
+    expect(coldProperty?.propertyId).toBe(bindings[0]!.canonicalPropertyId);
+    expect(queryReaderCalls).toBe(0);
+    expect(stages).not.toContain("parquet");
+    expect(rangeTouched).toBe(false);
+    expect(source.transport.reads).toContain(bindings[0]!.cid);
+    expect(source.transport.reads).not.toContain(
+      source.config.expectedOpenDataRootCid,
+    );
+    expect(source.transport.reads).not.toContain(shardCid);
+
     const firstQuery = provider.getQueryRows();
     const concurrentQuery = provider.getQueryRows();
     const firstOutcomes = Promise.allSettled([firstQuery, concurrentQuery]);
@@ -331,10 +344,10 @@ describe("compact candidate source-snapshot public provider", () => {
 
     expect(await provider.getQueryRows()).toBe(queryRows);
     expect(queryReaderCalls).toBe(2);
-    expect(source.transport.reads).toContain(
+    expect(source.transport.reads).not.toContain(
       source.config.expectedOpenDataRootCid,
     );
-    expect(source.transport.reads).toContain(shardCid);
+    expect(source.transport.reads).not.toContain(shardCid);
     expect(source.transport.reads).toContain(bindings[0]!.cid);
 
     const replacementQueryIpns = `k51${"f".repeat(59)}`;

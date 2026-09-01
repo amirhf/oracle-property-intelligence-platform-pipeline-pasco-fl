@@ -1935,6 +1935,35 @@ async function candidateInventoryEntry(options: {
   );
 }
 
+async function candidateInventoryEntryOrNull(options: {
+  context: CandidateSourceSnapshotReadContext;
+  key: string;
+  signal?: AbortSignal;
+  transport: PublicReadTransport;
+}): Promise<CandidateInventoryObject | null> {
+  try {
+    const value = await readControlEntryByKey({
+      index: options.context.objectInventoryIndex,
+      key: options.key,
+      readShard: (descriptor) =>
+        options.transport.readCid(
+          descriptor.expectedCid,
+          descriptor.byteSize,
+          options.signal,
+        ),
+    });
+    return value === null
+      ? null
+      : candidateInventoryObject(value, options.key, options.context.plan);
+  } catch (error) {
+    if (error instanceof PublicReadError) throw error;
+    throw publicError(
+      "artifact_invalid",
+      "Publication object inventory entry failed its immutable binding",
+    );
+  }
+}
+
 async function readCandidateObject(options: {
   binding: CandidateInventoryObject;
   maximumBytes: number;
@@ -2389,6 +2418,60 @@ async function readSourceSnapshotCanonicalProperty(options: {
     property,
     provenanceArtifactUris: new Set(),
   };
+}
+
+async function readSourceSnapshotCanonicalPropertyDirect(options: {
+  context: CandidateSourceSnapshotReadContext;
+  publicPropertyId: string;
+  maximumJsonBytes: number;
+  signal?: AbortSignal;
+  transport: PublicReadTransport;
+}): Promise<{
+  property: JsonObject;
+  provenanceArtifactUris: Set<string>;
+} | null> {
+  const match = /^prop_([a-f0-9]{32})$/.exec(options.publicPropertyId);
+  if (!match?.[1]) return null;
+  const canonicalPropertyId = `property_${match[1]}`;
+  const propertyBinding = await candidateInventoryEntryOrNull({
+    context: options.context,
+    key: `open_data:properties/${canonicalPropertyId}.json`,
+    ...(options.signal ? { signal: options.signal } : {}),
+    transport: options.transport,
+  });
+  if (propertyBinding === null) return null;
+  const property = parseJson(
+    await readCandidateObject({
+      binding: propertyBinding,
+      maximumBytes: options.maximumJsonBytes,
+      ...(options.signal ? { signal: options.signal } : {}),
+      transport: options.transport,
+    }),
+    "canonical property",
+  );
+  if (property.propertyId !== canonicalPropertyId) {
+    throw publicError(
+      "artifact_invalid",
+      "Published property does not match its immutable inventory identity",
+    );
+  }
+  const provenanceBinding = await candidateInventoryEntry({
+    context: options.context,
+    key: "open_data:provenance.json",
+    ...(options.signal ? { signal: options.signal } : {}),
+    transport: options.transport,
+  });
+  const provenance = parseJson(
+    await readCandidateObject({
+      binding: provenanceBinding,
+      maximumBytes: options.maximumJsonBytes,
+      ...(options.signal ? { signal: options.signal } : {}),
+      transport: options.transport,
+    }),
+    "source-snapshot provenance",
+  );
+  validateSourceSnapshotProvenance(provenance, options.context.plan);
+  return { property, provenanceArtifactUris: new Set() };
 }
 
 export class PublicIpnsProvider implements OracleMcpProvider {
@@ -2853,6 +2936,27 @@ export class PublicIpnsProvider implements OracleMcpProvider {
     signal?: AbortSignal,
   ): Promise<JsonObject | null> {
     if (this.#sourceSnapshotContext !== null) {
+      if (this.#sourceSnapshotQueryState === null) {
+        const resolved = await readSourceSnapshotCanonicalPropertyDirect({
+          context: this.#sourceSnapshotContext,
+          publicPropertyId: propertyId,
+          maximumJsonBytes: this.#maximumJsonBytes,
+          ...(signal ? { signal } : {}),
+          transport: this.#transport,
+        });
+        if (resolved === null) return null;
+        if (this.#contracts.validateCanonical(resolved.property).length > 0) {
+          throw publicError(
+            "contract_mismatch",
+            "Published property failed canonical contract validation",
+          );
+        }
+        this.#verifyPropertyProvenance(
+          resolved.property,
+          resolved.provenanceArtifactUris,
+        );
+        return resolved.property;
+      }
       const query = await this.#loadSourceSnapshotQuery(signal);
       const entry = query.entriesByPublicId.get(propertyId);
       if (!entry) return null;
