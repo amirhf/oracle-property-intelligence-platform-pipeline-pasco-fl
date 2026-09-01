@@ -84,18 +84,18 @@ export async function startCandidateSourceSnapshotCarImportAttempt(
       const rows = await transaction<AttemptBindingRow[]>`
         SELECT artifact.car_sha256, artifact.car_bytes::text,
                artifact.primary_root_cid, artifact.root_set_sha256,
-               artifact.member_set_sha256, authorization.endpoint,
-               authorization.import_method
+               artifact.member_set_sha256, car_auth.endpoint,
+               car_auth.import_method
         FROM oracle_candidate_source_snapshot_car_artifacts artifact
-        JOIN oracle_candidate_source_snapshot_car_import_authorizations authorization
-          ON authorization.plan_id = artifact.plan_id
+        JOIN oracle_candidate_source_snapshot_car_import_authorizations car_auth
+          ON car_auth.plan_id = artifact.plan_id
         WHERE artifact.car_artifact_id = ${input.artifactId}
           AND artifact.plan_id = ${input.planId}
           AND artifact.plan_sha256 = ${input.planSha256}
-          AND authorization.car_authorization_id = ${input.authorizationId}
-          AND authorization.implementation_commit_sha =
+          AND car_auth.car_authorization_id = ${input.authorizationId}
+          AND car_auth.implementation_commit_sha =
             ${input.implementationCommitSha}
-        FOR SHARE OF artifact, authorization
+        FOR SHARE OF artifact, car_auth
       `;
       const binding = rows[0];
       if (!binding) {

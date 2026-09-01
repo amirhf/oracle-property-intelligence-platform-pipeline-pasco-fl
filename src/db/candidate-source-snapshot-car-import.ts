@@ -577,7 +577,9 @@ export async function loadCandidateSourceSnapshotCarArtifactRecords(
     >`
       SELECT car_artifact_id, car_role, plan_sha256,
              implementation_commit_sha, car_sha256, car_bytes::text,
-             block_count, block_membership_sha256, primary_root_cid,
+             block_count,
+             artifact.block_set_sha256 AS block_membership_sha256,
+             primary_root_cid,
              root_count, root_set_sha256, member_count,
              member_logical_bytes::text, member_set_sha256,
              local_validation_sha256, recorded_at,
