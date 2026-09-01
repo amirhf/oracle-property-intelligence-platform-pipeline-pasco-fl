@@ -761,9 +761,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
     if (recoveryAttempt) {
       if ((await inspectUnknownUpload(recoveryAttempt)) !== "absent") return;
     }
-    let attemptsUsed = priorAttempts.filter(
-      (attempt) => attempt.operation === "upload",
-    ).length;
+    let attemptsUsed = checkpoint.attemptCount;
     const terminal = priorAttempts.find(
       (attempt) =>
         attempt.outcome === "provider_cid_mismatch" ||

@@ -4297,15 +4297,39 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
           AND upload_attempt.remote_object_key = ${object.remoteObjectKey}
           AND NOT EXISTS (
             SELECT 1
-            FROM oracle_candidate_source_snapshot_upload_inspection_cycle_members member
-            JOIN oracle_candidate_source_snapshot_upload_inspection_cycle_resolutions resolution
-              ON resolution.inspection_cycle_id = member.inspection_cycle_id
-             AND resolution.domain = member.domain
-             AND resolution.remote_object_key = member.remote_object_key
-            WHERE member.plan_id = upload_attempt.plan_id
-              AND member.domain = upload_attempt.domain
-              AND member.remote_object_key = upload_attempt.remote_object_key
-              AND member.source_attempt_id = upload_attempt.attempt_id
+            FROM oracle_candidate_source_snapshot_demo_inspection_attempts inspection
+            WHERE inspection.recovery_upload_attempt_id = upload_attempt.attempt_id
+              AND (
+                EXISTS (
+                  SELECT 1
+                  FROM oracle_candidate_source_snapshot_upload_continuation_reconciliations reconciliation
+                  WHERE reconciliation.inspection_id = inspection.inspection_id
+                    AND (
+                      (reconciliation.result = 'conclusively_absent' AND
+                       inspection.outcome = 'absent') OR
+                      (reconciliation.result = 'remote_verified' AND
+                       inspection.outcome = 'verified')
+                    )
+                ) OR EXISTS (
+                  SELECT 1
+                  FROM oracle_candidate_source_snapshot_upload_inspection_cycle_members member
+                  JOIN oracle_candidate_source_snapshot_upload_inspection_cycle_resolutions resolution
+                    ON resolution.inspection_cycle_id = member.inspection_cycle_id
+                   AND resolution.domain = member.domain
+                   AND resolution.remote_object_key = member.remote_object_key
+                  WHERE member.plan_id = upload_attempt.plan_id
+                    AND member.domain = upload_attempt.domain
+                    AND member.remote_object_key = upload_attempt.remote_object_key
+                    AND member.source_attempt_id = upload_attempt.attempt_id
+                    AND resolution.inspection_id = inspection.inspection_id
+                    AND (
+                      (resolution.result = 'conclusively_absent' AND
+                       inspection.outcome = 'absent') OR
+                      (resolution.result = 'remote_verified' AND
+                       inspection.outcome = 'verified')
+                    )
+                )
+              )
           )
         ORDER BY upload_attempt.attempt_sequence
       `;
