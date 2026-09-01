@@ -1,0 +1,20 @@
+{
+  "fixtureType": "error-response",
+  "tool": "prism_v1_search_roofing_opportunities",
+  "result": {
+    "ok": false,
+    "error": {
+      "code": "invalid_argument",
+      "message": "Radius must be greater than zero and no more than 50 miles.",
+      "retryable": false,
+      "details": {
+        "field": "radius.value"
+      }
+    },
+    "meta": {
+      "contractVersion": "1.2.0",
+      "schemaHash": "9fc112ef8a4e2120593c3dc20c90073b0eb96596817c96112f63fd258bb7c131",
+      "requestId": "req_fixture_001"
+    }
+  }
+}

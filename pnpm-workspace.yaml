@@ -1,0 +1,6 @@
+allowBuilds:
+  "@scarf/scarf": false
+  esbuild: true
+  protobufjs: false
+overrides:
+  protobufjs: 7.6.5

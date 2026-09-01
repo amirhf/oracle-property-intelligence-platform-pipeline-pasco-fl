@@ -1,0 +1,118 @@
+{
+  "county": "pasco",
+  "observedAt": "2026-08-28T00:00:00.000Z",
+  "sources": [
+    {
+      "id": "pasco_appraiser_parcel",
+      "sourceSystem": "pasco_appraiser",
+      "officialUrl": "https://ftp01.pascopa.com/real_estate/parcel.zip",
+      "accessMethod": "anonymous HTTPS bulk ZIP; weekly",
+      "observedMetadata": "Last-Modified Sun, 23 Aug 2026 11:07:02 GMT; 7,895,623 bytes",
+      "sha256": "bffeead6aa18d9e53e5da9efafa5533b24e7d563b733b1d327bdc0a5cb62cac9",
+      "expectedRelevantFields": [
+        "Parcel_Num",
+        "Prop_Use_Code",
+        "Prop_Use_Desc",
+        "TotSqFt",
+        "HstSqFt",
+        "Acres",
+        "NBHD_Code"
+      ],
+      "coverageAndLimitations": "County appraisal parcel-level detail; values are a weekly working roll and are not permit records."
+    },
+    {
+      "id": "pasco_appraiser_building",
+      "sourceSystem": "pasco_appraiser",
+      "officialUrl": "https://ftp01.pascopa.com/real_estate/building.zip",
+      "accessMethod": "anonymous HTTPS bulk ZIP; weekly",
+      "observedMetadata": "Last-Modified Sun, 23 Aug 2026 11:00:17 GMT; 6,371,361 bytes",
+      "sha256": "2713bc38194e30f80bfa96bb4f80b3adc9401cb932e13167a8628fd8dc66c3b9",
+      "expectedRelevantFields": [
+        "Parcel_Num",
+        "Bldg_Num",
+        "Bldg_Section",
+        "Bldg_EffYrBlt",
+        "Bldg_ActYrBlt",
+        "Bldg_Use_Desc",
+        "Bldg_Roof_Cover_Desc",
+        "Bldg_Roof_Structure_Desc",
+        "Bldg_Total_Sqft",
+        "Bldg_Heated_Sqft"
+      ],
+      "coverageAndLimitations": "Building sections are appraisal observations. Construction year and roof-cover attributes do not establish a roof installation date or year."
+    },
+    {
+      "id": "pasco_appraiser_owners",
+      "sourceSystem": "pasco_appraiser",
+      "officialUrl": "https://ftp01.pascopa.com/real_estate/owners.zip",
+      "accessMethod": "anonymous HTTPS bulk ZIP; weekly",
+      "observedMetadata": "Last-Modified Sun, 23 Aug 2026 11:01:06 GMT; 8,870,642 bytes",
+      "sha256": "001d84eac29f74225a825f8d74b06854338db96ac5a7719c5f8dce9bfafc2bf3",
+      "expectedRelevantFields": [
+        "Parcel_Num",
+        "Owner_Mail_Name1",
+        "Owner_Mail_Name2",
+        "Owner_Mail_Addr1",
+        "Owner_Mail_Addr2",
+        "Owner_Mail_City",
+        "Owner_Mail_State",
+        "Owner_Mail_Zip",
+        "Owner_Mail_Country"
+      ],
+      "coverageAndLimitations": "Current owner and mailing fields as supplied by the appraiser; no ownership transfer date is present in this file."
+    },
+    {
+      "id": "pasco_appraiser_site_addresses",
+      "sourceSystem": "pasco_appraiser",
+      "officialUrl": "https://ftp01.pascopa.com/real_estate/site_addresses.zip",
+      "accessMethod": "anonymous HTTPS bulk ZIP; weekly",
+      "observedMetadata": "Last-Modified Sun, 23 Aug 2026 11:00:10 GMT; 3,172,444 bytes",
+      "sha256": "42c30161bde57047d9522bc10827fe491c0fc54b75be92856dff1629e2b92505",
+      "expectedRelevantFields": [
+        "PARCEL",
+        "ADDRESS_NUMBER",
+        "STREET_NAME",
+        "STREET_SUFFIX",
+        "CITY",
+        "ZIP_CODE",
+        "UNIT_TYPE",
+        "UNIT_IDENTIFIER"
+      ],
+      "coverageAndLimitations": "Site addresses maintained by Pasco County GIS; a parcel can have zero, one, or multiple address rows."
+    },
+    {
+      "id": "pasco_gis_parcels",
+      "sourceSystem": "pasco_gis",
+      "officialUrl": "https://pascogis.pascocountyfl.net/giswebmm/rest/services/PascoMapper/Parcels/MapServer/7",
+      "accessMethod": "anonymous ArcGIS REST query; batched exact-HPARCEL filter; GeoJSON with outSR=4326",
+      "observedMetadata": "ArcGIS REST 11.5 feature layer; polygon geometry; maxRecordCount 2,000; JSON/GeoJSON/PBF",
+      "sha256": null,
+      "expectedRelevantFields": [
+        "HPARCEL",
+        "LAST_UPDATE",
+        "CENTROID_X",
+        "CENTROID_Y",
+        "geometry"
+      ],
+      "coverageAndLimitations": "Pilot requests only the 25 selected exact folios. WGS84 points are deterministically calculated from returned outSR=4326 parcel polygons; the 678.61 MB county ZIP is not downloaded."
+    },
+    {
+      "id": "pasco_accela_permits",
+      "sourceSystem": "pasco_accela",
+      "officialUrl": "https://aca-prod.accela.com/PASCO/Cap/CapHome.aspx?module=Permits&TabName=Permits",
+      "accessMethod": "anonymous Accela Citizen Access form; exact parcel-number search; one GET plus one POST per pilot parcel",
+      "observedMetadata": "Observed 2026-08-28; interactive anonymous browser exposed parcel-number and roofing-specific search fields; two programmatic form GET attempts (initial plus one Restate retry) matched challenge/CAPTCHA content, zero search POSTs were sent, and collection stopped",
+      "sha256": null,
+      "expectedRelevantFields": [
+        "recordDate",
+        "recordNumber",
+        "recordType",
+        "description",
+        "projectName",
+        "status",
+        "address"
+      ],
+      "coverageAndLimitations": "Source unavailable to the pilot after the required challenge stop. No search POST was sent. Permits, dates, statuses, duration, and contractors remain unavailable. Pasco County Accela coverage can also exclude incorporated-city permit systems."
+    }
+  ]
+}

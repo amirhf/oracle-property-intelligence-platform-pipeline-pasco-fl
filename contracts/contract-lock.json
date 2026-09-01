@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "contractVersion": "1.2.0",
+  "hashAlgorithm": {
+    "name": "SHA-256",
+    "input": "Exact committed file bytes, including the final LF byte.",
+    "normalization": "none",
+    "command": "shasum -a 256 contracts/mcp-v1.schema.json"
+  },
+  "supersededMcpContracts": [
+    {
+      "contractVersion": "1.0.0",
+      "sha256": "714ee037ffca1362870a5135328a783bfe4a0161e7136e09d4d1590894211de7",
+      "oracleSourceCommit": "92f002d72d084c96bce7ecc106a39671a3e095bb",
+      "crmSourceCommit": "603ef0d5f07a565f00c3261f05102d75d9475175",
+      "evidence": "Exact superseded bytes remain available in Git history at the source commits."
+    },
+    {
+      "contractVersion": "1.1.0",
+      "sha256": "1ef6f43072bc93ee8557aa9fcd0ce55eab26560fe4d061fac7c9388b2d0301c5",
+      "oracleSourceCommit": "a9222ee91be2eaa5126b7435f917e0da27daa5f8",
+      "crmSourceCommit": "71c03f8b653850f3e8afcd64b39aff67b5551332",
+      "evidence": "Exact superseded bytes remain available in Git history at the source commits."
+    }
+  ],
+  "mcpSchema": {
+    "path": "contracts/mcp-v1.schema.json",
+    "sha256": "9fc112ef8a4e2120593c3dc20c90073b0eb96596817c96112f63fd258bb7c131",
+    "mustBeByteIdenticalAcrossAssignments": true
+  },
+  "canonicalSchema": {
+    "path": "contracts/canonical-v1.schema.json",
+    "sha256": "59c6472c2cd6d18041cf72c779fb970a082b00bef09aea724b99687e84198306"
+  },
+  "sharedFixtures": [
+    {
+      "path": "contracts/fixtures/error-response.json",
+      "sha256": "bc1de3f33517ae9837e7a8de7a651f7e61ad788562713dcb2dfc451c3403759b"
+    },
+    {
+      "path": "contracts/fixtures/permit-request.json",
+      "sha256": "6bab9868c25378cd741af48d1af0795844138822c89bad0f7abe5bdd92bc5eb4"
+    },
+    {
+      "path": "contracts/fixtures/permit-response.json",
+      "sha256": "3fa65d1721d0a9538c86f1b2456f277aafe6ac29f4b1fe18e8d6cf07a778c193"
+    },
+    {
+      "path": "contracts/fixtures/pipeline-run-summary-request.json",
+      "sha256": "8f9b680d94e946149343d83f3560478534044e7fe0cb753ba775aad3e1e456cd"
+    },
+    {
+      "path": "contracts/fixtures/pipeline-run-summary-response.json",
+      "sha256": "48a5b9f5da9662d88343b62bcef1262a5e107d10d74bc0141c4e707d865b1949"
+    },
+    {
+      "path": "contracts/fixtures/property-request.json",
+      "sha256": "bb50b8b72489d89dcd093b969bd4c4c7a91663d3d21e5ef5f555558d7e8a2f8c"
+    },
+    {
+      "path": "contracts/fixtures/property-response.json",
+      "sha256": "60356df86e8ccbb3b5511808a12385ba992c2734847268537b866426ebb5d11e"
+    },
+    {
+      "path": "contracts/fixtures/query-schema-request.json",
+      "sha256": "eda216435d985138bfaf4bf04f57a1cef3f597dacbbfaa7b4a94c521cbc870e9"
+    },
+    {
+      "path": "contracts/fixtures/query-schema-response.json",
+      "sha256": "1a775c367ba873ab431903535ee386ea0ab804c6d7aee119685579c272882c59"
+    },
+    {
+      "path": "contracts/fixtures/search-request.json",
+      "sha256": "1c39b3b43c35e34e6cf6126166634e5d518a91153123f8554062f200ca095269"
+    },
+    {
+      "path": "contracts/fixtures/search-response.json",
+      "sha256": "465e401b0c9c1bf449c156244bddc323b9d24ac2174c98002f2dbdd8d2dbcc33"
+    },
+    {
+      "path": "contracts/fixtures/service-info-request.json",
+      "sha256": "3488c7f55527d6e2dbda6ae2c7232ae40c541ff4a21a83efa4af46c0a251b749"
+    },
+    {
+      "path": "contracts/fixtures/service-info-response.json",
+      "sha256": "d53b33cfaee38bfa0adba17c870b688a7b7417fbe835dc77952a825d708811df"
+    }
+  ],
+  "baselineCommit": null,
+  "baselineCommitStatus": "pending until this approved v1.2.0 revision is committed in a later authorized phase"
+}

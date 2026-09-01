@@ -1,0 +1,335 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.prismteam.ai/oracle/canonical/v1/schema.json",
+  "title": "Prism Oracle canonical data contract v1",
+  "description": "Canonical property, permit and pipeline-run records. Exact source values, normalized values, deterministic derivations and disclosed inferences remain distinct and evidence-backed.",
+  "oneOf": [
+    { "$ref": "#/$defs/CanonicalProperty" },
+    { "$ref": "#/$defs/CanonicalPermit" },
+    { "$ref": "#/$defs/PipelineRun" }
+  ],
+  "$defs": {
+    "Identifier": {
+      "type": "string",
+      "pattern": "^[a-z]+_[a-f0-9]{32}$"
+    },
+    "IsoDateTime": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "Derivation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule", "ruleVersion", "inputs"],
+      "properties": {
+        "rule": { "type": "string", "minLength": 1 },
+        "ruleVersion": { "type": "string", "minLength": 1 },
+        "asOf": { "$ref": "#/$defs/IsoDateTime" },
+        "inputs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      }
+    },
+    "Fact": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["availability", "value", "class", "evidenceRefs"],
+          "properties": {
+            "availability": { "const": "available" },
+            "value": true,
+            "class": { "enum": ["raw", "normalized", "derived", "inferred"] },
+            "evidenceRefs": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "derivation": { "$ref": "#/$defs/Derivation" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["availability", "value", "class", "reason", "evidenceRefs"],
+          "properties": {
+            "availability": { "const": "unavailable" },
+            "value": { "type": "null" },
+            "class": { "enum": ["raw", "normalized", "derived", "inferred"] },
+            "reason": {
+              "enum": [
+                "not_provided_by_source",
+                "source_not_collected",
+                "source_unavailable",
+                "not_applicable",
+                "ambiguous_match"
+              ]
+            },
+            "evidenceRefs": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "uniqueItems": true
+            }
+          }
+        }
+      ]
+    },
+    "Evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidenceId",
+        "sourceSystem",
+        "sourceName",
+        "sourceRecordKey",
+        "sourceUrl",
+        "sourceArtifactUri",
+        "sourceRecordHash",
+        "observedAt",
+        "retrievedAt",
+        "loadedAt",
+        "publishedCid"
+      ],
+      "properties": {
+        "evidenceId": { "type": "string", "minLength": 1 },
+        "sourceSystem": { "type": "string", "minLength": 1 },
+        "sourceName": { "type": "string", "minLength": 1 },
+        "sourceRecordKey": { "type": "string", "minLength": 1 },
+        "sourceUrl": { "type": ["string", "null"], "format": "uri" },
+        "sourceArtifactUri": { "type": "string", "format": "uri" },
+        "sourceRecordHash": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "observedAt": {
+          "oneOf": [
+            { "$ref": "#/$defs/IsoDateTime" },
+            { "type": "null" }
+          ]
+        },
+        "retrievedAt": { "$ref": "#/$defs/IsoDateTime" },
+        "loadedAt": { "$ref": "#/$defs/IsoDateTime" },
+        "publishedCid": { "type": ["string", "null"] }
+      }
+    },
+    "Freshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observedAt",
+        "retrievedAt",
+        "loadedAt",
+        "publishedAt",
+        "computedAt",
+        "sourceCadence"
+      ],
+      "properties": {
+        "observedAt": {
+          "oneOf": [
+            { "$ref": "#/$defs/IsoDateTime" },
+            { "type": "null" }
+          ]
+        },
+        "retrievedAt": { "$ref": "#/$defs/IsoDateTime" },
+        "loadedAt": { "$ref": "#/$defs/IsoDateTime" },
+        "publishedAt": {
+          "oneOf": [
+            { "$ref": "#/$defs/IsoDateTime" },
+            { "type": "null" }
+          ]
+        },
+        "computedAt": { "$ref": "#/$defs/IsoDateTime" },
+        "sourceCadence": { "type": ["string", "null"] }
+      }
+    },
+    "CanonicalPermit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entityType",
+        "contractVersion",
+        "permitId",
+        "propertyId",
+        "sourceRecordKey",
+        "permitNumber",
+        "rawStatus",
+        "normalizedStatus",
+        "applicationDate",
+        "issueDate",
+        "finalDate",
+        "closeDate",
+        "isOpen",
+        "openStartDate",
+        "openDurationDays",
+        "roofingRelevance",
+        "contractor",
+        "bbbReputation",
+        "businessIdentity",
+        "evidence",
+        "freshness"
+      ],
+      "properties": {
+        "entityType": { "const": "permit" },
+        "contractVersion": { "const": "1.0.0" },
+        "permitId": { "$ref": "#/$defs/Identifier" },
+        "propertyId": { "$ref": "#/$defs/Identifier" },
+        "sourceRecordKey": { "type": "string", "minLength": 1 },
+        "permitNumber": { "$ref": "#/$defs/Fact" },
+        "rawStatus": { "$ref": "#/$defs/Fact" },
+        "normalizedStatus": { "$ref": "#/$defs/Fact" },
+        "applicationDate": { "$ref": "#/$defs/Fact" },
+        "issueDate": { "$ref": "#/$defs/Fact" },
+        "finalDate": { "$ref": "#/$defs/Fact" },
+        "closeDate": { "$ref": "#/$defs/Fact" },
+        "isOpen": { "$ref": "#/$defs/Fact" },
+        "openStartDate": { "$ref": "#/$defs/Fact" },
+        "openDurationDays": { "$ref": "#/$defs/Fact" },
+        "roofingRelevance": { "$ref": "#/$defs/Fact" },
+        "contractor": { "$ref": "#/$defs/Fact" },
+        "bbbReputation": { "$ref": "#/$defs/Fact" },
+        "businessIdentity": { "$ref": "#/$defs/Fact" },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Evidence" },
+          "minItems": 1
+        },
+        "freshness": { "$ref": "#/$defs/Freshness" }
+      }
+    },
+    "CanonicalProperty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entityType",
+        "contractVersion",
+        "propertyId",
+        "parcelId",
+        "county",
+        "sourceSystem",
+        "folio",
+        "parcelIdentifier",
+        "situsAddress",
+        "coordinates",
+        "yearBuilt",
+        "roofInstallationDate",
+        "roofInstallationYear",
+        "roofAgeSignal",
+        "ownership",
+        "permits",
+        "evidence",
+        "freshness"
+      ],
+      "properties": {
+        "entityType": { "const": "property" },
+        "contractVersion": { "const": "1.0.0" },
+        "propertyId": { "$ref": "#/$defs/Identifier" },
+        "parcelId": { "$ref": "#/$defs/Identifier" },
+        "county": { "const": "pasco" },
+        "sourceSystem": { "const": "pasco_appraiser" },
+        "folio": { "$ref": "#/$defs/Fact" },
+        "parcelIdentifier": { "$ref": "#/$defs/Fact" },
+        "situsAddress": { "$ref": "#/$defs/Fact" },
+        "coordinates": { "$ref": "#/$defs/Fact" },
+        "yearBuilt": {
+          "description": "Building construction year. It never populates roofInstallationYear.",
+          "$ref": "#/$defs/Fact"
+        },
+        "roofInstallationDate": { "$ref": "#/$defs/Fact" },
+        "roofInstallationYear": { "$ref": "#/$defs/Fact" },
+        "roofAgeSignal": {
+          "description": "A distinct direct or proxy signal with an explicit basis.",
+          "$ref": "#/$defs/Fact"
+        },
+        "ownership": { "$ref": "#/$defs/Fact" },
+        "permits": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CanonicalPermit" }
+        },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Evidence" },
+          "minItems": 1
+        },
+        "freshness": { "$ref": "#/$defs/Freshness" }
+      }
+    },
+    "PipelineRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entityType",
+        "contractVersion",
+        "runId",
+        "workflowId",
+        "county",
+        "windowStart",
+        "windowEnd",
+        "status",
+        "startedAt",
+        "completedAt",
+        "sources",
+        "limitations",
+        "publication"
+      ],
+      "properties": {
+        "entityType": { "const": "pipeline-run" },
+        "contractVersion": { "const": "1.0.0" },
+        "runId": { "$ref": "#/$defs/Identifier" },
+        "workflowId": { "type": "string", "minLength": 1 },
+        "county": { "const": "pasco" },
+        "windowStart": { "$ref": "#/$defs/IsoDateTime" },
+        "windowEnd": { "$ref": "#/$defs/IsoDateTime" },
+        "status": { "enum": ["running", "completed", "partial", "failed"] },
+        "startedAt": { "$ref": "#/$defs/IsoDateTime" },
+        "completedAt": {
+          "oneOf": [
+            { "$ref": "#/$defs/IsoDateTime" },
+            { "type": "null" }
+          ]
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["source", "captured", "loaded", "new", "changed", "unchanged", "deleted"],
+            "properties": {
+              "source": { "type": "string", "minLength": 1 },
+              "captured": { "type": "integer", "minimum": 0 },
+              "loaded": { "type": "integer", "minimum": 0 },
+              "new": { "type": "integer", "minimum": 0 },
+              "changed": { "type": "integer", "minimum": 0 },
+              "unchanged": { "type": "integer", "minimum": 0 },
+              "deleted": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "limitations": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "publication": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "planHash", "artifactCids"],
+          "properties": {
+            "status": { "enum": ["not_requested", "dry_run", "approved", "published", "failed"] },
+            "planHash": {
+              "type": ["string", "null"],
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "artifactCids": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "uniqueItems": true
+            }
+          }
+        }
+      }
+    }
+  }
+}

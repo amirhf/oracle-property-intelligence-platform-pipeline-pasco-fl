@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "version": 1,
+  "policy": {
+    "controllerPhaseVendorCopy": false,
+    "requiredSiblingRuntime": false,
+    "excludedFromFutureSnapshots": [
+      ".git",
+      "node_modules",
+      "build-output",
+      "caches",
+      "local-data",
+      "environment-files",
+      "secrets",
+      "unrelated-generated-artifacts"
+    ],
+    "pinnedGitDependencyFallback": "Allowed only after a fresh isolated clone proves build and deployment without sibling paths."
+  },
+  "upstreams": [
+    {
+      "name": "elephant-query-db",
+      "sourceUrl": "https://github.com/elephant-xyz/elephant-query-db.git",
+      "commit": "15187e2d8709115635620ea7113e915b1e9a0651",
+      "tree": "fbed821490ebb9c858bef174430ffb12f869e599",
+      "licensePreservationRequired": true,
+      "controllerPhaseState": "reference-only"
+    },
+    {
+      "name": "elephant-mcp",
+      "sourceUrl": "https://github.com/elephant-xyz/elephant-mcp.git",
+      "commit": "0d61c83f9e166c9da5c5945641a2e322949dd8c1",
+      "tree": "702fa69feb708bc8ac7f114b8e7b7f47030c8af5",
+      "licensePreservationRequired": true,
+      "controllerPhaseState": "reference-only"
+    },
+    {
+      "name": "Counties-trasform-scripts/pasco",
+      "sourceUrl": "https://github.com/elephant-xyz/Counties-trasform-scripts.git",
+      "commit": "438fe3b59fb5538ac516cb65da0c86edc5d4390c",
+      "tree": "63b115deb2f687cc67cd511776a1f96242896b0b",
+      "licensePreservationRequired": true,
+      "controllerPhaseState": "reference-only"
+    },
+    {
+      "name": "soofi-xyz-team-kit",
+      "sourceUrl": "https://github.com/soofi-xyz/soofi-xyz-team-kit.git",
+      "commit": "6a41052c95b1be3b935bb409ce2d9d190ed41390",
+      "tree": "d6992b15baa1e02d0e236a1f581fc7b05f14d53c",
+      "licensePreservationRequired": true,
+      "controllerPhaseState": "guidance-only"
+    }
+  ]
+}

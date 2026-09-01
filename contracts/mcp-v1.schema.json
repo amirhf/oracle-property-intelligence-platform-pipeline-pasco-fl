@@ -1,0 +1,1351 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.prismteam.ai/oracle/mcp/v1/schema.json",
+  "title": "Prism Oracle MCP v1.2 contract fixtures",
+  "description": "Normative schemas for the structured MCP v1.2 tool inputs, outputs, evidence, pagination and partial-data behavior. The document root validates committed contract fixtures; the $defs are the runtime contract.",
+  "oneOf": [
+    { "$ref": "#/$defs/ServiceInfoRequestFixture" },
+    { "$ref": "#/$defs/ServiceInfoResponseFixture" },
+    { "$ref": "#/$defs/PipelineRunSummaryRequestFixture" },
+    { "$ref": "#/$defs/PipelineRunSummaryResponseFixture" },
+    { "$ref": "#/$defs/SearchRequestFixture" },
+    { "$ref": "#/$defs/SearchResponseFixture" },
+    { "$ref": "#/$defs/PropertyRequestFixture" },
+    { "$ref": "#/$defs/PropertyResponseFixture" },
+    { "$ref": "#/$defs/PermitRequestFixture" },
+    { "$ref": "#/$defs/PermitResponseFixture" },
+    { "$ref": "#/$defs/QuerySchemaRequestFixture" },
+    { "$ref": "#/$defs/QuerySchemaResponseFixture" },
+    { "$ref": "#/$defs/ErrorResponseFixture" }
+  ],
+  "$defs": {
+    "ContractVersion": {
+      "const": "1.2.0"
+    },
+    "SchemaHash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "Identifier": {
+      "type": "string",
+      "pattern": "^[a-z]+_[a-f0-9]{32}$"
+    },
+    "ToolName": {
+      "enum": [
+        "prism_v1_get_service_info",
+        "prism_v1_get_pipeline_run_summary",
+        "prism_v1_search_roofing_opportunities",
+        "prism_v1_get_property",
+        "prism_v1_get_permit",
+        "prism_v1_get_query_schema"
+      ]
+    },
+    "SupportedToolNames": {
+      "const": [
+        "prism_v1_get_service_info",
+        "prism_v1_get_pipeline_run_summary",
+        "prism_v1_search_roofing_opportunities",
+        "prism_v1_get_property",
+        "prism_v1_get_permit",
+        "prism_v1_get_query_schema"
+      ]
+    },
+    "IsoDateTime": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "Derivation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule", "ruleVersion", "inputs"],
+      "properties": {
+        "rule": { "type": "string", "minLength": 1 },
+        "ruleVersion": { "type": "string", "minLength": 1 },
+        "asOf": { "$ref": "#/$defs/IsoDateTime" },
+        "inputs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      }
+    },
+    "AvailableFact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["availability", "value", "class", "evidenceRefs"],
+      "properties": {
+        "availability": { "const": "available" },
+        "value": true,
+        "class": {
+          "enum": ["raw", "normalized", "derived", "inferred"]
+        },
+        "evidenceRefs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "derivation": { "$ref": "#/$defs/Derivation" }
+      }
+    },
+    "UnavailableFact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["availability", "value", "class", "reason", "evidenceRefs"],
+      "properties": {
+        "availability": { "const": "unavailable" },
+        "value": { "type": "null" },
+        "class": {
+          "enum": ["raw", "normalized", "derived", "inferred"]
+        },
+        "reason": {
+          "enum": [
+            "not_provided_by_source",
+            "source_not_collected",
+            "source_unavailable",
+            "not_applicable",
+            "ambiguous_match"
+          ]
+        },
+        "evidenceRefs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "Fact": {
+      "description": "The wrapper is strict. The value payload is intentionally field-specific and is constrained by the containing entity where needed.",
+      "oneOf": [
+        { "$ref": "#/$defs/AvailableFact" },
+        { "$ref": "#/$defs/UnavailableFact" }
+      ]
+    },
+    "SourceUnavailableFact": {
+      "allOf": [
+        { "$ref": "#/$defs/UnavailableFact" },
+        {
+          "properties": {
+            "class": { "enum": ["raw", "normalized"] }
+          }
+        }
+      ]
+    },
+    "SourceBackedTextAvailableFact": {
+      "allOf": [
+        { "$ref": "#/$defs/AvailableFact" },
+        {
+          "properties": {
+            "value": { "type": "string", "minLength": 1, "maxLength": 500 },
+            "class": { "enum": ["raw", "normalized"] },
+            "derivation": false
+          }
+        }
+      ]
+    },
+    "SourceBackedTextFact": {
+      "oneOf": [
+        { "$ref": "#/$defs/SourceBackedTextAvailableFact" },
+        { "$ref": "#/$defs/SourceUnavailableFact" }
+      ]
+    },
+    "SourceBackedEmailAvailableFact": {
+      "allOf": [
+        { "$ref": "#/$defs/SourceBackedTextAvailableFact" },
+        {
+          "properties": {
+            "value": {
+              "type": "string",
+              "format": "email",
+              "maxLength": 320
+            }
+          }
+        }
+      ]
+    },
+    "SourceBackedEmailFact": {
+      "oneOf": [
+        { "$ref": "#/$defs/SourceBackedEmailAvailableFact" },
+        { "$ref": "#/$defs/SourceUnavailableFact" }
+      ]
+    },
+    "SourceBackedStringListAvailableFact": {
+      "allOf": [
+        { "$ref": "#/$defs/AvailableFact" },
+        {
+          "properties": {
+            "value": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1, "maxLength": 200 },
+              "minItems": 1,
+              "maxItems": 4,
+              "uniqueItems": true
+            },
+            "class": { "enum": ["raw", "normalized"] },
+            "derivation": false
+          }
+        }
+      ]
+    },
+    "SourceBackedStringListFact": {
+      "oneOf": [
+        { "$ref": "#/$defs/SourceBackedStringListAvailableFact" },
+        { "$ref": "#/$defs/SourceUnavailableFact" }
+      ]
+    },
+    "OwnerDisplayName": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["displayName", "evidenceRefs"],
+      "properties": {
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "evidenceRefs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      }
+    },
+    "CurrentOwnersAvailableFact": {
+      "allOf": [
+        { "$ref": "#/$defs/AvailableFact" },
+        {
+          "properties": {
+            "value": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/OwnerDisplayName" },
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "class": { "enum": ["raw", "normalized"] },
+            "derivation": false
+          }
+        }
+      ]
+    },
+    "CurrentOwnersFact": {
+      "oneOf": [
+        { "$ref": "#/$defs/CurrentOwnersAvailableFact" },
+        { "$ref": "#/$defs/SourceUnavailableFact" }
+      ]
+    },
+    "PublicMailingAddressValue": {
+      "description": "A public-record mailing address. Every component has its own availability and provenance; it is distinct from the property situs address.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["addressLines", "locality", "region", "postalCode", "country"],
+      "properties": {
+        "addressLines": { "$ref": "#/$defs/SourceBackedStringListFact" },
+        "locality": { "$ref": "#/$defs/SourceBackedTextFact" },
+        "region": { "$ref": "#/$defs/SourceBackedTextFact" },
+        "postalCode": { "$ref": "#/$defs/SourceBackedTextFact" },
+        "country": { "$ref": "#/$defs/SourceBackedTextFact" }
+      }
+    },
+    "PublicMailingAddressAvailableFact": {
+      "allOf": [
+        { "$ref": "#/$defs/AvailableFact" },
+        {
+          "properties": {
+            "value": { "$ref": "#/$defs/PublicMailingAddressValue" },
+            "class": { "enum": ["raw", "normalized"] },
+            "derivation": false
+          }
+        }
+      ]
+    },
+    "PublicMailingAddressFact": {
+      "oneOf": [
+        { "$ref": "#/$defs/PublicMailingAddressAvailableFact" },
+        { "$ref": "#/$defs/SourceUnavailableFact" }
+      ]
+    },
+    "OwnerContactPrivacy": {
+      "description": "Publication metadata describes provenance and approval, not independent verification or a correctness guarantee.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recordNature", "publicationStatus", "accuracyQualification"],
+      "properties": {
+        "recordNature": { "const": "official_public_record" },
+        "publicationStatus": { "const": "approved_for_publication" },
+        "accuracyQualification": {
+          "const": "source_reported_not_independently_verified"
+        }
+      }
+    },
+    "PublicOwnership": {
+      "description": "Owner-approved public-record projection. classification is a source field and does not reinterpret ownerArea; no acquisition date is inferred.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "currentOwners",
+        "classification",
+        "publicMailingAddress",
+        "phone",
+        "email",
+        "privacy"
+      ],
+      "properties": {
+        "currentOwners": { "$ref": "#/$defs/CurrentOwnersFact" },
+        "classification": { "$ref": "#/$defs/SourceBackedTextFact" },
+        "publicMailingAddress": { "$ref": "#/$defs/PublicMailingAddressFact" },
+        "phone": { "$ref": "#/$defs/SourceBackedTextFact" },
+        "email": { "$ref": "#/$defs/SourceBackedEmailFact" },
+        "privacy": { "$ref": "#/$defs/OwnerContactPrivacy" }
+      }
+    },
+    "Evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidenceId",
+        "sourceSystem",
+        "sourceName",
+        "sourceRecordKey",
+        "sourceUrl",
+        "sourceArtifactUri",
+        "sourceRecordHash",
+        "observedAt",
+        "retrievedAt",
+        "loadedAt",
+        "publishedCid"
+      ],
+      "properties": {
+        "evidenceId": { "type": "string", "minLength": 1 },
+        "sourceSystem": { "type": "string", "minLength": 1 },
+        "sourceName": { "type": "string", "minLength": 1 },
+        "sourceRecordKey": { "type": "string", "minLength": 1 },
+        "sourceUrl": {
+          "type": ["string", "null"],
+          "format": "uri"
+        },
+        "sourceArtifactUri": { "type": "string", "format": "uri" },
+        "sourceRecordHash": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "observedAt": {
+          "oneOf": [
+            { "$ref": "#/$defs/IsoDateTime" },
+            { "type": "null" }
+          ]
+        },
+        "retrievedAt": { "$ref": "#/$defs/IsoDateTime" },
+        "loadedAt": { "$ref": "#/$defs/IsoDateTime" },
+        "publishedCid": {
+          "type": ["string", "null"],
+          "minLength": 1
+        }
+      }
+    },
+    "Freshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observedAt",
+        "retrievedAt",
+        "loadedAt",
+        "publishedAt",
+        "computedAt",
+        "sourceCadence",
+        "cadenceStatus"
+      ],
+      "properties": {
+        "observedAt": {
+          "oneOf": [
+            { "$ref": "#/$defs/IsoDateTime" },
+            { "type": "null" }
+          ]
+        },
+        "retrievedAt": { "$ref": "#/$defs/IsoDateTime" },
+        "loadedAt": { "$ref": "#/$defs/IsoDateTime" },
+        "publishedAt": {
+          "oneOf": [
+            { "$ref": "#/$defs/IsoDateTime" },
+            { "type": "null" }
+          ]
+        },
+        "computedAt": { "$ref": "#/$defs/IsoDateTime" },
+        "sourceCadence": { "type": ["string", "null"] },
+        "cadenceStatus": {
+          "enum": [
+            "within_source_cadence",
+            "past_source_cadence",
+            "cadence_unknown"
+          ]
+        }
+      }
+    },
+    "Coordinates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["latitude", "longitude", "crs"],
+      "properties": {
+        "latitude": { "type": "number", "minimum": -90, "maximum": 90 },
+        "longitude": { "type": "number", "minimum": -180, "maximum": 180 },
+        "crs": { "const": "EPSG:4326" }
+      }
+    },
+    "RoofAgeSignal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ageYears", "precision", "basis", "basisQuality", "asOf"],
+      "properties": {
+        "ageYears": { "type": "integer", "minimum": 0, "maximum": 500 },
+        "precision": { "enum": ["day", "year"] },
+        "basis": {
+          "enum": [
+            "roof_installation_date",
+            "roof_permit_completion",
+            "final_inspection",
+            "roof_permit_issue",
+            "year_built_proxy"
+          ]
+        },
+        "basisQuality": { "enum": ["direct", "proxy"] },
+        "asOf": { "$ref": "#/$defs/IsoDateTime" }
+      }
+    },
+    "Permit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "permitId",
+        "propertyId",
+        "permitNumber",
+        "status",
+        "isOpen",
+        "openDurationDays",
+        "roofingRelevance",
+        "contractor",
+        "bbbRating",
+        "evidence",
+        "freshness"
+      ],
+      "properties": {
+        "permitId": { "$ref": "#/$defs/Identifier" },
+        "propertyId": { "$ref": "#/$defs/Identifier" },
+        "permitNumber": { "$ref": "#/$defs/Fact" },
+        "status": { "$ref": "#/$defs/Fact" },
+        "isOpen": { "$ref": "#/$defs/Fact" },
+        "openDurationDays": { "$ref": "#/$defs/Fact" },
+        "roofingRelevance": { "$ref": "#/$defs/Fact" },
+        "contractor": { "$ref": "#/$defs/Fact" },
+        "bbbRating": { "$ref": "#/$defs/Fact" },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Evidence" },
+          "minItems": 1
+        },
+        "freshness": { "$ref": "#/$defs/Freshness" }
+      }
+    },
+    "Property": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "propertyId",
+        "county",
+        "folio",
+        "address",
+        "coordinates",
+        "yearBuilt",
+        "roofInstallationDate",
+        "roofAgeSignal",
+        "ownershipDurationYears",
+        "ownerArea",
+        "ownership",
+        "openRoofingPermitCount",
+        "maximumOpenRoofingPermitDays",
+        "permits",
+        "evidence",
+        "freshness"
+      ],
+      "properties": {
+        "propertyId": { "$ref": "#/$defs/Identifier" },
+        "county": { "const": "pasco" },
+        "folio": { "$ref": "#/$defs/Fact" },
+        "address": { "$ref": "#/$defs/Fact" },
+        "coordinates": { "$ref": "#/$defs/Fact" },
+        "yearBuilt": { "$ref": "#/$defs/Fact" },
+        "roofInstallationDate": { "$ref": "#/$defs/Fact" },
+        "roofAgeSignal": { "$ref": "#/$defs/Fact" },
+        "ownershipDurationYears": { "$ref": "#/$defs/Fact" },
+        "ownerArea": { "$ref": "#/$defs/Fact" },
+        "ownership": { "$ref": "#/$defs/PublicOwnership" },
+        "openRoofingPermitCount": { "$ref": "#/$defs/Fact" },
+        "maximumOpenRoofingPermitDays": { "$ref": "#/$defs/Fact" },
+        "permits": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Permit" },
+          "maxItems": 100
+        },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Evidence" },
+          "minItems": 1
+        },
+        "freshness": { "$ref": "#/$defs/Freshness" }
+      }
+    },
+    "ResponseMeta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contractVersion",
+        "schemaHash",
+        "county",
+        "asOf",
+        "artifactCids",
+        "nextCursor"
+      ],
+      "properties": {
+        "contractVersion": { "$ref": "#/$defs/ContractVersion" },
+        "schemaHash": { "$ref": "#/$defs/SchemaHash" },
+        "county": { "const": "pasco" },
+        "asOf": { "$ref": "#/$defs/IsoDateTime" },
+        "artifactCids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "nextCursor": { "type": ["string", "null"] }
+      }
+    },
+    "EmptyArguments": {
+      "type": "object",
+      "additionalProperties": false
+    },
+    "ServiceInfoArguments": {
+      "$ref": "#/$defs/EmptyArguments"
+    },
+    "PipelineRunSummaryArguments": {
+      "$ref": "#/$defs/EmptyArguments"
+    },
+    "QuerySchemaArguments": {
+      "$ref": "#/$defs/EmptyArguments"
+    },
+    "PropertyIdentifier": {
+      "type": "string",
+      "pattern": "^prop_[a-f0-9]{32}$"
+    },
+    "PermitIdentifier": {
+      "type": "string",
+      "pattern": "^perm_[a-f0-9]{32}$"
+    },
+    "PropertyArguments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["propertyId"],
+      "properties": {
+        "propertyId": { "$ref": "#/$defs/PropertyIdentifier" }
+      }
+    },
+    "PermitArguments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["permitId"],
+      "properties": {
+        "permitId": { "$ref": "#/$defs/PermitIdentifier" }
+      }
+    },
+    "ServiceInfoData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "serviceVersion",
+        "contractVersion",
+        "activeContractHash",
+        "county",
+        "dataset",
+        "supportedTools"
+      ],
+      "properties": {
+        "serviceVersion": { "type": "string", "minLength": 1 },
+        "contractVersion": { "$ref": "#/$defs/ContractVersion" },
+        "activeContractHash": { "$ref": "#/$defs/SchemaHash" },
+        "county": { "const": "pasco" },
+        "dataset": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "freshness"],
+          "properties": {
+            "version": { "type": "string", "minLength": 1 },
+            "freshness": { "$ref": "#/$defs/Freshness" }
+          }
+        },
+        "supportedTools": { "$ref": "#/$defs/SupportedToolNames" }
+      }
+    },
+    "ServiceInfoSuccessResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "data", "meta"],
+      "properties": {
+        "ok": { "const": true },
+        "data": { "$ref": "#/$defs/ServiceInfoData" },
+        "meta": { "$ref": "#/$defs/ResponseMeta" }
+      }
+    },
+    "ServiceInfoRequestFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "arguments"],
+      "properties": {
+        "fixtureType": { "const": "service-info-request" },
+        "tool": { "const": "prism_v1_get_service_info" },
+        "arguments": { "$ref": "#/$defs/ServiceInfoArguments" }
+      }
+    },
+    "ServiceInfoResponseFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "result"],
+      "properties": {
+        "fixtureType": { "const": "service-info-response" },
+        "tool": { "const": "prism_v1_get_service_info" },
+        "result": { "$ref": "#/$defs/ServiceInfoSuccessResult" }
+      }
+    },
+    "SourceCount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceSystem",
+        "sourceRecords",
+        "parsedRecords",
+        "acceptedRecords",
+        "rejectedRecords"
+      ],
+      "properties": {
+        "sourceSystem": { "type": "string", "minLength": 1 },
+        "sourceRecords": { "type": "integer", "minimum": 0 },
+        "parsedRecords": { "type": "integer", "minimum": 0 },
+        "acceptedRecords": { "type": "integer", "minimum": 0 },
+        "rejectedRecords": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "ReconciliationCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "canonicalProperties",
+        "distinctPropertyIds",
+        "newRecords",
+        "changedRecords",
+        "unchangedRecords",
+        "duplicateRecords"
+      ],
+      "properties": {
+        "canonicalProperties": { "type": "integer", "minimum": 0 },
+        "distinctPropertyIds": { "type": "integer", "minimum": 0 },
+        "newRecords": { "type": "integer", "minimum": 0 },
+        "changedRecords": { "type": "integer", "minimum": 0 },
+        "unchangedRecords": { "type": "integer", "minimum": 0 },
+        "duplicateRecords": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "CountCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "unavailable"],
+      "properties": {
+        "available": { "type": "integer", "minimum": 0 },
+        "unavailable": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "RoofSignalCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "unavailable", "direct", "proxy"],
+      "properties": {
+        "available": { "type": "integer", "minimum": 0 },
+        "unavailable": { "type": "integer", "minimum": 0 },
+        "direct": { "type": "integer", "minimum": 0 },
+        "proxy": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "SourceCoverage": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "recordCount",
+            "propertyCount",
+            "unavailableReason"
+          ],
+          "properties": {
+            "status": { "enum": ["available", "partial"] },
+            "recordCount": { "type": "integer", "minimum": 0 },
+            "propertyCount": { "type": "integer", "minimum": 0 },
+            "unavailableReason": { "type": "null" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "recordCount",
+            "propertyCount",
+            "unavailableReason"
+          ],
+          "properties": {
+            "status": { "const": "unavailable" },
+            "recordCount": { "type": "null" },
+            "propertyCount": { "type": "null" },
+            "unavailableReason": {
+              "enum": [
+                "not_provided_by_source",
+                "source_not_collected",
+                "source_unavailable",
+                "not_applicable",
+                "ambiguous_match"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "PublicationArtifactState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "datasetVersion",
+        "artifactCount",
+        "publishedAt",
+        "artifactCids"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "not_generated",
+            "dry_run_validated",
+            "published",
+            "unavailable"
+          ]
+        },
+        "datasetVersion": { "type": ["string", "null"], "minLength": 1 },
+        "artifactCount": { "type": ["integer", "null"], "minimum": 0 },
+        "publishedAt": {
+          "oneOf": [
+            { "$ref": "#/$defs/IsoDateTime" },
+            { "type": "null" }
+          ]
+        },
+        "artifactCids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "UnavailableSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceSystem", "reason", "message"],
+      "properties": {
+        "sourceSystem": { "type": "string", "minLength": 1 },
+        "reason": {
+          "enum": [
+            "not_provided_by_source",
+            "source_not_collected",
+            "source_unavailable",
+            "not_applicable",
+            "ambiguous_match"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    },
+    "PipelineRunSummaryData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "county",
+        "runId",
+        "workflowId",
+        "status",
+        "startedAt",
+        "completedAt",
+        "sourceCounts",
+        "reconciliationCounts",
+        "coverage",
+        "publicationArtifacts",
+        "unavailableSources"
+      ],
+      "properties": {
+        "county": { "const": "pasco" },
+        "runId": { "$ref": "#/$defs/Identifier" },
+        "workflowId": { "type": "string", "minLength": 1 },
+        "status": { "const": "completed" },
+        "startedAt": { "$ref": "#/$defs/IsoDateTime" },
+        "completedAt": { "$ref": "#/$defs/IsoDateTime" },
+        "sourceCounts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SourceCount" },
+          "minItems": 1
+        },
+        "reconciliationCounts": { "$ref": "#/$defs/ReconciliationCounts" },
+        "coverage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "properties",
+            "coordinates",
+            "roofSignals",
+            "permits",
+            "contractors"
+          ],
+          "properties": {
+            "properties": { "$ref": "#/$defs/CountCoverage" },
+            "coordinates": { "$ref": "#/$defs/CountCoverage" },
+            "roofSignals": { "$ref": "#/$defs/RoofSignalCoverage" },
+            "permits": { "$ref": "#/$defs/SourceCoverage" },
+            "contractors": { "$ref": "#/$defs/SourceCoverage" }
+          }
+        },
+        "publicationArtifacts": {
+          "$ref": "#/$defs/PublicationArtifactState"
+        },
+        "unavailableSources": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/UnavailableSource" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "PipelineRunSummarySuccessResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "data", "meta"],
+      "properties": {
+        "ok": { "const": true },
+        "data": { "$ref": "#/$defs/PipelineRunSummaryData" },
+        "meta": { "$ref": "#/$defs/ResponseMeta" }
+      }
+    },
+    "PipelineRunSummaryRequestFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "arguments"],
+      "properties": {
+        "fixtureType": { "const": "pipeline-run-summary-request" },
+        "tool": { "const": "prism_v1_get_pipeline_run_summary" },
+        "arguments": { "$ref": "#/$defs/PipelineRunSummaryArguments" }
+      }
+    },
+    "PipelineRunSummaryResponseFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "result"],
+      "properties": {
+        "fixtureType": { "const": "pipeline-run-summary-response" },
+        "tool": { "const": "prism_v1_get_pipeline_run_summary" },
+        "result": { "$ref": "#/$defs/PipelineRunSummarySuccessResult" }
+      }
+    },
+    "QueryCapabilitiesData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "searchableFields",
+        "filterBounds",
+        "allowedSortKeys",
+        "pagination",
+        "roofAgeSemantics",
+        "coverageSemantics",
+        "queryRestrictions"
+      ],
+      "properties": {
+        "searchableFields": {
+          "const": [
+            "coordinates",
+            "roofAgeSignal.ageYears",
+            "roofAgeSignal.basis",
+            "permit.isOpen",
+            "permit.openDurationDays",
+            "ownershipDurationYears",
+            "ownerArea",
+            "freshness.observedAt",
+            "freshness.publishedAt"
+          ]
+        },
+        "filterBounds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "radius",
+            "roofAgeYears",
+            "permitOpenDays",
+            "ownershipYears"
+          ],
+          "properties": {
+            "radius": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "units",
+                "exclusiveMinimum",
+                "maximumMiles",
+                "maximumKilometers"
+              ],
+              "properties": {
+                "units": { "const": ["mi", "km"] },
+                "exclusiveMinimum": { "const": 0 },
+                "maximumMiles": { "const": 50 },
+                "maximumKilometers": { "const": 80.4672 }
+              }
+            },
+            "roofAgeYears": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["minimum", "maximum", "operators", "bases"],
+              "properties": {
+                "minimum": { "const": 0 },
+                "maximum": { "const": 100 },
+                "operators": { "const": ["gt", "gte"] },
+                "bases": { "const": ["direct_only", "direct_or_proxy"] }
+              }
+            },
+            "permitOpenDays": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["minimum", "maximum"],
+              "properties": {
+                "minimum": { "const": 0 },
+                "maximum": { "const": 36500 }
+              }
+            },
+            "ownershipYears": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["minimum", "maximum", "operators"],
+              "properties": {
+                "minimum": { "const": 0 },
+                "maximum": { "const": 500 },
+                "operators": { "const": ["gt", "gte"] }
+              }
+            }
+          }
+        },
+        "allowedSortKeys": {
+          "const": [
+            "distance_asc",
+            "roof_age_desc",
+            "permit_open_days_desc"
+          ]
+        },
+        "pagination": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["minimumLimit", "maximumLimit", "cursor", "stableOrdering"],
+          "properties": {
+            "minimumLimit": { "const": 1 },
+            "maximumLimit": { "const": 100 },
+            "cursor": { "const": "opaque" },
+            "stableOrdering": { "const": true }
+          }
+        },
+        "roofAgeSemantics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "actualBasis",
+            "proxyBases",
+            "yearBuiltProxyIsActualRoofAge"
+          ],
+          "properties": {
+            "actualBasis": { "const": "roof_installation_date" },
+            "proxyBases": {
+              "const": [
+                "roof_permit_completion",
+                "final_inspection",
+                "roof_permit_issue",
+                "year_built_proxy"
+              ]
+            },
+            "yearBuiltProxyIsActualRoofAge": { "const": false }
+          }
+        },
+        "coverageSemantics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["coordinates", "permits", "contractors"],
+          "properties": {
+            "coordinates": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "missingExcludedFromRadius",
+                "directLookupPreservesUnavailable"
+              ],
+              "properties": {
+                "missingExcludedFromRadius": { "const": true },
+                "directLookupPreservesUnavailable": { "const": true }
+              }
+            },
+            "permits": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "unavailableDistinctFromZeroMatches",
+                "aggregatesNullWhenUnavailable"
+              ],
+              "properties": {
+                "unavailableDistinctFromZeroMatches": { "const": true },
+                "aggregatesNullWhenUnavailable": { "const": true }
+              }
+            },
+            "contractors": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["unavailableDistinctFromNoMatch"],
+              "properties": {
+                "unavailableDistinctFromNoMatch": { "const": true }
+              }
+            }
+          }
+        },
+        "queryRestrictions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "arbitrarySql",
+            "arbitraryFilesystemPaths",
+            "databaseAccess",
+            "publicationMutation",
+            "internalSchemaExposure"
+          ],
+          "properties": {
+            "arbitrarySql": { "const": false },
+            "arbitraryFilesystemPaths": { "const": false },
+            "databaseAccess": { "const": false },
+            "publicationMutation": { "const": false },
+            "internalSchemaExposure": { "const": false }
+          }
+        }
+      }
+    },
+    "QuerySchemaSuccessResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "data", "meta"],
+      "properties": {
+        "ok": { "const": true },
+        "data": { "$ref": "#/$defs/QueryCapabilitiesData" },
+        "meta": { "$ref": "#/$defs/ResponseMeta" }
+      }
+    },
+    "QuerySchemaRequestFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "arguments"],
+      "properties": {
+        "fixtureType": { "const": "query-schema-request" },
+        "tool": { "const": "prism_v1_get_query_schema" },
+        "arguments": { "$ref": "#/$defs/QuerySchemaArguments" }
+      }
+    },
+    "QuerySchemaResponseFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "result"],
+      "properties": {
+        "fixtureType": { "const": "query-schema-response" },
+        "tool": { "const": "prism_v1_get_query_schema" },
+        "result": { "$ref": "#/$defs/QuerySchemaSuccessResult" }
+      }
+    },
+    "SearchArguments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["county", "center", "radius", "filters", "sort", "page"],
+      "properties": {
+        "county": { "const": "pasco" },
+        "center": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "latitude", "longitude"],
+              "properties": {
+                "kind": { "const": "coordinates" },
+                "latitude": { "type": "number", "minimum": -90, "maximum": 90 },
+                "longitude": { "type": "number", "minimum": -180, "maximum": 180 }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "text"],
+              "properties": {
+                "kind": { "const": "place" },
+                "text": { "type": "string", "minLength": 1, "maxLength": 200 }
+              }
+            }
+          ]
+        },
+        "radius": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["value", "unit"],
+          "properties": {
+            "value": { "type": "number", "exclusiveMinimum": 0 },
+            "unit": { "enum": ["mi", "km"] }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "unit": { "const": "mi" } } },
+              "then": { "properties": { "value": { "maximum": 50 } } }
+            },
+            {
+              "if": { "properties": { "unit": { "const": "km" } } },
+              "then": { "properties": { "value": { "maximum": 80.4672 } } }
+            }
+          ]
+        },
+        "filters": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "roofAge": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["operator", "years", "basis"],
+              "properties": {
+                "operator": { "enum": ["gt", "gte"] },
+                "years": { "type": "integer", "minimum": 0, "maximum": 100 },
+                "basis": { "enum": ["direct_only", "direct_or_proxy"] }
+              }
+            },
+            "permit": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "roofingOnly": { "type": "boolean" },
+                "openOnly": { "type": "boolean" },
+                "minOpenDays": { "type": "integer", "minimum": 0, "maximum": 36500 }
+              }
+            },
+            "ownership": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "operator": { "enum": ["gt", "gte"] },
+                "years": { "type": "integer", "minimum": 0, "maximum": 500 },
+                "ownerArea": {
+                  "enum": ["any", "out_of_county", "out_of_state"]
+                }
+              }
+            },
+            "freshness": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "observedAtOrAfter": { "$ref": "#/$defs/IsoDateTime" },
+                "publishedAtOrAfter": { "$ref": "#/$defs/IsoDateTime" }
+              }
+            },
+            "matchMode": { "enum": ["all", "any"] }
+          }
+        },
+        "sort": {
+          "enum": ["distance_asc", "roof_age_desc", "permit_open_days_desc"]
+        },
+        "page": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["limit"],
+          "properties": {
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "cursor": { "type": "string", "minLength": 1 }
+          }
+        },
+        "asOf": { "$ref": "#/$defs/IsoDateTime" }
+      }
+    },
+    "SearchRequestFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "arguments"],
+      "properties": {
+        "fixtureType": { "const": "search-request" },
+        "tool": { "const": "prism_v1_search_roofing_opportunities" },
+        "arguments": { "$ref": "#/$defs/SearchArguments" }
+      }
+    },
+    "SearchSuccessResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "data", "meta"],
+      "properties": {
+        "ok": { "const": true },
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["resolvedCenter", "opportunities"],
+          "properties": {
+            "resolvedCenter": { "$ref": "#/$defs/Fact" },
+            "opportunities": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["property", "distanceMeters", "matchReasons"],
+                "properties": {
+                  "property": { "$ref": "#/$defs/Property" },
+                  "distanceMeters": { "$ref": "#/$defs/Fact" },
+                  "matchReasons": {
+                    "type": "array",
+                    "items": {
+                      "enum": [
+                        "roof_age",
+                        "open_roofing_permit",
+                        "ownership_duration",
+                        "owner_area"
+                      ]
+                    },
+                    "minItems": 1,
+                    "uniqueItems": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "meta": { "$ref": "#/$defs/ResponseMeta" }
+      }
+    },
+    "SearchResponseFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "result"],
+      "properties": {
+        "fixtureType": { "const": "search-response" },
+        "tool": { "const": "prism_v1_search_roofing_opportunities" },
+        "result": { "$ref": "#/$defs/SearchSuccessResult" }
+      }
+    },
+    "PropertyRequestFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "arguments"],
+      "properties": {
+        "fixtureType": { "const": "property-request" },
+        "tool": { "const": "prism_v1_get_property" },
+        "arguments": { "$ref": "#/$defs/PropertyArguments" }
+      }
+    },
+    "PropertySuccessResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "data", "meta"],
+      "properties": {
+        "ok": { "const": true },
+        "data": { "$ref": "#/$defs/Property" },
+        "meta": { "$ref": "#/$defs/ResponseMeta" }
+      }
+    },
+    "PropertyResponseFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "result"],
+      "properties": {
+        "fixtureType": { "const": "property-response" },
+        "tool": { "const": "prism_v1_get_property" },
+        "result": { "$ref": "#/$defs/PropertySuccessResult" }
+      }
+    },
+    "PermitRequestFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "arguments"],
+      "properties": {
+        "fixtureType": { "const": "permit-request" },
+        "tool": { "const": "prism_v1_get_permit" },
+        "arguments": { "$ref": "#/$defs/PermitArguments" }
+      }
+    },
+    "PermitSuccessResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "data", "meta"],
+      "properties": {
+        "ok": { "const": true },
+        "data": { "$ref": "#/$defs/Permit" },
+        "meta": { "$ref": "#/$defs/ResponseMeta" }
+      }
+    },
+    "PermitResponseFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "result"],
+      "properties": {
+        "fixtureType": { "const": "permit-response" },
+        "tool": { "const": "prism_v1_get_permit" },
+        "result": { "$ref": "#/$defs/PermitSuccessResult" }
+      }
+    },
+    "ErrorResponseFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureType", "tool", "result"],
+      "properties": {
+        "fixtureType": { "const": "error-response" },
+        "tool": { "$ref": "#/$defs/ToolName" },
+        "result": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ok", "error", "meta"],
+          "properties": {
+            "ok": { "const": false },
+            "error": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["code", "message", "retryable"],
+              "properties": {
+                "code": {
+                  "enum": [
+                    "invalid_argument",
+                    "invalid_cursor",
+                    "not_found",
+                    "county_not_served",
+                    "data_unavailable",
+                    "dependency_unavailable",
+                    "rate_limited",
+                    "deadline_exceeded",
+                    "internal"
+                  ]
+                },
+                "message": { "type": "string", "minLength": 1 },
+                "retryable": { "type": "boolean" },
+                "dependency": { "type": "string", "minLength": 1 },
+                "details": {
+                  "description": "Deliberately extensible, non-secret diagnostic fields for the selected error code.",
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            },
+            "meta": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["contractVersion", "schemaHash", "requestId"],
+              "properties": {
+                "contractVersion": { "$ref": "#/$defs/ContractVersion" },
+                "schemaHash": { "$ref": "#/$defs/SchemaHash" },
+                "requestId": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
