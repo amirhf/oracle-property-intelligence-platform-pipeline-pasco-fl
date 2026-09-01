@@ -2914,7 +2914,7 @@ async function assertExecutingPlan(
     SELECT plan_sha256, state
     FROM oracle_candidate_source_snapshot_demo_plans
     WHERE plan_id = ${plan.planId}
-    FOR UPDATE
+    FOR SHARE
   `;
   if (
     rows[0]?.plan_sha256 !== plan.planSha256 ||
@@ -3546,7 +3546,10 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
       return await runCandidateSourceSnapshotFencedPostgresOperation({
         dependencies: {
           createSession: () => {
-            const sql = postgres(this.databaseUrl, { max: 1 });
+            const sql = postgres(this.databaseUrl, {
+              max: 1,
+              onnotice: () => undefined,
+            });
             return {
               close: async () => await sql.end({ timeout: 5 }),
               probe: async () => {
@@ -3575,7 +3578,10 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
         },
       });
     }
-    const sql = postgres(this.databaseUrl, { max: 1 });
+    const sql = postgres(this.databaseUrl, {
+      max: 1,
+      onnotice: () => undefined,
+    });
     try {
       return (await sql.begin(
         async (transaction) => await operation(transaction),
