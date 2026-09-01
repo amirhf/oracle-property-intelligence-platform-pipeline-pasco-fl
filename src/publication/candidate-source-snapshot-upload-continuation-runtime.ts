@@ -160,6 +160,14 @@ async function reconcileUncertainObjects(input: {
   transport: CandidateSourceSnapshotUploadTransport;
   dependencies: CandidateSourceSnapshotUploadContinuationRuntimeDependencies;
 }): Promise<void> {
+  if (
+    await input.dependencies.reconciliationComplete(
+      input.databaseUrl,
+      input.authorization.authorizationId,
+    )
+  ) {
+    return;
+  }
   const uncertainties = await input.dependencies.listUncertainties(
     input.databaseUrl,
     input.authorization.authorizationId,
