@@ -47,6 +47,18 @@ export interface CandidateSourceSnapshotUploadBodyLease {
 }
 
 export interface CandidateSourceSnapshotLocalObjectSource {
+  /**
+   * Opens one immutable object for a local CAR build without performing a
+   * redundant only-hash pass. The CAR builder must verify the streamed byte
+   * count, SHA-256, and UnixFS root before it finalizes any output.
+   */
+  openCarSource?(
+    object: CandidateSourceSnapshotUploadObject,
+  ): Promise<{
+    body: Readable;
+    contentLength: number;
+    release(): Promise<void>;
+  }>;
   /** A fresh, one-attempt body. Implementations must never reuse a consumed stream. */
   openVerifiedUploadBody?(
     object: CandidateSourceSnapshotUploadObject,
@@ -221,6 +233,42 @@ export class BoundCandidateSourceSnapshotLocalObjectSource implements CandidateS
         object.domain === "query_table"
           ? ("application/vnd.apache.parquet" as const)
           : ("application/json" as const),
+    };
+  }
+
+  async openCarSource(object: CandidateSourceSnapshotUploadObject): Promise<{
+    body: Readable;
+    contentLength: number;
+    release(): Promise<void>;
+  }> {
+    const filePath = await this.#resolve(object);
+    const handle = await open(
+      filePath,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+    const state = await handle.stat().catch(async (error: unknown) => {
+      await handle.close();
+      throw error;
+    });
+    if (
+      !state.isFile() ||
+      state.size !== object.byteSize ||
+      state.size > this.#plan.limits.maxObjectBytes
+    ) {
+      await handle.close();
+      throw new Error("Candidate CAR source byte binding is invalid");
+    }
+    const body = handle.createReadStream({ autoClose: true, start: 0 });
+    let released = false;
+    return {
+      body,
+      contentLength: state.size,
+      release: async () => {
+        if (released) return;
+        released = true;
+        if (!body.destroyed) body.destroy();
+        await finished(body).catch(() => undefined);
+      },
     };
   }
 
