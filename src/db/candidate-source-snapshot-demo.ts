@@ -2805,7 +2805,6 @@ async function assertRecoveryUploadAttemptForInspection(
         ) AND request.outcome IN ('retryable_failure', 'timeout_unknown')) OR
         (attempt.outcome = 'request_started' AND
           request.outcome = 'request_started' AND
-          ${continuation?.resumeAuthorizationId ?? null} IS NOT NULL AND
           EXISTS (
             SELECT 1
             FROM oracle_candidate_source_snapshot_upload_inspection_cycles cycle
