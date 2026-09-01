@@ -32,21 +32,27 @@ import {
   type CandidateSourceSnapshotIpnsRollbackAuthorization,
 } from "../publication/candidate-source-snapshot-ipns-controller.js";
 import { createCandidateSourceSnapshotApprovalIdentity } from "./candidate-source-snapshot-approval.js";
+import { runCandidateSourceSnapshotFencedPostgresOperation } from "./candidate-source-snapshot-postgres-reconnect.js";
 
 const OBJECT_BATCH_SIZE = 500;
 
 export interface CandidateSourceSnapshotUploadJournalLeaseBinding {
   authorizationId: string;
-  leaseEpoch: 1;
+  leaseGeneration: number;
   leaseId: string;
+  resumeAuthorizationId?: string;
 }
 
 const uploadJournalLeaseBindingSchema = z.strictObject({
   authorizationId: z
     .string()
     .regex(/^snapshotdemouploadcontinuation_[a-f0-9]{32}$/),
-  leaseEpoch: z.literal(1),
+  leaseGeneration: z.number().int().positive(),
   leaseId: z.string().regex(/^snapshotdemoexecutorlease_[a-f0-9]{32}$/),
+  resumeAuthorizationId: z
+    .string()
+    .regex(/^snapshotdemouploadresume_[a-f0-9]{32}$/)
+    .optional(),
 });
 
 const transportFailureEvidenceSchema = z
@@ -3149,11 +3155,13 @@ async function admitRequest(
         request_id: string;
         started_at: Date;
         upload_continuation_authorization_id: string | null;
+        upload_resume_authorization_id: string | null;
       }[]
     >`
       SELECT attempt.attempt_id, attempt.request_id, attempt.attempt_sequence,
              attempt.outcome, attempt.started_at,
              request.upload_continuation_authorization_id,
+             request.upload_resume_authorization_id,
              request.executor_lease_id, request.executor_lease_epoch
       FROM oracle_candidate_source_snapshot_demo_upload_attempts attempt
       JOIN oracle_candidate_source_snapshot_demo_requests request
@@ -3171,8 +3179,11 @@ async function admitRequest(
         row.request_id !== id ||
         row.upload_continuation_authorization_id !==
           (input.continuation?.authorizationId ?? null) ||
+        row.upload_resume_authorization_id !==
+          (input.continuation?.resumeAuthorizationId ?? null) ||
         row.executor_lease_id !== (input.continuation?.leaseId ?? null) ||
-        row.executor_lease_epoch !== (input.continuation?.leaseEpoch ?? null)
+        row.executor_lease_epoch !==
+          (input.continuation?.leaseGeneration ?? null)
       ) {
         throw new DurableConflictError(
           "Candidate source-snapshot upload admission replay conflicts with durable identity",
@@ -3218,7 +3229,10 @@ async function admitRequest(
       input.object,
       input.recoveryAttempt,
     );
-    if (input.sequence !== input.recoveryAttempt.attemptSequence) {
+    if (
+      !input.continuation?.resumeAuthorizationId &&
+      input.sequence !== input.recoveryAttempt.attemptSequence
+    ) {
       throw new DurableInputError(
         "Candidate source-snapshot inspection sequence must match its upload attempt",
       );
@@ -3236,6 +3250,7 @@ async function admitRequest(
         recovery_upload_attempt_id: string;
         request_id: string;
         upload_continuation_authorization_id: string | null;
+        upload_resume_authorization_id: string | null;
         executor_lease_id: string | null;
         executor_lease_epoch: number | null;
       }[]
@@ -3245,6 +3260,7 @@ async function admitRequest(
              attempt.observed_cid, attempt.observed_sha256,
              attempt.observed_bytes, attempt.receipt_sha256,
              request.upload_continuation_authorization_id,
+             request.upload_resume_authorization_id,
              request.executor_lease_id, request.executor_lease_epoch
       FROM oracle_candidate_source_snapshot_demo_inspection_attempts attempt
       JOIN oracle_candidate_source_snapshot_demo_requests request
@@ -3263,8 +3279,11 @@ async function admitRequest(
         row.recovery_upload_attempt_id !== input.recoveryAttempt.attemptId ||
         row.upload_continuation_authorization_id !==
           (input.continuation?.authorizationId ?? null) ||
+        row.upload_resume_authorization_id !==
+          (input.continuation?.resumeAuthorizationId ?? null) ||
         row.executor_lease_id !== (input.continuation?.leaseId ?? null) ||
-        row.executor_lease_epoch !== (input.continuation?.leaseEpoch ?? null)
+        row.executor_lease_epoch !==
+          (input.continuation?.leaseGeneration ?? null)
       ) {
         throw new DurableConflictError(
           "Candidate source-snapshot inspection admission replay conflicts with durable identity",
@@ -3393,14 +3412,15 @@ async function admitRequest(
       remote_object_key, request_cost_usd, outcome, request_category,
       logical_request_id, attempt_sequence, redirect_sequence,
       upload_continuation_authorization_id, executor_lease_id,
-      executor_lease_epoch
+      executor_lease_epoch, upload_resume_authorization_id
     ) VALUES (
       ${id}, ${input.plan.planId}, ${operationClass}, ${operationKind},
       ${input.object.domain}, ${input.object.remoteObjectKey},
       ${requestCostUsd}, 'request_started', ${requestCategory}, ${logicalId},
       ${input.sequence}, 0, ${input.continuation?.authorizationId ?? null},
       ${input.continuation?.leaseId ?? null},
-      ${input.continuation?.leaseEpoch ?? null}
+      ${input.continuation?.leaseGeneration ?? null},
+      ${input.continuation?.resumeAuthorizationId ?? null}
     )
   `;
   const attempt: CandidateSourceSnapshotUploadAttempt = {
@@ -3489,14 +3509,58 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
     private readonly databaseUrl: string,
     continuation?: CandidateSourceSnapshotUploadJournalLeaseBinding,
   ) {
-    this.#continuation = continuation
-      ? uploadJournalLeaseBindingSchema.parse(continuation)
-      : undefined;
+    if (!continuation) {
+      this.#continuation = undefined;
+      return;
+    }
+    const parsed = uploadJournalLeaseBindingSchema.parse(continuation);
+    this.#continuation = {
+      authorizationId: parsed.authorizationId,
+      leaseGeneration: parsed.leaseGeneration,
+      leaseId: parsed.leaseId,
+      ...(parsed.resumeAuthorizationId
+        ? { resumeAuthorizationId: parsed.resumeAuthorizationId }
+        : {}),
+    };
   }
 
   private async transaction<T>(
     operation: (transaction: postgres.TransactionSql) => Promise<T>,
   ): Promise<T> {
+    if (this.#continuation) {
+      const continuation = this.#continuation;
+      return await runCandidateSourceSnapshotFencedPostgresOperation({
+        dependencies: {
+          createSession: () => {
+            const sql = postgres(this.databaseUrl, { max: 1 });
+            return {
+              close: async () => await sql.end({ timeout: 5 }),
+              probe: async () => {
+                await sql`SELECT 1`;
+              },
+              transaction: async <Result>(
+                callback: (
+                  transaction: postgres.TransactionSql,
+                ) => Promise<Result>,
+              ) =>
+                (await sql.begin(
+                  async (transaction) => await callback(transaction),
+                )) as Result,
+            };
+          },
+          sleep: async (delayMs) => {
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+          },
+        },
+        operation,
+        revalidateGeneration: async (transaction) => {
+          await transaction`SELECT oracle_css_assert_active_executor_lease(
+            ${continuation.leaseId}, ${continuation.leaseGeneration},
+            ${continuation.resumeAuthorizationId ?? continuation.authorizationId}
+          )`;
+        },
+      });
+    }
     const sql = postgres(this.databaseUrl, { max: 1 });
     try {
       return (await sql.begin(
@@ -4254,17 +4318,44 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
   ) {
     const plan = validateCandidateSourceSnapshotDemoPlan(planValue);
     const object = candidateSourceSnapshotObjectSchema().parse(objectValue);
-    return await this.transaction(
-      async (transaction) =>
-        await admitRequest(transaction, {
-          ...(this.#continuation ? { continuation: this.#continuation } : {}),
-          object,
-          operation: "inspect",
-          plan,
-          recoveryAttempt,
-          sequence: recoveryAttempt.attemptSequence,
-        }),
-    );
+    return await this.transaction(async (transaction) => {
+      let inspectionSequence = recoveryAttempt.attemptSequence;
+      if (this.#continuation?.resumeAuthorizationId) {
+        await transaction`SELECT oracle_css_freeze_upload_inspection_cycle(
+          ${plan.planId}, ${this.#continuation.resumeAuthorizationId},
+          ${this.#continuation.leaseId},
+          ${this.#continuation.leaseGeneration}, now()
+        )`;
+        const latest = await transaction<
+          { inspection_sequence: number; outcome: string }[]
+        >`
+          SELECT inspection_sequence, outcome
+          FROM oracle_candidate_source_snapshot_demo_inspection_attempts
+          WHERE plan_id = ${plan.planId} AND domain = ${object.domain}
+            AND remote_object_key = ${object.remoteObjectKey}
+          ORDER BY inspection_sequence DESC
+          LIMIT 1
+          FOR UPDATE
+        `;
+        inspectionSequence =
+          latest[0]?.outcome === "request_started"
+            ? latest[0].inspection_sequence
+            : (latest[0]?.inspection_sequence ?? 0) + 1;
+        if (inspectionSequence > 3) {
+          throw new DurableConflictError(
+            "Candidate source-snapshot inspection allowance is exhausted",
+          );
+        }
+      }
+      return await admitRequest(transaction, {
+        ...(this.#continuation ? { continuation: this.#continuation } : {}),
+        object,
+        operation: "inspect",
+        plan,
+        recoveryAttempt,
+        sequence: inspectionSequence,
+      });
+    });
   }
 
   async markInterruptedAttemptUnknown(
@@ -4562,7 +4653,14 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
             "Candidate source-snapshot inspection result replay conflicts with durable evidence",
           );
         }
-        return checkpoint(row);
+        await this.recordResumeInspectionCycleResolution(
+          transaction,
+          plan,
+          object,
+          attempt,
+          result,
+        );
+        return checkpoint(await loadObjectForUpdate(transaction, plan, object));
       }
       await assertInspectionAttemptForUpdate(
         transaction,
@@ -4659,14 +4757,91 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
           "Candidate source-snapshot inspection checkpoint lost its durable binding",
         );
       }
-      return checkpoint({
-        ...row,
-        provider_cid: result.outcome === "verified" ? result.observedCid : null,
-        receipt_sha256:
-          result.outcome === "verified" ? result.receiptSha256 : null,
-        revision: row.revision + 1,
-        status,
-      });
+      await this.recordResumeInspectionCycleResolution(
+        transaction,
+        plan,
+        object,
+        attempt,
+        result,
+      );
+      return checkpoint(await loadObjectForUpdate(transaction, plan, object));
     });
+  }
+
+  private async recordResumeInspectionCycleResolution(
+    transaction: postgres.TransactionSql,
+    plan: CandidateSourceSnapshotDemoPlan,
+    object: CandidateSourceSnapshotUploadObject,
+    attempt: CandidateSourceSnapshotUploadAttempt,
+    result: CandidateSourceSnapshotInspectionResult,
+  ): Promise<void> {
+    const continuation = this.#continuation;
+    if (
+      !continuation?.resumeAuthorizationId ||
+      !["verified", "absent"].includes(result.outcome) ||
+      !attempt.recoveryUploadAttemptId
+    ) {
+      return;
+    }
+    const resolutionResult =
+      result.outcome === "verified" ? "remote_verified" : "conclusively_absent";
+    const inserted = await transaction<
+      {
+        inspection_cycle_id: string;
+      }[]
+    >`
+      INSERT INTO oracle_candidate_source_snapshot_upload_inspection_cycle_resolutions (
+        inspection_cycle_id, plan_id, domain, remote_object_key,
+        inspection_id, result, receipt_sha256, recorded_at
+      )
+      SELECT cycle.inspection_cycle_id, ${plan.planId}, ${object.domain},
+             ${object.remoteObjectKey}, ${attempt.attemptId},
+             ${resolutionResult}, ${result.receiptSha256}, now()
+      FROM oracle_candidate_source_snapshot_upload_inspection_cycles cycle
+      JOIN oracle_candidate_source_snapshot_upload_inspection_cycle_members member
+        ON member.inspection_cycle_id = cycle.inspection_cycle_id
+      WHERE cycle.plan_id = ${plan.planId}
+        AND cycle.resume_authorization_id = ${continuation.resumeAuthorizationId}
+        AND cycle.executor_lease_id = ${continuation.leaseId}
+        AND cycle.lease_generation = ${continuation.leaseGeneration}
+        AND member.domain = ${object.domain}
+        AND member.remote_object_key = ${object.remoteObjectKey}
+        AND member.source_attempt_id = ${attempt.recoveryUploadAttemptId}
+      ON CONFLICT (inspection_cycle_id, domain, remote_object_key) DO NOTHING
+      RETURNING inspection_cycle_id
+    `;
+    if (inserted[0]) return;
+    const existing = await transaction<
+      {
+        inspection_id: string;
+        receipt_sha256: string;
+        result: string;
+      }[]
+    >`
+      SELECT resolution.inspection_id, resolution.result,
+             resolution.receipt_sha256
+      FROM oracle_candidate_source_snapshot_upload_inspection_cycles cycle
+      JOIN oracle_candidate_source_snapshot_upload_inspection_cycle_members member
+        ON member.inspection_cycle_id = cycle.inspection_cycle_id
+      JOIN oracle_candidate_source_snapshot_upload_inspection_cycle_resolutions resolution
+        ON resolution.inspection_cycle_id = member.inspection_cycle_id
+       AND resolution.domain = member.domain
+       AND resolution.remote_object_key = member.remote_object_key
+      WHERE cycle.plan_id = ${plan.planId}
+        AND cycle.resume_authorization_id = ${continuation.resumeAuthorizationId}
+        AND member.domain = ${object.domain}
+        AND member.remote_object_key = ${object.remoteObjectKey}
+        AND member.source_attempt_id = ${attempt.recoveryUploadAttemptId}
+    `;
+    if (
+      existing.length !== 1 ||
+      existing[0]!.inspection_id !== attempt.attemptId ||
+      existing[0]!.result !== resolutionResult ||
+      existing[0]!.receipt_sha256 !== result.receiptSha256
+    ) {
+      throw new DurableConflictError(
+        "Candidate source-snapshot inspection cycle resolution conflicts",
+      );
+    }
   }
 }

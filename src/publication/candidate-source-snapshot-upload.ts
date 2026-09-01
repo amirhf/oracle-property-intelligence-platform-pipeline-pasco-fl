@@ -260,6 +260,67 @@ export interface CandidateSourceSnapshotUploadSummary {
   uploadedAndVerified: number;
 }
 
+const UPLOAD_HEALTH_WINDOW_MS = 5 * 60_000;
+const UPLOAD_NO_PROGRESS_LIMIT_MS = 15 * 60_000;
+
+/** Small process-local stop policy; durable object state remains authoritative. */
+export class CandidateSourceSnapshotUploadHealthMonitor {
+  #lastVerifiedAt: number;
+  #previousWindowExceeded = false;
+  #windowRequests = 0;
+  #windowStartedAt: number;
+  #windowUncertainties = 0;
+
+  constructor(startedAt: number) {
+    this.#lastVerifiedAt = startedAt;
+    this.#windowStartedAt = startedAt;
+  }
+
+  #advance(now: number, checkProgress = true): void {
+    while (now - this.#windowStartedAt >= UPLOAD_HEALTH_WINDOW_MS) {
+      const exceeded =
+        this.#windowRequests > 0 &&
+        this.#windowUncertainties / this.#windowRequests > 0.01;
+      if (exceeded && this.#previousWindowExceeded) {
+        throw new Error(
+          "Candidate source-snapshot uncertainty rate exceeded its stop limit",
+        );
+      }
+      this.#previousWindowExceeded = exceeded;
+      this.#windowRequests = 0;
+      this.#windowUncertainties = 0;
+      this.#windowStartedAt += UPLOAD_HEALTH_WINDOW_MS;
+    }
+    if (
+      checkProgress &&
+      now - this.#lastVerifiedAt >= UPLOAD_NO_PROGRESS_LIMIT_MS
+    ) {
+      throw new Error(
+        "Candidate source-snapshot verified progress stalled for 15 minutes",
+      );
+    }
+  }
+
+  recordRequest(now: number): void {
+    this.#advance(now);
+    this.#windowRequests += 1;
+  }
+
+  recordUncertainty(now: number): void {
+    this.#advance(now);
+    this.#windowUncertainties += 1;
+  }
+
+  recordVerified(now: number): void {
+    this.#advance(now, false);
+    this.#lastVerifiedAt = now;
+  }
+
+  assertHealthy(now: number): void {
+    this.#advance(now);
+  }
+}
+
 function objectIdentity(object: CandidateSourceSnapshotUploadObject): string {
   return `${object.domain}:${object.remoteObjectKey}`;
 }
@@ -348,6 +409,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
   executionPermit?: CandidateSourceSnapshotUploadExecutionPermit;
   executorEnabled: true;
   journal: CandidateSourceSnapshotUploadJournal;
+  now?: () => number;
   objects:
     | Iterable<CandidateSourceSnapshotUploadObject>
     | AsyncIterable<CandidateSourceSnapshotUploadObject>;
@@ -363,6 +425,8 @@ export async function executeCandidateSourceSnapshotUploads(options: {
     throw new Error("Candidate source-snapshot executor is disabled");
   }
   const plan = validateCandidateSourceSnapshotDemoPlan(options.plan);
+  const now = options.now ?? Date.now;
+  const health = new CandidateSourceSnapshotUploadHealthMonitor(now());
   const requestTimeoutSchema = z
     .number()
     .int()
@@ -481,6 +545,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
   };
 
   const recordNewlyVerifiedObject = async (): Promise<void> => {
+    health.recordVerified(now());
     if (!stagedPermit) return;
     newlyVerifiedObjects += 1;
     const promotion = promotionGate.then(async () => {
@@ -514,6 +579,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
     rawObject: CandidateSourceSnapshotUploadObject,
   ): Promise<void> => {
     assertRunning();
+    health.assertHealthy(now());
     const object = candidateSourceSnapshotObjectSchema().parse(rawObject);
     assertCandidateSourceSnapshotObjectNamespace(plan, object);
     const key = objectIdentity(object);
@@ -549,7 +615,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
     await options.journal.admitObject(plan, object);
     const inspectUnknownUpload = async (
       recoveryAttempt: CandidateSourceSnapshotUploadAttempt,
-    ): Promise<"absent" | "verified"> => {
+    ): Promise<"absent" | "quarantined" | "verified"> => {
       assertRunning();
       const admitted = await options.journal.startInspection(
         plan,
@@ -567,6 +633,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
       } else
         try {
           attemptedRequests += 1;
+          health.recordRequest(now());
           inspection = await boundedTransportCall({
             call: async (signal) =>
               await options.transport.inspectExistingOnce(plan, object, signal),
@@ -577,15 +644,11 @@ export async function executeCandidateSourceSnapshotUploads(options: {
           if (fatalError !== undefined || executionSignal.aborted) throw error;
           if (
             error instanceof CandidateSourceSnapshotUploadError &&
-            error.outcome === "timeout_unknown"
+            retryable(error.outcome)
           ) {
             inspection = {
               outcome: "ambiguous",
-              receiptSha256: canonicalReceiptSha256({
-                attemptId: admitted.attempt.attemptId,
-                outcome: "timeout_unknown",
-                recoveryUploadAttemptId: recoveryAttempt.attemptId,
-              }),
+              receiptSha256: error.evidence.evidenceSha256,
             };
           } else {
             throw error;
@@ -618,7 +681,11 @@ export async function executeCandidateSourceSnapshotUploads(options: {
         );
       }
       if (inspection.outcome === "ambiguous") {
-        throw new Error("Candidate remote object inspection is ambiguous");
+        // The frozen inspection cycle is the quarantine. Leave this object
+        // outcome_unknown and let unrelated workers continue; a future exact
+        // HEAD reconciliation is required before this object may upload again.
+        health.recordUncertainty(now());
+        return "quarantined";
       }
       return "absent";
     };
@@ -660,7 +727,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
         if (replayedAttempt.outcome !== "request_started") {
           return replayedAttempt;
         }
-        if (Date.now() >= deadline) return replayedAttempt;
+        if (now() >= deadline) return replayedAttempt;
         await (options.backoff?.(concurrentAttempt.attemptSequence) ??
           new Promise((resolve) => setTimeout(resolve, 25)));
       }
@@ -692,7 +759,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
           retryable(attempt.outcome),
       );
     if (recoveryAttempt) {
-      if ((await inspectUnknownUpload(recoveryAttempt)) === "verified") return;
+      if ((await inspectUnknownUpload(recoveryAttempt)) !== "absent") return;
     }
     let attemptsUsed = priorAttempts.filter(
       (attempt) => attempt.operation === "upload",
@@ -735,7 +802,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
         }
         attemptsUsed = Math.max(attemptsUsed, attempt.attemptSequence);
         if (retryable(attempt.outcome)) {
-          if ((await inspectUnknownUpload(attempt)) === "verified") return;
+          if ((await inspectUnknownUpload(attempt)) !== "absent") return;
           if (attemptsUsed >= plan.limits.maxRetries + 1) {
             throw new Error(
               "Candidate source-snapshot retry allowance is exhausted",
@@ -747,6 +814,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
       }
       attemptsUsed += 1;
       attemptedRequests += 1;
+      health.recordRequest(now());
       try {
         assertRunning();
         const result = await boundedTransportCall({
@@ -820,7 +888,7 @@ export async function executeCandidateSourceSnapshotUploads(options: {
         // A transport reset or 5xx can be post-dispatch just as a timeout can.
         // Inspect the immutable object before any retry so an acknowledged provider
         // write is never repeated solely because its response was ambiguous.
-        if ((await inspectUnknownUpload(attempt)) === "verified") {
+        if ((await inspectUnknownUpload(attempt)) !== "absent") {
           return;
         }
         if (attemptsUsed >= plan.limits.maxRetries + 1) throw error;

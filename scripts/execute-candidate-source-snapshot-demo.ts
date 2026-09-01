@@ -43,7 +43,8 @@ async function main(): Promise<void> {
     databaseUrl,
     descriptor,
     environment: process.env,
-    ...(authorization?.uploadContinuationAuthorization &&
+    ...((authorization?.uploadContinuationAuthorization ||
+      authorization?.uploadResumeAuthorization) &&
     executorLeaseHolderToken
       ? { executorLeaseHolderToken }
       : {}),
@@ -57,12 +58,18 @@ async function main(): Promise<void> {
             planSha256: result.planSha256,
             status: result.status,
           }
-        : {
-            cutover: result.cutover,
-            executorEnabled: false,
-            status: result.status,
-            summary: result.summary,
-          },
+        : result.status === "upload_resume_paused"
+          ? {
+              executorEnabled: false,
+              status: result.status,
+              summary: result.summary,
+            }
+          : {
+              cutover: result.cutover,
+              executorEnabled: false,
+              status: result.status,
+              summary: result.summary,
+            },
       null,
       2,
     )}\n`,

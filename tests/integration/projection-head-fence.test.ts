@@ -69,7 +69,7 @@ async function withEnvironment(
   const admin = postgres(adminDatabaseUrl, { max: 1 });
   try {
     await admin.unsafe(`CREATE SCHEMA ${schema}`);
-    expect(await runMigrations(databaseUrl)).toHaveLength(34);
+    expect(await runMigrations(databaseUrl)).toHaveLength(35);
     await test({ dataDir, databaseUrl });
   } finally {
     await admin.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);

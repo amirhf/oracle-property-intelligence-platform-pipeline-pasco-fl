@@ -113,7 +113,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(34);
+  expect(await runMigrations(schemaDatabaseUrl)).toHaveLength(35);
 });
 
 afterAll(async () => {

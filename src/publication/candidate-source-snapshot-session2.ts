@@ -21,7 +21,10 @@ import {
   recordCandidateSourceSnapshotPreflightContinuation,
   type CandidateSourceSnapshotPreflightContinuationAuthorization,
 } from "../db/candidate-source-snapshot-preflight-continuation.js";
-import type { CandidateSourceSnapshotUploadContinuationAuthorization } from "../db/candidate-source-snapshot-upload-continuation.js";
+import type {
+  CandidateSourceSnapshotUploadContinuationAuthorization,
+  CandidateSourceSnapshotUploadResumeAuthorization,
+} from "../db/candidate-source-snapshot-upload-continuation.js";
 import { recordCompatibleCandidateSourceSnapshotPlanDerivation } from "../db/candidate-source-snapshot-plan-derivation.js";
 import {
   buildCandidateSourceSnapshotDemo,
@@ -194,6 +197,13 @@ export async function executeCandidateSourceSnapshotIpnsCutover(input: {
 
 export type CandidateSourceSnapshotSession2Result =
   | {
+      executorEnabled: false;
+      planId: string;
+      planSha256: string;
+      status: "upload_resume_paused";
+      summary: CandidateSourceSnapshotUploadSummary;
+    }
+  | {
       planId: string;
       planSha256: string;
       status: "executor_disabled";
@@ -231,6 +241,7 @@ export interface CandidateSourceSnapshotSession2Authorization {
   replayAuthorizations?: readonly CandidateSourceSnapshotIpnsReplayAuthorization[];
   rollbackAuthorization?: CandidateSourceSnapshotIpnsRollbackAuthorization;
   uploadContinuationAuthorization?: CandidateSourceSnapshotUploadContinuationAuthorization;
+  uploadResumeAuthorization?: CandidateSourceSnapshotUploadResumeAuthorization;
 }
 
 /**
@@ -446,6 +457,13 @@ export async function executeCandidateSourceSnapshotSession2(input: {
     : undefined;
   const uploadContinuationAuthorization =
     input.authorization.uploadContinuationAuthorization;
+  const uploadResumeAuthorization =
+    input.authorization.uploadResumeAuthorization;
+  if (uploadResumeAuthorization && !uploadContinuationAuthorization) {
+    throw new Error(
+      "Candidate upload resume requires its predecessor continuation authorization",
+    );
+  }
   if (
     uploadContinuationAuthorization &&
     (!input.executorLeaseHolderToken ||
@@ -512,12 +530,16 @@ export async function executeCandidateSourceSnapshotSession2(input: {
     let summary: CandidateSourceSnapshotUploadSummary;
     if (uploadContinuationAuthorization) {
       summary = await dependencies.executeUploadContinuation({
-        afterUploadsVerified: async () => {
-          uploadClosure = await dependencies.recordUploadClosure(
-            input.databaseUrl,
-            { approvalId: approval.approvalId, ...identity },
-          );
-        },
+        ...(uploadResumeAuthorization
+          ? {}
+          : {
+              afterUploadsVerified: async () => {
+                uploadClosure = await dependencies.recordUploadClosure(
+                  input.databaseUrl,
+                  { approvalId: approval.approvalId, ...identity },
+                );
+              },
+            }),
         authorization: uploadContinuationAuthorization,
         config,
         createObjects: bundle.createObjects,
@@ -525,8 +547,22 @@ export async function executeCandidateSourceSnapshotSession2(input: {
         holderToken: input.executorLeaseHolderToken!,
         localSource: bundle.localSource,
         plan: durable.plan,
+        ...(uploadResumeAuthorization
+          ? { resumeAuthorization: uploadResumeAuthorization }
+          : {}),
         ...(input.s3Executor ? { s3Executor: input.s3Executor } : {}),
       });
+      // Resume authorizations are deliberately upload-only. Even complete
+      // object verification requires a later, separate authority before an
+      // upload closure, IPNS intent, or IPNS mutation can be created.
+      if (uploadResumeAuthorization) {
+        return {
+          executorEnabled: false,
+          ...identity,
+          status: "upload_resume_paused",
+          summary,
+        };
+      }
       if (!uploadClosure) {
         throw new Error(
           "Candidate upload continuation did not persist upload closure",

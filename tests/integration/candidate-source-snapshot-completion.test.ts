@@ -52,7 +52,7 @@ beforeAll(async () => {
   } finally {
     await admin.end({ timeout: 5 });
   }
-  expect(await runMigrations(databaseUrl)).toHaveLength(34);
+  expect(await runMigrations(databaseUrl)).toHaveLength(35);
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });
 

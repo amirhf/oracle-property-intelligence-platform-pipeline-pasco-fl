@@ -14,6 +14,14 @@ export const CANDIDATE_SOURCE_SNAPSHOT_UPLOAD_CONTINUATION_AUTHORIZATION_VERSION
   "candidate-source-snapshot-upload-continuation-authorization-v1" as const;
 export const CANDIDATE_SOURCE_SNAPSHOT_EXECUTOR_LEASE_VERSION =
   "candidate-source-snapshot-executor-lease-v1" as const;
+export const CANDIDATE_SOURCE_SNAPSHOT_EXECUTOR_LEASE_V2_VERSION =
+  "candidate-source-snapshot-executor-lease-v2" as const;
+export const CANDIDATE_SOURCE_SNAPSHOT_UPLOAD_RESUME_BINDING_VERSION =
+  "candidate-source-snapshot-upload-resume-binding-v1" as const;
+export const CANDIDATE_SOURCE_SNAPSHOT_UPLOAD_RESUME_AUTHORIZATION_VERSION =
+  "candidate-source-snapshot-upload-resume-authorization-v1" as const;
+export const CANDIDATE_SOURCE_SNAPSHOT_EXECUTOR_LEASE_EXPIRY_GRACE_MS =
+  30_000 as const;
 export const CANDIDATE_SOURCE_SNAPSHOT_FILEBASE_S3_ENDPOINT =
   "https://s3.filebase.io" as const;
 export const CANDIDATE_SOURCE_SNAPSHOT_UPLOAD_CONNECTION_TIMEOUT_MS =
@@ -44,6 +52,9 @@ const approvalIdSchema = z
 const authorizationIdSchema = z
   .string()
   .regex(/^snapshotdemouploadcontinuation_[a-f0-9]{32}$/);
+const resumeAuthorizationIdSchema = z
+  .string()
+  .regex(/^snapshotdemouploadresume_[a-f0-9]{32}$/);
 const leaseIdSchema = z
   .string()
   .regex(/^snapshotdemoexecutorlease_[a-f0-9]{32}$/);
@@ -172,6 +183,135 @@ export type CandidateSourceSnapshotUploadContinuationAuthorization = z.infer<
   typeof candidateSourceSnapshotUploadContinuationAuthorizationSchema
 >;
 
+const resumeCheckpointSchema = z.strictObject({
+  admittedRecoveryCount: z.number().int().nonnegative(),
+  admittedRecoverySetSha256: sha256Schema,
+  futureInspectionCycleCount: z.number().int().nonnegative(),
+  futureInspectionCycleSetSha256: sha256Schema,
+  verifiedBytes: z.number().int().nonnegative(),
+  verifiedObjectCount: z.number().int().nonnegative(),
+  verifiedReceiptSetSha256: sha256Schema,
+});
+
+const resumeExecutionSchema = z.strictObject({
+  bufferBodyMaxBytes: z.literal(
+    CANDIDATE_SOURCE_SNAPSHOT_UPLOAD_BUFFER_BODY_MAX_BYTES,
+  ),
+  connectionTimeoutMs: z.literal(
+    CANDIDATE_SOURCE_SNAPSHOT_UPLOAD_CONNECTION_TIMEOUT_MS,
+  ),
+  concurrencyStages: z.tuple([z.literal(4), z.literal(8), z.literal(16)]),
+  executorLeaseLimit: z.literal(1),
+  leaseExpiryGraceMs: z.literal(
+    CANDIDATE_SOURCE_SNAPSHOT_EXECUTOR_LEASE_EXPIRY_GRACE_MS,
+  ),
+  maxSocketsStages: z.tuple([z.literal(4), z.literal(8), z.literal(16)]),
+  persistentExecutorEnabled: z.literal(false),
+  promotionVerifiedObjectsPerStage: z.literal(
+    CANDIDATE_SOURCE_SNAPSHOT_UPLOAD_PROMOTION_VERIFIED_OBJECTS_PER_STAGE,
+  ),
+  reconciliationRequired: z.literal(true),
+  requestTimeoutMs: z.number().int().gt(45_000).max(60_000),
+  s3Endpoint: z.literal(CANDIDATE_SOURCE_SNAPSHOT_FILEBASE_S3_ENDPOINT),
+  socketTimeoutMs: z.literal(
+    CANDIDATE_SOURCE_SNAPSHOT_UPLOAD_SOCKET_TIMEOUT_MS,
+  ),
+});
+
+const resumeInventorySchema = z.strictObject({
+  exactObjectCount: z.number().int().positive(),
+  exactTotalBytes: z.number().int().positive(),
+  fullInventorySha256: sha256Schema,
+  inventoryCid: cidSchema,
+  inventoryRootSha256: sha256Schema,
+});
+
+const resumePlanSchema = z.strictObject({
+  artifactCid: cidSchema,
+  artifactSha256: sha256Schema,
+  planId: planIdSchema,
+  planRevision: z.number().int().positive(),
+  planSha256: sha256Schema,
+});
+
+const resumeRemainingAllowanceSchema = z.strictObject({
+  absoluteRequestCeiling: z.number().int().positive(),
+  costEnvelopeSha256: sha256Schema,
+  hardBudgetCeilingUsd: moneySchema,
+  hardBudgetRemainingUsd: moneySchema,
+  requestEnvelopeSha256: sha256Schema,
+  requestsRemaining: z.number().int().nonnegative(),
+});
+
+export const candidateSourceSnapshotUploadResumeBindingSchema = z
+  .strictObject({
+    amendedImplementationCommitSha: commitShaSchema,
+    checkpoint: resumeCheckpointSchema,
+    execution: resumeExecutionSchema,
+    inventory: resumeInventorySchema,
+    lease: z.strictObject({
+      predecessorLeaseGeneration: z.number().int().positive(),
+      predecessorLeaseId: leaseIdSchema,
+      resumeLeaseGeneration: z.number().int().min(2),
+    }),
+    plan: resumePlanSchema,
+    predecessor: z.strictObject({
+      authorizationId: authorizationIdSchema,
+      authorizationSha256: sha256Schema,
+      implementationCommitSha: commitShaSchema,
+    }),
+    remainingAllowance: resumeRemainingAllowanceSchema,
+    schemaVersion: z.literal(
+      CANDIDATE_SOURCE_SNAPSHOT_UPLOAD_RESUME_BINDING_VERSION,
+    ),
+    targetsSha256: sha256Schema,
+  })
+  .superRefine((value, context) => {
+    if (
+      value.lease.resumeLeaseGeneration !==
+      value.lease.predecessorLeaseGeneration + 1
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "resume lease generation must increment exactly once",
+        path: ["lease", "resumeLeaseGeneration"],
+      });
+    }
+    if (
+      value.amendedImplementationCommitSha ===
+      value.predecessor.implementationCommitSha
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "resume implementation commit must change",
+        path: ["amendedImplementationCommitSha"],
+      });
+    }
+  });
+
+export type CandidateSourceSnapshotUploadResumeBinding = z.infer<
+  typeof candidateSourceSnapshotUploadResumeBindingSchema
+>;
+
+export const candidateSourceSnapshotUploadResumeAuthorizationSchema =
+  z.strictObject({
+    authorizationBinding: candidateSourceSnapshotUploadResumeBindingSchema,
+    authorizationBindingSha256: sha256Schema,
+    authorizationId: resumeAuthorizationIdSchema,
+    authorizationSha256: sha256Schema,
+    authorizationStatement: z.string().min(1).max(12_000),
+    authorizationStatementSha256: sha256Schema,
+    authorizationVersion: z.literal(
+      CANDIDATE_SOURCE_SNAPSHOT_UPLOAD_RESUME_AUTHORIZATION_VERSION,
+    ),
+    authorizedAt: timestampSchema,
+    authorizerReference: referenceSchema,
+  });
+
+export type CandidateSourceSnapshotUploadResumeAuthorization = z.infer<
+  typeof candidateSourceSnapshotUploadResumeAuthorizationSchema
+>;
+
 export const candidateSourceSnapshotUploadContinuationUncertaintySchema =
   z.strictObject({
     authorizationId: authorizationIdSchema,
@@ -210,11 +350,16 @@ export const candidateSourceSnapshotExecutorLeaseSchema = z.strictObject({
   expiresAt: timestampSchema,
   heartbeatAt: timestampSchema,
   holderTokenSha256: sha256Schema,
-  leaseEpoch: z.literal(1),
+  leaseEpoch: z.number().int().positive(),
+  leaseGeneration: z.number().int().positive(),
   leaseId: leaseIdSchema,
-  leaseVersion: z.literal(CANDIDATE_SOURCE_SNAPSHOT_EXECUTOR_LEASE_VERSION),
+  leaseVersion: z.union([
+    z.literal(CANDIDATE_SOURCE_SNAPSHOT_EXECUTOR_LEASE_VERSION),
+    z.literal(CANDIDATE_SOURCE_SNAPSHOT_EXECUTOR_LEASE_V2_VERSION),
+  ]),
   phase: leasePhaseSchema,
   planId: planIdSchema,
+  resumeAuthorizationId: resumeAuthorizationIdSchema.nullable(),
   revision: z.number().int().positive(),
 });
 
@@ -234,13 +379,15 @@ export const candidateSourceSnapshotUploadExecutionPermitSchema =
     ),
     effectiveConcurrency: z.union([z.literal(4), z.literal(8), z.literal(16)]),
     executorLeaseId: leaseIdSchema,
-    leaseEpoch: z.literal(1),
+    leaseEpoch: z.number().int().positive(),
+    leaseGeneration: z.number().int().positive(),
     leaseRevision: z.number().int().positive(),
     maxSockets: z.union([z.literal(4), z.literal(8), z.literal(16)]),
     phase: z.enum(["upload_4", "upload_8", "upload_16"]),
     planId: planIdSchema,
     planSha256: sha256Schema,
     reconciliationComplete: z.literal(true),
+    resumeAuthorizationId: resumeAuthorizationIdSchema.nullable(),
     requestTimeoutMs: z.number().int().gt(45_000).max(60_000),
     s3Endpoint: z.literal(CANDIDATE_SOURCE_SNAPSHOT_FILEBASE_S3_ENDPOINT),
     socketTimeoutMs: z.literal(
@@ -321,6 +468,80 @@ export function createCandidateSourceSnapshotUploadContinuationIdentity(inputVal
     authorizationStatementSha256,
     authorizationVersion:
       CANDIDATE_SOURCE_SNAPSHOT_UPLOAD_CONTINUATION_AUTHORIZATION_VERSION,
+    authorizedAt: input.authorizedAt,
+    authorizerReference: input.authorizerReference,
+  });
+}
+
+export function renderCandidateSourceSnapshotUploadResumeStatement(
+  bindingValue: CandidateSourceSnapshotUploadResumeBinding,
+  authorizerReferenceValue: string,
+  authorizedAtValue: string,
+): string {
+  const binding =
+    candidateSourceSnapshotUploadResumeBindingSchema.parse(bindingValue);
+  const authorizerReference = referenceSchema.parse(authorizerReferenceValue);
+  const authorizedAt = timestampSchema.parse(authorizedAtValue);
+  return `I authorize exactly one fail-closed candidate-owned source-snapshot upload resume for plan ${binding.plan.planId}, logical SHA-256 ${binding.plan.planSha256}, at durable plan revision ${binding.plan.planRevision}, from continuation authorization ${binding.predecessor.authorizationId}, SHA-256 ${binding.predecessor.authorizationSha256}, and implementation commit ${binding.predecessor.implementationCommitSha} to amended implementation commit ${binding.amendedImplementationCommitSha}. It preserves ${binding.checkpoint.verifiedObjectCount} verified objects and ${binding.checkpoint.verifiedBytes} verified bytes under receipt-set SHA-256 ${binding.checkpoint.verifiedReceiptSetSha256}; it binds ${binding.checkpoint.admittedRecoveryCount} admitted-object recovery records under SHA-256 ${binding.checkpoint.admittedRecoverySetSha256} and ${binding.checkpoint.futureInspectionCycleCount} future inspection-cycle members under SHA-256 ${binding.checkpoint.futureInspectionCycleSetSha256}. It supersedes expired executor lease ${binding.lease.predecessorLeaseId} generation ${binding.lease.predecessorLeaseGeneration} with generation ${binding.lease.resumeLeaseGeneration} only after ${binding.execution.leaseExpiryGraceMs} ms expiry grace while the persistent executor flag is false. It retains compiled S3 endpoint ${binding.execution.s3Endpoint}, connection timeout ${binding.execution.connectionTimeoutMs} ms, socket timeout ${binding.execution.socketTimeoutMs} ms, request timeout ${binding.execution.requestTimeoutMs} ms, immutable-buffer threshold ${binding.execution.bufferBodyMaxBytes} bytes, staged concurrency/maxSockets 4 then 8 then 16 after ${binding.execution.promotionVerifiedObjectsPerStage} newly verified objects per promotion, exactly one executor lease, inventory CID ${binding.inventory.inventoryCid}, inventory SHA-256 ${binding.inventory.fullInventorySha256}, exactly ${binding.inventory.exactObjectCount} objects and ${binding.inventory.exactTotalBytes} bytes, targets SHA-256 ${binding.targetsSha256}, request-envelope SHA-256 ${binding.remainingAllowance.requestEnvelopeSha256}, cost-envelope SHA-256 ${binding.remainingAllowance.costEnvelopeSha256}, absolute request ceiling ${binding.remainingAllowance.absoluteRequestCeiling}, and USD ${binding.remainingAllowance.hardBudgetCeilingUsd} hard spending ceiling, with ${binding.remainingAllowance.requestsRemaining} requests and USD ${binding.remainingAllowance.hardBudgetRemainingUsd} hard-budget allowance remaining at authorization. No object, CID, key, bucket, prefix, IPNS identity, target, request ceiling, cost ceiling, or existing verified receipt may change; no IPNS operation is authorized. Human authorization reference ${authorizerReference} at ${authorizedAt}.`;
+}
+
+export function createCandidateSourceSnapshotUploadResumeIdentity(inputValue: {
+  authorizationBinding: CandidateSourceSnapshotUploadResumeBinding;
+  authorizationStatement?: string;
+  authorizedAt: string;
+  authorizerReference: string;
+}): CandidateSourceSnapshotUploadResumeAuthorization {
+  const input = z
+    .strictObject({
+      authorizationBinding: candidateSourceSnapshotUploadResumeBindingSchema,
+      authorizationStatement: z.string().min(1).max(12_000).optional(),
+      authorizedAt: timestampSchema,
+      authorizerReference: referenceSchema,
+    })
+    .parse(inputValue);
+  const authorizationStatement =
+    renderCandidateSourceSnapshotUploadResumeStatement(
+      input.authorizationBinding,
+      input.authorizerReference,
+      input.authorizedAt,
+    );
+  if (
+    input.authorizationStatement !== undefined &&
+    input.authorizationStatement !== authorizationStatement
+  ) {
+    throw new DurableInputError(
+      "Candidate source-snapshot upload resume statement is not exact",
+    );
+  }
+  const authorizationBindingSha256 = canonicalJsonSha256(
+    input.authorizationBinding,
+  );
+  const authorizationStatementSha256 = sha256(authorizationStatement);
+  const authorizationSha256 = canonicalJsonSha256({
+    authorizationBinding: input.authorizationBinding,
+    authorizationBindingSha256,
+    authorizationStatement,
+    authorizationStatementSha256,
+    authorizationVersion:
+      CANDIDATE_SOURCE_SNAPSHOT_UPLOAD_RESUME_AUTHORIZATION_VERSION,
+    authorizedAt: input.authorizedAt,
+    authorizerReference: input.authorizerReference,
+  });
+  return candidateSourceSnapshotUploadResumeAuthorizationSchema.parse({
+    authorizationBinding: input.authorizationBinding,
+    authorizationBindingSha256,
+    authorizationId: deterministicId("snapshotdemouploadresume", [
+      CANDIDATE_SOURCE_SNAPSHOT_UPLOAD_RESUME_AUTHORIZATION_VERSION,
+      input.authorizationBinding.plan.planId,
+      input.authorizationBinding.predecessor.authorizationId,
+      String(input.authorizationBinding.lease.resumeLeaseGeneration),
+      authorizationSha256,
+    ]),
+    authorizationSha256,
+    authorizationStatement,
+    authorizationStatementSha256,
+    authorizationVersion:
+      CANDIDATE_SOURCE_SNAPSHOT_UPLOAD_RESUME_AUTHORIZATION_VERSION,
     authorizedAt: input.authorizedAt,
     authorizerReference: input.authorizerReference,
   });
@@ -721,6 +942,157 @@ export async function recordCandidateSourceSnapshotUploadContinuation(
   }
 }
 
+const resumeProposalInputSchema = z.strictObject({
+  amendedImplementationCommitSha: commitShaSchema,
+  authorizedAt: timestampSchema,
+  authorizerReference: referenceSchema,
+  persistentExecutorEnabled: z.literal(false),
+  planId: planIdSchema,
+  planSha256: sha256Schema,
+});
+
+async function loadUploadResumeBinding(
+  transaction: postgres.TransactionSql,
+  input: z.infer<typeof resumeProposalInputSchema>,
+): Promise<CandidateSourceSnapshotUploadResumeBinding> {
+  const rows = await transaction<{ authorization_binding: unknown }[]>`
+    SELECT oracle_css_upload_resume_binding(
+      ${input.planId}, ${input.planSha256},
+      ${input.amendedImplementationCommitSha},
+      ${input.persistentExecutorEnabled}
+    ) AS authorization_binding
+  `;
+  if (!rows[0]?.authorization_binding) {
+    throw new DurableConflictError(
+      "Candidate source-snapshot upload resume lacks its exact durable binding",
+    );
+  }
+  return candidateSourceSnapshotUploadResumeBindingSchema.parse(
+    rows[0].authorization_binding,
+  );
+}
+
+export async function proposeCandidateSourceSnapshotUploadResume(
+  databaseUrl: string,
+  inputValue: z.input<typeof resumeProposalInputSchema>,
+): Promise<CandidateSourceSnapshotUploadResumeAuthorization> {
+  const input = resumeProposalInputSchema.parse(inputValue);
+  const sql = postgres(databaseUrl, { max: 1 });
+  try {
+    return await sql.begin(async (transaction) =>
+      createCandidateSourceSnapshotUploadResumeIdentity({
+        authorizationBinding: await loadUploadResumeBinding(transaction, input),
+        authorizedAt: input.authorizedAt,
+        authorizerReference: input.authorizerReference,
+      }),
+    );
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
+}
+
+export async function recordCandidateSourceSnapshotUploadResumeAuthorization(
+  databaseUrl: string,
+  authorizationValue: CandidateSourceSnapshotUploadResumeAuthorization,
+): Promise<CandidateSourceSnapshotUploadResumeAuthorization> {
+  const authorization =
+    candidateSourceSnapshotUploadResumeAuthorizationSchema.parse(
+      authorizationValue,
+    );
+  const binding = authorization.authorizationBinding;
+  const sql = postgres(databaseUrl, { max: 1 });
+  try {
+    return await sql.begin(async (transaction) => {
+      const existing = await transaction<{ authorization_payload: unknown }[]>`
+        SELECT authorization_payload
+        FROM oracle_candidate_source_snapshot_upload_resume_authorizations
+        WHERE resume_authorization_id = ${authorization.authorizationId}
+           OR (plan_id = ${binding.plan.planId}
+               AND resume_lease_generation = ${binding.lease.resumeLeaseGeneration})
+        FOR UPDATE
+      `;
+      if (existing[0]) {
+        const replay =
+          candidateSourceSnapshotUploadResumeAuthorizationSchema.parse(
+            existing[0].authorization_payload,
+          );
+        if (
+          canonicalJsonSha256(replay) !== canonicalJsonSha256(authorization)
+        ) {
+          throw new DurableConflictError(
+            "Candidate source-snapshot upload resume authorization conflicts",
+          );
+        }
+        return replay;
+      }
+      const expectedBinding = await loadUploadResumeBinding(transaction, {
+        amendedImplementationCommitSha: binding.amendedImplementationCommitSha,
+        authorizedAt: authorization.authorizedAt,
+        authorizerReference: authorization.authorizerReference,
+        persistentExecutorEnabled: false,
+        planId: binding.plan.planId,
+        planSha256: binding.plan.planSha256,
+      });
+      const expected = createCandidateSourceSnapshotUploadResumeIdentity({
+        authorizationBinding: expectedBinding,
+        authorizationStatement: authorization.authorizationStatement,
+        authorizedAt: authorization.authorizedAt,
+        authorizerReference: authorization.authorizerReference,
+      });
+      if (
+        canonicalJsonSha256(expected) !== canonicalJsonSha256(authorization)
+      ) {
+        throw new DurableInputError(
+          "Candidate source-snapshot upload resume authorization is not exact",
+        );
+      }
+      await transaction`
+        INSERT INTO oracle_candidate_source_snapshot_upload_resume_authorizations (
+          resume_authorization_id, authorization_version,
+          authorization_sha256, plan_id, plan_sha256, plan_revision,
+          predecessor_authorization_id, predecessor_authorization_sha256,
+          predecessor_lease_id, amended_implementation_commit_sha,
+          predecessor_lease_generation, resume_lease_generation,
+          verified_object_count, verified_bytes, verified_receipt_set_sha256,
+          admitted_recovery_count, admitted_recovery_set_sha256,
+          future_inspection_cycle_count, future_inspection_cycle_set_sha256,
+          authorization_binding, authorization_binding_sha256,
+          authorization_statement, authorization_statement_sha256,
+          authorizer_reference, authorized_at, authorized_at_iso,
+          authorization_payload
+        ) VALUES (
+          ${authorization.authorizationId}, ${authorization.authorizationVersion},
+          ${authorization.authorizationSha256}, ${binding.plan.planId},
+          ${binding.plan.planSha256}, ${binding.plan.planRevision},
+          ${binding.predecessor.authorizationId},
+          ${binding.predecessor.authorizationSha256},
+          ${binding.lease.predecessorLeaseId},
+          ${binding.amendedImplementationCommitSha},
+          ${binding.lease.predecessorLeaseGeneration},
+          ${binding.lease.resumeLeaseGeneration},
+          ${binding.checkpoint.verifiedObjectCount},
+          ${binding.checkpoint.verifiedBytes},
+          ${binding.checkpoint.verifiedReceiptSetSha256},
+          ${binding.checkpoint.admittedRecoveryCount},
+          ${binding.checkpoint.admittedRecoverySetSha256},
+          ${binding.checkpoint.futureInspectionCycleCount},
+          ${binding.checkpoint.futureInspectionCycleSetSha256},
+          ${transaction.json(binding as postgres.JSONValue)},
+          ${authorization.authorizationBindingSha256},
+          ${authorization.authorizationStatement},
+          ${authorization.authorizationStatementSha256},
+          ${authorization.authorizerReference}, ${authorization.authorizedAt},
+          ${authorization.authorizedAt},
+          ${transaction.json(authorization as postgres.JSONValue)}
+        )
+      `;
+      return authorization;
+    });
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
+}
+
 interface UncertaintyRow {
   authorization_id: string;
   domain: "open_data" | "query_table";
@@ -775,11 +1147,14 @@ interface LeaseRow {
   expires_at: Date;
   heartbeat_at: Date;
   holder_token_sha256: string;
-  lease_epoch: 1;
+  lease_epoch: number;
   lease_id: string;
-  lease_version: typeof CANDIDATE_SOURCE_SNAPSHOT_EXECUTOR_LEASE_VERSION;
+  lease_version:
+    | typeof CANDIDATE_SOURCE_SNAPSHOT_EXECUTOR_LEASE_VERSION
+    | typeof CANDIDATE_SOURCE_SNAPSHOT_EXECUTOR_LEASE_V2_VERSION;
   phase: z.infer<typeof leasePhaseSchema>;
   plan_id: string;
+  resume_authorization_id: string | null;
   revision: number;
 }
 
@@ -792,10 +1167,12 @@ function leaseFromRow(row: LeaseRow): CandidateSourceSnapshotExecutorLease {
     heartbeatAt: row.heartbeat_at.toISOString(),
     holderTokenSha256: row.holder_token_sha256,
     leaseEpoch: row.lease_epoch,
+    leaseGeneration: row.lease_epoch,
     leaseId: row.lease_id,
     leaseVersion: row.lease_version,
     phase: row.phase,
     planId: row.plan_id,
+    resumeAuthorizationId: row.resume_authorization_id,
     revision: row.revision,
   });
 }
@@ -826,6 +1203,9 @@ export async function acquireCandidateSourceSnapshotExecutorLease(
     authorizationId: string;
     expiresAt: string;
     holderToken: string;
+    leaseGeneration?: number;
+    persistentExecutorEnabled?: false;
+    resumeAuthorizationId?: string;
   },
 ): Promise<CandidateSourceSnapshotExecutorLease> {
   const timing = leaseTimingSchema.parse({
@@ -836,10 +1216,30 @@ export async function acquireCandidateSourceSnapshotExecutorLease(
     .strictObject({
       authorizationId: authorizationIdSchema,
       holderToken: z.string().min(32).max(512),
+      leaseGeneration: z.number().int().min(2).optional(),
+      persistentExecutorEnabled: z.literal(false).optional(),
+      resumeAuthorizationId: resumeAuthorizationIdSchema.optional(),
+    })
+    .superRefine((value, context) => {
+      const isResume = value.resumeAuthorizationId !== undefined;
+      if (
+        isResume !== (value.leaseGeneration !== undefined) ||
+        isResume !== (value.persistentExecutorEnabled === false)
+      ) {
+        context.addIssue({
+          code: "custom",
+          message:
+            "lease resume identity, generation, and disabled persistent executor assertion must be complete",
+          path: ["resumeAuthorizationId"],
+        });
+      }
     })
     .parse({
       authorizationId: inputValue.authorizationId,
       holderToken: inputValue.holderToken,
+      leaseGeneration: inputValue.leaseGeneration,
+      persistentExecutorEnabled: inputValue.persistentExecutorEnabled,
+      resumeAuthorizationId: inputValue.resumeAuthorizationId,
     });
   const holderTokenSha256 = sha256(input.holderToken);
   const sql = postgres(databaseUrl, { max: 1 });
@@ -858,22 +1258,73 @@ export async function acquireCandidateSourceSnapshotExecutorLease(
           "Candidate source-snapshot executor lease lacks its authorization",
         );
       }
-      const leaseId = deterministicId("snapshotdemoexecutorlease", [
-        CANDIDATE_SOURCE_SNAPSHOT_EXECUTOR_LEASE_VERSION,
-        authorization[0].plan_id,
-        input.authorizationId,
-      ]);
-      const existing = await transaction<
-        (LeaseRow & { is_expired: boolean })[]
-      >`
-        SELECT *, expires_at <= now() AS is_expired
-        FROM oracle_candidate_source_snapshot_executor_leases
-        WHERE authorization_id = ${input.authorizationId}
-           OR plan_id = ${authorization[0].plan_id}
+      await transaction`
+        SELECT plan_id
+        FROM oracle_candidate_source_snapshot_demo_plans
+        WHERE plan_id = ${authorization[0].plan_id}
         FOR UPDATE
       `;
-      if (existing[0]) {
-        const replay = leaseFromRow(existing[0]);
+      const resumeAuthorization = input.resumeAuthorizationId
+        ? await transaction<
+            {
+              predecessor_authorization_id: string;
+              predecessor_lease_generation: number;
+              resume_authorization_id: string;
+              resume_lease_generation: number;
+            }[]
+          >`
+            SELECT resume_authorization_id, predecessor_authorization_id,
+                   predecessor_lease_generation, resume_lease_generation
+            FROM oracle_candidate_source_snapshot_upload_resume_authorizations
+            WHERE resume_authorization_id = ${input.resumeAuthorizationId}
+              AND plan_id = ${authorization[0].plan_id}
+            FOR SHARE
+          `
+        : [];
+      if (
+        input.resumeAuthorizationId &&
+        (!resumeAuthorization[0] ||
+          resumeAuthorization[0].predecessor_authorization_id !==
+            input.authorizationId ||
+          resumeAuthorization[0].resume_lease_generation !==
+            input.leaseGeneration)
+      ) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot executor lease lacks its exact resume authorization",
+        );
+      }
+      const leaseVersion = input.resumeAuthorizationId
+        ? CANDIDATE_SOURCE_SNAPSHOT_EXECUTOR_LEASE_V2_VERSION
+        : CANDIDATE_SOURCE_SNAPSHOT_EXECUTOR_LEASE_VERSION;
+      const leaseGeneration = input.leaseGeneration ?? 1;
+      const leaseId = deterministicId(
+        "snapshotdemoexecutorlease",
+        input.resumeAuthorizationId
+          ? [
+              leaseVersion,
+              authorization[0].plan_id,
+              input.resumeAuthorizationId,
+              String(leaseGeneration),
+            ]
+          : [
+              CANDIDATE_SOURCE_SNAPSHOT_EXECUTOR_LEASE_VERSION,
+              authorization[0].plan_id,
+              input.authorizationId,
+            ],
+      );
+      const existing = await transaction<
+        (LeaseRow & { grace_elapsed: boolean; is_expired: boolean })[]
+      >`
+        SELECT *, expires_at <= now() AS is_expired,
+               expires_at + interval '30 seconds' <= now() AS grace_elapsed
+        FROM oracle_candidate_source_snapshot_executor_leases
+        WHERE plan_id = ${authorization[0].plan_id}
+        ORDER BY lease_epoch DESC
+        FOR UPDATE
+      `;
+      const latest = existing[0];
+      if (latest && latest.lease_epoch === leaseGeneration) {
+        const replay = leaseFromRow(latest);
         if (
           replay.leaseId !== leaseId ||
           replay.holderTokenSha256 !== holderTokenSha256 ||
@@ -883,7 +1334,7 @@ export async function acquireCandidateSourceSnapshotExecutorLease(
             "Candidate source-snapshot executor lease is already owned",
           );
         }
-        if (existing[0].is_expired) {
+        if (latest.is_expired) {
           const resumed = await transaction<LeaseRow[]>`
             UPDATE oracle_candidate_source_snapshot_executor_leases
             SET heartbeat_at = ${timing.acquiredAt},
@@ -891,9 +1342,12 @@ export async function acquireCandidateSourceSnapshotExecutorLease(
                 revision = revision + 1
             WHERE lease_id = ${leaseId}
               AND holder_token_sha256 = ${holderTokenSha256}
+              AND lease_epoch = ${leaseGeneration}
+              AND lease_epoch =
+                oracle_css_active_executor_lease_generation(plan_id)
               AND phase <> 'released'
               AND expires_at <= now()
-              AND revision = ${existing[0].revision}
+              AND revision = ${latest.revision}
             RETURNING *
           `;
           if (!resumed[0]) {
@@ -905,15 +1359,34 @@ export async function acquireCandidateSourceSnapshotExecutorLease(
         }
         return replay;
       }
+      if (input.resumeAuthorizationId) {
+        const resume = resumeAuthorization[0]!;
+        if (
+          !latest ||
+          latest.lease_epoch !== resume.predecessor_lease_generation ||
+          leaseGeneration !== latest.lease_epoch + 1 ||
+          !latest.grace_elapsed
+        ) {
+          throw new DurableConflictError(
+            "Candidate source-snapshot executor lease is not safely supersedable",
+          );
+        }
+      } else if (latest) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot executor lease is already owned",
+        );
+      }
       const inserted = await transaction<LeaseRow[]>`
         INSERT INTO oracle_candidate_source_snapshot_executor_leases (
           lease_id, lease_version, authorization_id, plan_id,
-          holder_token_sha256, lease_epoch, phase, effective_concurrency,
+          resume_authorization_id, holder_token_sha256, lease_epoch, phase,
+          effective_concurrency,
           acquired_at, heartbeat_at, expires_at, revision
         ) VALUES (
-          ${leaseId}, ${CANDIDATE_SOURCE_SNAPSHOT_EXECUTOR_LEASE_VERSION},
+          ${leaseId}, ${leaseVersion},
           ${input.authorizationId}, ${authorization[0].plan_id},
-          ${holderTokenSha256}, 1, 'reconciling', 0,
+          ${input.resumeAuthorizationId ?? null}, ${holderTokenSha256},
+          ${leaseGeneration}, 'reconciling', 0,
           ${timing.acquiredAt}, ${timing.acquiredAt}, ${timing.expiresAt}, 1
         ) RETURNING *
       `;
@@ -938,6 +1411,7 @@ export async function transitionCandidateSourceSnapshotExecutorLease(
     expiresAt: string;
     heartbeatAt: string;
     holderToken: string;
+    leaseGeneration?: number;
     leaseId: string;
     nextPhase: z.infer<typeof leasePhaseSchema>;
     revision: number;
@@ -948,6 +1422,7 @@ export async function transitionCandidateSourceSnapshotExecutorLease(
       expiresAt: timestampSchema,
       heartbeatAt: timestampSchema,
       holderToken: z.string().min(32).max(512),
+      leaseGeneration: z.number().int().positive().default(1),
       leaseId: leaseIdSchema,
       nextPhase: leasePhaseSchema,
       revision: z.number().int().positive(),
@@ -967,23 +1442,40 @@ export async function transitionCandidateSourceSnapshotExecutorLease(
     .parse(inputValue);
   const sql = postgres(databaseUrl, { max: 1 });
   try {
-    const updated = await sql<LeaseRow[]>`
-      UPDATE oracle_candidate_source_snapshot_executor_leases
-      SET phase = ${input.nextPhase},
-          effective_concurrency = ${phaseConcurrency[input.nextPhase]},
-          heartbeat_at = ${input.heartbeatAt}, expires_at = ${input.expiresAt},
-          revision = revision + 1
-      WHERE lease_id = ${input.leaseId}
-        AND holder_token_sha256 = ${sha256(input.holderToken)}
-        AND revision = ${input.revision}
-      RETURNING *
-    `;
-    if (!updated[0]) {
-      throw new DurableConflictError(
-        "Candidate source-snapshot executor lease transition lost ownership",
-      );
-    }
-    return leaseFromRow(updated[0]);
+    return await sql.begin(async (transaction) => {
+      const current = await transaction<LeaseRow[]>`
+        SELECT * FROM oracle_candidate_source_snapshot_executor_leases
+        WHERE lease_id = ${input.leaseId}
+          AND lease_epoch = ${input.leaseGeneration}
+      `;
+      if (!current[0]) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot executor lease transition lacks ownership",
+        );
+      }
+      await transaction`SELECT oracle_css_assert_active_executor_lease(
+        ${input.leaseId}, ${input.leaseGeneration},
+        ${current[0].resume_authorization_id ?? current[0].authorization_id}
+      )`;
+      const updated = await transaction<LeaseRow[]>`
+        UPDATE oracle_candidate_source_snapshot_executor_leases
+        SET phase = ${input.nextPhase},
+            effective_concurrency = ${phaseConcurrency[input.nextPhase]},
+            heartbeat_at = ${input.heartbeatAt}, expires_at = ${input.expiresAt},
+            revision = revision + 1
+        WHERE lease_id = ${input.leaseId}
+          AND lease_epoch = ${input.leaseGeneration}
+          AND holder_token_sha256 = ${sha256(input.holderToken)}
+          AND revision = ${input.revision}
+        RETURNING *
+      `;
+      if (!updated[0]) {
+        throw new DurableConflictError(
+          "Candidate source-snapshot executor lease transition lost ownership",
+        );
+      }
+      return leaseFromRow(updated[0]);
+    });
   } finally {
     await sql.end({ timeout: 5 });
   }
@@ -995,6 +1487,7 @@ export async function heartbeatCandidateSourceSnapshotExecutorLease(
     expiresAt: string;
     heartbeatAt: string;
     holderToken: string;
+    leaseGeneration?: number;
     leaseId: string;
   },
 ): Promise<CandidateSourceSnapshotExecutorLease> {
@@ -1003,6 +1496,7 @@ export async function heartbeatCandidateSourceSnapshotExecutorLease(
       expiresAt: timestampSchema,
       heartbeatAt: timestampSchema,
       holderToken: z.string().min(32).max(512),
+      leaseGeneration: z.number().int().positive().default(1),
       leaseId: leaseIdSchema,
     })
     .superRefine((value, context) => {
@@ -1025,19 +1519,26 @@ export async function heartbeatCandidateSourceSnapshotExecutorLease(
       const current = await transaction<LeaseRow[]>`
         SELECT * FROM oracle_candidate_source_snapshot_executor_leases
         WHERE lease_id = ${input.leaseId}
+          AND lease_epoch = ${input.leaseGeneration}
+          AND lease_epoch = oracle_css_active_executor_lease_generation(plan_id)
           AND phase <> 'released' AND expires_at > now()
-        FOR UPDATE
       `;
       if (!current[0] || current[0].holder_token_sha256 !== holderTokenSha256) {
         throw new DurableConflictError(
           "Candidate source-snapshot executor lease heartbeat lacks unexpired ownership",
         );
       }
+      await transaction`SELECT oracle_css_assert_active_executor_lease(
+        ${input.leaseId}, ${input.leaseGeneration},
+        ${current[0].resume_authorization_id ?? current[0].authorization_id}
+      )`;
       const updated = await transaction<LeaseRow[]>`
         UPDATE oracle_candidate_source_snapshot_executor_leases
         SET heartbeat_at = ${input.heartbeatAt}, expires_at = ${input.expiresAt},
             revision = revision + 1
         WHERE lease_id = ${input.leaseId}
+          AND lease_epoch = ${input.leaseGeneration}
+          AND lease_epoch = oracle_css_active_executor_lease_generation(plan_id)
           AND holder_token_sha256 = ${holderTokenSha256}
           AND revision = ${current[0].revision}
         RETURNING *
@@ -1094,6 +1595,7 @@ export async function recordCandidateSourceSnapshotUploadReconciliation(
     holderToken: string;
     inspectionId: string;
     planId: string;
+    leaseGeneration?: number;
     receiptSha256: string;
     recordedAt: string;
     remoteObjectKey: string;
@@ -1108,6 +1610,7 @@ export async function recordCandidateSourceSnapshotUploadReconciliation(
       holderToken: z.string().min(32).max(512),
       inspectionId: z.string().regex(/^snapshotdemoinspection_[a-f0-9]{32}$/),
       planId: planIdSchema,
+      leaseGeneration: z.number().int().positive().default(1),
       receiptSha256: sha256Schema,
       recordedAt: timestampSchema,
       remoteObjectKey: z.string().min(1),
@@ -1120,6 +1623,8 @@ export async function recordCandidateSourceSnapshotUploadReconciliation(
       const lease = await transaction<LeaseRow[]>`
         SELECT * FROM oracle_candidate_source_snapshot_executor_leases
         WHERE lease_id = ${input.executorLeaseId}
+          AND lease_epoch = ${input.leaseGeneration}
+          AND lease_epoch = oracle_css_active_executor_lease_generation(plan_id)
         FOR UPDATE
       `;
       if (
@@ -1164,7 +1669,8 @@ export async function recordCandidateSourceSnapshotUploadReconciliation(
           receipt_sha256, recorded_at
         ) VALUES (
           ${input.authorizationId}, ${input.planId}, ${input.domain},
-          ${input.remoteObjectKey}, ${input.executorLeaseId}, 1,
+          ${input.remoteObjectKey}, ${input.executorLeaseId},
+          ${input.leaseGeneration},
           ${input.inspectionId}, ${input.result}, ${input.receiptSha256},
           ${input.recordedAt}
         )
@@ -1179,6 +1685,7 @@ export async function loadCandidateSourceSnapshotUploadExecutionPermit(
   databaseUrl: string,
   inputValue: {
     holderToken: string;
+    leaseGeneration?: number;
     leaseId: string;
     planId: string;
     planSha256: string;
@@ -1187,6 +1694,7 @@ export async function loadCandidateSourceSnapshotUploadExecutionPermit(
   const input = z
     .strictObject({
       holderToken: z.string().min(32).max(512),
+      leaseGeneration: z.number().int().positive().default(1),
       leaseId: leaseIdSchema,
       planId: planIdSchema,
       planSha256: sha256Schema,
@@ -1204,15 +1712,23 @@ export async function loadCandidateSourceSnapshotUploadExecutionPermit(
     >`
       SELECT lease.*, auth.authorization_binding,
              auth.authorization_sha256, plan.plan_sha256,
-             oracle_css_upload_continuation_is_reconciled(
-               auth.authorization_id
-             ) AS reconciliation_complete
+             CASE WHEN lease.resume_authorization_id IS NULL
+               THEN oracle_css_upload_continuation_is_reconciled(
+                 auth.authorization_id
+               )
+               ELSE oracle_css_upload_resume_admission_is_reconciled(
+                 lease.resume_authorization_id
+               )
+             END AS reconciliation_complete
       FROM oracle_candidate_source_snapshot_executor_leases lease
       JOIN oracle_candidate_source_snapshot_upload_continuation_authorizations auth
         ON auth.authorization_id = lease.authorization_id
       JOIN oracle_candidate_source_snapshot_demo_plans plan
         ON plan.plan_id = lease.plan_id
       WHERE lease.lease_id = ${input.leaseId}
+        AND lease.lease_epoch = ${input.leaseGeneration}
+        AND lease.lease_epoch =
+          oracle_css_active_executor_lease_generation(lease.plan_id)
         AND lease.plan_id = ${input.planId}
         AND plan.plan_sha256 = ${input.planSha256}
         AND lease.holder_token_sha256 = ${sha256(input.holderToken)}
@@ -1238,12 +1754,14 @@ export async function loadCandidateSourceSnapshotUploadExecutionPermit(
       effectiveConcurrency: row.effective_concurrency,
       executorLeaseId: row.lease_id,
       leaseEpoch: row.lease_epoch,
+      leaseGeneration: row.lease_epoch,
       leaseRevision: row.revision,
       maxSockets: row.effective_concurrency,
       phase: row.phase,
       planId: row.plan_id,
       planSha256: row.plan_sha256,
       reconciliationComplete: true,
+      resumeAuthorizationId: row.resume_authorization_id,
       requestTimeoutMs: binding.execution.requestTimeoutMs,
       s3Endpoint: binding.execution.s3Endpoint,
       socketTimeoutMs: binding.execution.socketTimeoutMs,

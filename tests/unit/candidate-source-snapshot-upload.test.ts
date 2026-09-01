@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   CANDIDATE_SOURCE_SNAPSHOT_CONTINUATION_PROMOTION_VERIFIED_OBJECTS,
+  CandidateSourceSnapshotUploadHealthMonitor,
   CandidateSourceSnapshotUploadError,
   executeCandidateSourceSnapshotUploads,
   type CandidateSourceSnapshotPlanAccounting,
@@ -891,12 +892,14 @@ describe("candidate source-snapshot resumable upload boundary", () => {
         transport: { inspectExistingOnce, uploadOnce },
         verifyLocalObject: vi.fn(async () => undefined),
       });
-      if (inspectionOutcome === "verified" || inspectionOutcome === "absent") {
+      if (
+        inspectionOutcome === "verified" ||
+        inspectionOutcome === "absent" ||
+        inspectionOutcome === "ambiguous"
+      ) {
         await expect(operation).resolves.toMatchObject({ totalObjects: 3 });
       } else {
-        await expect(operation).rejects.toThrow(
-          inspectionOutcome === "ambiguous" ? "ambiguous" : "conflicts",
-        );
+        await expect(operation).rejects.toThrow("conflicts");
       }
       expect(inspectExistingOnce).toHaveBeenCalledTimes(1);
       expect(uploadOnce).toHaveBeenCalledTimes(
@@ -1064,12 +1067,8 @@ describe("candidate source-snapshot resumable upload boundary", () => {
         transport: { inspectExistingOnce, uploadOnce },
         verifyLocalObject: vi.fn(async () => undefined),
       });
-      const rejection = expect(operation).rejects.toThrow(
-        "remote object inspection is ambiguous",
-      );
-
       await vi.advanceTimersByTimeAsync(plan.limits.requestTimeoutMs);
-      await rejection;
+      await expect(operation).resolves.toMatchObject({ totalObjects: 3 });
       expect(transportSignal?.aborted).toBe(true);
       expect(uploadOnce).toHaveBeenCalledTimes(1);
       expect(inspectExistingOnce).toHaveBeenCalledTimes(1);
@@ -1081,6 +1080,27 @@ describe("candidate source-snapshot resumable upload boundary", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("stops after two consecutive five-minute windows exceed one-percent uncertainty", () => {
+    const monitor = new CandidateSourceSnapshotUploadHealthMonitor(0);
+    for (let index = 0; index < 100; index += 1) monitor.recordRequest(0);
+    monitor.recordUncertainty(0);
+    monitor.recordUncertainty(0);
+    monitor.recordRequest(300_000);
+    monitor.recordUncertainty(300_000);
+    expect(() => monitor.recordRequest(600_000)).toThrow(
+      "uncertainty rate exceeded",
+    );
+  });
+
+  it("stops after fifteen minutes without a newly verified object", () => {
+    const monitor = new CandidateSourceSnapshotUploadHealthMonitor(0);
+    monitor.recordRequest(899_999);
+    expect(() => monitor.assertHealthy(900_000)).toThrow("progress stalled");
+    const progressing = new CandidateSourceSnapshotUploadHealthMonitor(0);
+    progressing.recordVerified(899_999);
+    expect(() => progressing.assertHealthy(900_000)).not.toThrow();
   });
 
   it("stops before transport when durable accounting exceeds a hard ceiling", async () => {

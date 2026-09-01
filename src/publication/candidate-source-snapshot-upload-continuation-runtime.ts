@@ -7,16 +7,19 @@ import {
 import {
   acquireCandidateSourceSnapshotExecutorLease,
   candidateSourceSnapshotUploadContinuationAuthorizationSchema,
+  candidateSourceSnapshotUploadResumeAuthorizationSchema,
   candidateSourceSnapshotUploadReconciliationComplete,
   heartbeatCandidateSourceSnapshotExecutorLease,
   listCandidateSourceSnapshotUploadContinuationUncertainties,
   loadCandidateSourceSnapshotUploadExecutionPermit,
   recordCandidateSourceSnapshotUploadContinuation,
+  recordCandidateSourceSnapshotUploadResumeAuthorization,
   recordCandidateSourceSnapshotUploadReconciliation,
   releaseCandidateSourceSnapshotExecutorLease,
   transitionCandidateSourceSnapshotExecutorLease,
   type CandidateSourceSnapshotExecutorLease,
   type CandidateSourceSnapshotUploadContinuationAuthorization,
+  type CandidateSourceSnapshotUploadResumeAuthorization,
 } from "../db/candidate-source-snapshot-upload-continuation.js";
 import type { EnabledCandidateSourceSnapshotExecutionConfig } from "./candidate-source-snapshot-executor-config.js";
 import {
@@ -80,6 +83,7 @@ export interface CandidateSourceSnapshotUploadContinuationRuntimeDependencies {
   now(): Date;
   reconciliationComplete: typeof candidateSourceSnapshotUploadReconciliationComplete;
   recordAuthorization: typeof recordCandidateSourceSnapshotUploadContinuation;
+  recordResumeAuthorization: typeof recordCandidateSourceSnapshotUploadResumeAuthorization;
   recordReconciliation: typeof recordCandidateSourceSnapshotUploadReconciliation;
   releaseLease: typeof releaseCandidateSourceSnapshotExecutorLease;
   transitionLease: typeof transitionCandidateSourceSnapshotExecutorLease;
@@ -102,6 +106,8 @@ const defaultDependencies: CandidateSourceSnapshotUploadContinuationRuntimeDepen
     now: () => new Date(),
     reconciliationComplete: candidateSourceSnapshotUploadReconciliationComplete,
     recordAuthorization: recordCandidateSourceSnapshotUploadContinuation,
+    recordResumeAuthorization:
+      recordCandidateSourceSnapshotUploadResumeAuthorization,
     recordReconciliation: recordCandidateSourceSnapshotUploadReconciliation,
     releaseLease: releaseCandidateSourceSnapshotExecutorLease,
     transitionLease: transitionCandidateSourceSnapshotExecutorLease,
@@ -279,6 +285,7 @@ async function reconcileUncertainObjects(input: {
       holderToken: input.holderToken,
       inspectionId: admission.attempt.attemptId,
       planId: input.plan.planId,
+      leaseGeneration: input.lease.leaseGeneration,
       receiptSha256: result.receiptSha256,
       recordedAt: input.dependencies.now().toISOString(),
       remoteObjectKey: object.remoteObjectKey,
@@ -313,6 +320,7 @@ export async function executeCandidateSourceSnapshotUploadContinuation(input: {
   holderToken: string;
   localSource: CandidateSourceSnapshotLocalObjectSource;
   plan: CandidateSourceSnapshotDemoPlan;
+  resumeAuthorization?: CandidateSourceSnapshotUploadResumeAuthorization;
   s3Executor?: CandidateSourceSnapshotS3CommandExecutor;
 }): Promise<CandidateSourceSnapshotUploadSummary> {
   const dependencies = { ...defaultDependencies, ...input.dependencies };
@@ -328,6 +336,26 @@ export async function executeCandidateSourceSnapshotUploadContinuation(input: {
       "Candidate source-snapshot continuation plan binding differs",
     );
   }
+  const resumeAuthorization = input.resumeAuthorization
+    ? candidateSourceSnapshotUploadResumeAuthorizationSchema.parse(
+        input.resumeAuthorization,
+      )
+    : undefined;
+  if (
+    resumeAuthorization &&
+    (resumeAuthorization.authorizationBinding.plan.planId !==
+      input.plan.planId ||
+      resumeAuthorization.authorizationBinding.plan.planSha256 !==
+        input.plan.planSha256 ||
+      resumeAuthorization.authorizationBinding.predecessor.authorizationId !==
+        authorization.authorizationId ||
+      resumeAuthorization.authorizationBinding.predecessor
+        .authorizationSha256 !== authorization.authorizationSha256)
+  ) {
+    throw new DurableConflictError(
+      "Candidate source-snapshot upload resume binding differs",
+    );
+  }
   const recorded = await dependencies.recordAuthorization(
     input.databaseUrl,
     authorization,
@@ -337,17 +365,43 @@ export async function executeCandidateSourceSnapshotUploadContinuation(input: {
       "Candidate source-snapshot continuation authorization replay differs",
     );
   }
+  if (resumeAuthorization) {
+    const recordedResume = await dependencies.recordResumeAuthorization(
+      input.databaseUrl,
+      resumeAuthorization,
+    );
+    if (
+      recordedResume.authorizationSha256 !==
+      resumeAuthorization.authorizationSha256
+    ) {
+      throw new DurableConflictError(
+        "Candidate source-snapshot upload resume authorization replay differs",
+      );
+    }
+  }
   const acquiredAt = dependencies.now();
   let lease = await dependencies.acquireLease(input.databaseUrl, {
     acquiredAt: acquiredAt.toISOString(),
     authorizationId: authorization.authorizationId,
     expiresAt: new Date(acquiredAt.getTime() + LEASE_DURATION_MS).toISOString(),
     holderToken: input.holderToken,
+    ...(resumeAuthorization
+      ? {
+          leaseGeneration:
+            resumeAuthorization.authorizationBinding.lease
+              .resumeLeaseGeneration,
+          persistentExecutorEnabled: false as const,
+          resumeAuthorizationId: resumeAuthorization.authorizationId,
+        }
+      : {}),
   });
   const leaseBinding: CandidateSourceSnapshotUploadJournalLeaseBinding = {
     authorizationId: authorization.authorizationId,
-    leaseEpoch: 1,
+    leaseGeneration: lease.leaseGeneration,
     leaseId: lease.leaseId,
+    ...(resumeAuthorization
+      ? { resumeAuthorizationId: resumeAuthorization.authorizationId }
+      : {}),
   };
   const journal = new PostgresCandidateSourceSnapshotUploadJournal(
     input.databaseUrl,
@@ -395,6 +449,7 @@ export async function executeCandidateSourceSnapshotUploadContinuation(input: {
           await dependencies.heartbeatLease(input.databaseUrl, {
             ...window,
             holderToken: input.holderToken,
+            leaseGeneration: lease.leaseGeneration,
             leaseId: lease.leaseId,
           }),
       ).catch(() => undefined);
@@ -420,6 +475,7 @@ export async function executeCandidateSourceSnapshotUploadContinuation(input: {
           await dependencies.transitionLease(input.databaseUrl, {
             ...window,
             holderToken: input.holderToken,
+            leaseGeneration: lease.leaseGeneration,
             leaseId: lease.leaseId,
             nextPhase: "upload_4",
             revision: lease.revision,
@@ -437,6 +493,7 @@ export async function executeCandidateSourceSnapshotUploadContinuation(input: {
     }
     const permit = await dependencies.loadExecutionPermit(input.databaseUrl, {
       holderToken: input.holderToken,
+      leaseGeneration: lease.leaseGeneration,
       leaseId: lease.leaseId,
       planId: input.plan.planId,
       planSha256: input.plan.planSha256,
@@ -466,6 +523,7 @@ export async function executeCandidateSourceSnapshotUploadContinuation(input: {
             await dependencies.transitionLease(input.databaseUrl, {
               ...window,
               holderToken: input.holderToken,
+              leaseGeneration: lease.leaseGeneration,
               leaseId: lease.leaseId,
               nextPhase,
               revision: lease.revision,
@@ -489,6 +547,7 @@ export async function executeCandidateSourceSnapshotUploadContinuation(input: {
           await dependencies.releaseLease(input.databaseUrl, {
             ...releasedAt,
             holderToken: input.holderToken,
+            leaseGeneration: lease.leaseGeneration,
             leaseId: lease.leaseId,
             revision: lease.revision,
           }),

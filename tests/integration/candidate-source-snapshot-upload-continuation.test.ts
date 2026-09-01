@@ -54,7 +54,7 @@ beforeAll(async () => {
     await admin.end({ timeout: 5 });
   }
   expect((await runMigrations(databaseUrl)).at(-1)).toBe(
-    "034_candidate_source_snapshot_transport_continuation.sql",
+    "035_candidate_source_snapshot_upload_resume.sql",
   );
   expect(await runMigrations(databaseUrl)).toEqual([]);
 });
@@ -298,7 +298,7 @@ describe("candidate source-snapshot upload continuation", () => {
     const continuationJournal =
       new PostgresCandidateSourceSnapshotUploadJournal(databaseUrl, {
         authorizationId: authorization.authorizationId,
-        leaseEpoch: 1,
+        leaseGeneration: 1,
         leaseId: lease.leaseId,
       });
     const frozenSetSql = postgres(databaseUrl, { max: 1 });
