@@ -425,7 +425,7 @@ describe("candidate source-snapshot explorer status", () => {
           closureId:
             "snapshotdemouploadclosure_95a8b6c2a3a8a6ff4825d3fb2286ab8b",
           sha256:
-            "cdf73f2a7bf3a31cf8dd7333d5b04e7e34da33227dd90997feb4502e2526a591",
+            "b56927ed06ddb3007ce1aa85f236f49727bbe6697ad0feefb22cf967da5a4ff4",
         },
         providerCidVerification: {
           matchedObjectCount: 325_312,

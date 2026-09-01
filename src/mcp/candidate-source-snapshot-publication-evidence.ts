@@ -67,7 +67,7 @@ export const CANDIDATE_SOURCE_SNAPSHOT_PUBLICATION_EVIDENCE = Object.freeze({
     },
     resolverPolicy: "candidate_filebase_delegated_v2",
     verification:
-      "provider readiness requires each configured identity to resolve to its exact target through the candidate control-plane, public-gateway, and signed delegated-record checks",
+      "provider readiness requires each configured identity to resolve to its exact target through the official Filebase public gateway and a cryptographically validated signed delegated record",
   },
   plan: {
     artifactCid: "QmcxZWB8W2asaZDNNXi1WyprzQT8cMKmen7FW8fbGiivTW",
@@ -97,7 +97,7 @@ export const CANDIDATE_SOURCE_SNAPSHOT_PUBLICATION_EVIDENCE = Object.freeze({
 });
 
 export const CANDIDATE_SOURCE_SNAPSHOT_PUBLICATION_EVIDENCE_SHA256 =
-  "cdf73f2a7bf3a31cf8dd7333d5b04e7e34da33227dd90997feb4502e2526a591";
+  "b56927ed06ddb3007ce1aa85f236f49727bbe6697ad0feefb22cf967da5a4ff4";
 
 export function validatedCandidateSourceSnapshotPublicationEvidence(
   metadata: DatasetMetadata,
