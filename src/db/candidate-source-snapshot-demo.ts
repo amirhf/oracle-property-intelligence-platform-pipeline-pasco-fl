@@ -3571,6 +3571,20 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
         },
         operation,
         revalidateGeneration: async (transaction) => {
+          const lockedPlan = await transaction<{ plan_id: string }[]>`
+            SELECT plan.plan_id
+            FROM oracle_candidate_source_snapshot_demo_plans plan
+            JOIN oracle_candidate_source_snapshot_executor_leases lease
+              ON lease.plan_id = plan.plan_id
+            WHERE lease.lease_id = ${continuation.leaseId}
+              AND lease.lease_epoch = ${continuation.leaseGeneration}
+            FOR UPDATE OF plan
+          `;
+          if (!lockedPlan[0]) {
+            throw new DurableConflictError(
+              "Candidate source-snapshot executor lease lost its plan fence",
+            );
+          }
           await transaction`SELECT oracle_css_assert_active_executor_lease(
             ${continuation.leaseId}, ${continuation.leaseGeneration},
             ${continuation.resumeAuthorizationId ?? continuation.authorizationId}
