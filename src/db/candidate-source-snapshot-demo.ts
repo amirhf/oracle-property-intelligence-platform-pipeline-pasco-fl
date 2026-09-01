@@ -2747,12 +2747,18 @@ async function assertRecoveryUploadAttemptForInspection(
   plan: CandidateSourceSnapshotDemoPlan,
   object: CandidateSourceSnapshotUploadObject,
   attempt: CandidateSourceSnapshotUploadAttempt,
+  continuation?: CandidateSourceSnapshotUploadJournalLeaseBinding,
 ): Promise<void> {
   if (
     attempt.operation !== "upload" ||
-    !["connection_failure", "retryable_http_error", "timeout_unknown"].includes(
-      attempt.outcome,
-    )
+    ![
+      "connection_failure",
+      "request_started",
+      "retryable_http_error",
+      "timeout_unknown",
+    ].includes(attempt.outcome) ||
+    (attempt.outcome === "request_started" &&
+      !continuation?.resumeAuthorizationId)
   ) {
     throw new DurableInputError(
       "Candidate source-snapshot inspection requires one ambiguous upload attempt",
@@ -2793,7 +2799,29 @@ async function assertRecoveryUploadAttemptForInspection(
       AND request.plan_id = ${plan.planId}
       AND request.operation_class = 'class_a_mutation'
       AND request.operation_kind = 'put_object'
-      AND request.outcome IN ('retryable_failure', 'timeout_unknown')
+      AND (
+        (attempt.outcome IN (
+          'connection_failure', 'retryable_http_error', 'timeout_unknown'
+        ) AND request.outcome IN ('retryable_failure', 'timeout_unknown')) OR
+        (attempt.outcome = 'request_started' AND
+          request.outcome = 'request_started' AND
+          ${continuation?.resumeAuthorizationId ?? null} IS NOT NULL AND
+          EXISTS (
+            SELECT 1
+            FROM oracle_candidate_source_snapshot_upload_inspection_cycles cycle
+            JOIN oracle_candidate_source_snapshot_upload_inspection_cycle_members member
+              ON member.inspection_cycle_id = cycle.inspection_cycle_id
+            WHERE cycle.plan_id = ${plan.planId}
+              AND cycle.resume_authorization_id =
+                ${continuation?.resumeAuthorizationId ?? null}
+              AND cycle.executor_lease_id = ${continuation?.leaseId ?? null}
+              AND cycle.lease_generation =
+                ${continuation?.leaseGeneration ?? null}
+              AND member.domain = ${object.domain}
+              AND member.remote_object_key = ${object.remoteObjectKey}
+              AND member.source_attempt_id = ${attempt.attemptId}
+          ))
+      )
     FOR UPDATE OF attempt, request
   `;
   if (!rows[0]) {
@@ -3228,6 +3256,7 @@ async function admitRequest(
       input.plan,
       input.object,
       input.recoveryAttempt,
+      input.continuation,
     );
     if (
       !input.continuation?.resumeAuthorizationId &&
