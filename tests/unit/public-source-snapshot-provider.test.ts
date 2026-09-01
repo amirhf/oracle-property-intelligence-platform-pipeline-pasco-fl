@@ -336,6 +336,23 @@ describe("compact candidate source-snapshot public provider", () => {
     );
     expect(source.transport.reads).toContain(shardCid);
     expect(source.transport.reads).toContain(bindings[0]!.cid);
+
+    const replacementQueryIpns = `k51${"f".repeat(59)}`;
+    source.transport.resolutions.set(
+      replacementQueryIpns,
+      resolved(config.expectedQueryTableRootCid),
+    );
+    const replacementProvider = await PublicIpnsProvider.create(
+      { ...config, queryTableIpns: replacementQueryIpns },
+      contracts,
+      source.transport,
+      undefined,
+      undefined,
+      { sourceSnapshotQueryTableReader: async () => queryResult },
+    );
+    expect((await replacementProvider.getMetadata()).coverageMode).toBe(
+      "source_snapshot",
+    );
   }, 30_000);
 });
 

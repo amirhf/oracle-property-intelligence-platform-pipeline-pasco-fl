@@ -1518,13 +1518,20 @@ async function initializeCandidateSourceSnapshot(options: {
     );
   }
   const manifestBinding = plan.controlArtifacts.manifestIndex;
+  const candidateQueryTableReplacementMatches =
+    options.config.resolverPolicy === "candidate_filebase_delegated_v2" &&
+    plan.targets.queryTable.targetCid ===
+      options.config.expectedQueryTableRootCid;
+  const queryTableIdentityMatches =
+    plan.targets.queryTable.ipnsNetworkKey === options.config.queryTableIpns ||
+    candidateQueryTableReplacementMatches;
   if (
     plan.planId !== options.config.candidateDemoPlanId ||
     plan.planSha256 !== options.config.candidateDemoPlanSha256 ||
     plan.source.sourcePlanSha256 !==
       options.config.candidateDemoSourcePlanSha256 ||
     plan.targets.openData.ipnsNetworkKey !== options.config.openDataIpns ||
-    plan.targets.queryTable.ipnsNetworkKey !== options.config.queryTableIpns ||
+    !queryTableIdentityMatches ||
     plan.targets.openData.targetCid !==
       options.config.expectedOpenDataRootCid ||
     plan.targets.queryTable.targetCid !==
