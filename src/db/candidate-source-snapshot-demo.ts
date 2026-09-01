@@ -3504,6 +3504,7 @@ async function admitRequest(
 export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSourceSnapshotUploadJournal {
   readonly #continuation:
     CandidateSourceSnapshotUploadJournalLeaseBinding | undefined;
+  #transactionGate: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly databaseUrl: string,
@@ -3525,6 +3526,19 @@ export class PostgresCandidateSourceSnapshotUploadJournal implements CandidateSo
   }
 
   private async transaction<T>(
+    operation: (transaction: postgres.TransactionSql) => Promise<T>,
+  ): Promise<T> {
+    const pending = this.#transactionGate.then(
+      async () => await this.transactionOnce(operation),
+    );
+    this.#transactionGate = pending.then(
+      () => undefined,
+      () => undefined,
+    );
+    return await pending;
+  }
+
+  private async transactionOnce<T>(
     operation: (transaction: postgres.TransactionSql) => Promise<T>,
   ): Promise<T> {
     if (this.#continuation) {
