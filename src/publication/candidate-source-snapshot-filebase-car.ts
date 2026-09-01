@@ -19,6 +19,8 @@ export const CANDIDATE_SOURCE_SNAPSHOT_FILEBASE_CAR_IMPORT_POLICY =
   "filebase-rpc-car-import-v1" as const;
 export const CANDIDATE_SOURCE_SNAPSHOT_FILEBASE_CAR_PIN_ENDPOINT =
   "https://rpc.filebase.io/api/v0/pin/ls?type=recursive";
+export const CANDIDATE_SOURCE_SNAPSHOT_FILEBASE_CAR_BLOCK_GET_ENDPOINT =
+  "https://rpc.filebase.io/api/v0/block/get";
 export const CANDIDATE_SOURCE_SNAPSHOT_FILEBASE_CAR_GATEWAY_ORIGIN =
   "https://ipfs.filebase.io";
 const MULTIPART_BOUNDARY = "----prism-candidate-source-snapshot-car-v1";
@@ -77,6 +79,7 @@ export interface CandidateSourceSnapshotCarImportHttpEvidence {
   endpointPolicy:
     | "filebase_official_gateway_raw_block_v1"
     | "filebase_rpc_car_import_v1"
+    | "filebase_rpc_exact_root_raw_block_v1"
     | "filebase_rpc_recursive_pin_list_v1";
   httpStatus: number;
   latencyMs: number;
@@ -461,6 +464,12 @@ function exactRootSet(
   );
 }
 
+function exactRootRpcEndpoint(endpoint: string, rootCid: string): URL {
+  const url = new URL(endpoint);
+  url.searchParams.set("arg", rootCid);
+  return url;
+}
+
 function responseFailure(input: {
   attemptNumber: number;
   code: CandidateSourceSnapshotCarImportFailureCode;
@@ -571,7 +580,10 @@ export class CandidateSourceSnapshotFilebaseCarImportTransport {
     try {
       const pinStartedAt = Date.now();
       const pinResponse = await this.#fetch(
-        new URL(CANDIDATE_SOURCE_SNAPSHOT_FILEBASE_CAR_PIN_ENDPOINT),
+        exactRootRpcEndpoint(
+          CANDIDATE_SOURCE_SNAPSHOT_FILEBASE_CAR_PIN_ENDPOINT,
+          roots[0]!,
+        ),
         {
           body: null,
           headers: {
@@ -620,6 +632,36 @@ export class CandidateSourceSnapshotFilebaseCarImportTransport {
       evidence.push(pinEvidence);
       const pinnedRoots = parseRecursivePinRoots(pinBounded.bytes);
 
+      const rootStartedAt = Date.now();
+      const rootResponse = await this.#fetch(
+        exactRootRpcEndpoint(
+          CANDIDATE_SOURCE_SNAPSHOT_FILEBASE_CAR_BLOCK_GET_ENDPOINT,
+          roots[0]!,
+        ),
+        {
+          body: null,
+          headers: {
+            Accept: "application/vnd.ipld.raw",
+            Authorization: `Bearer ${bucketScopedBearerToken}`,
+            "Cache-Control": "no-store",
+          },
+          method: "POST",
+          redirect: "manual",
+          signal: controller.signal,
+        },
+      );
+      const rootBounded = await readBoundedResponse(
+        rootResponse,
+        MAX_GATEWAY_ROOT_BLOCK_BYTES,
+      );
+      const rootEvidence = httpEvidence(
+        "filebase_rpc_exact_root_raw_block_v1",
+        rootResponse,
+        rootBounded,
+        elapsedMilliseconds(rootStartedAt),
+      );
+      evidence.push(rootEvidence);
+
       const gatewayStartedAt = Date.now();
       const gatewayResponse = await this.#fetch(
         new URL(
@@ -648,10 +690,12 @@ export class CandidateSourceSnapshotFilebaseCarImportTransport {
       const expectedRootSha256 = Buffer.from(
         CID.parse(roots[0]!).multihash.digest,
       ).toString("hex");
-      const allPinned =
-        pinnedRoots !== null && roots.every((root) => pinnedRoots.has(root));
-      const nonePinned =
-        pinnedRoots !== null && roots.every((root) => !pinnedRoots.has(root));
+      const rootPinned = pinnedRoots?.has(roots[0]!) === true;
+      const rootUnpinned = pinnedRoots !== null && !rootPinned;
+      const rpcRootExact =
+        rootResponse.status === 200 &&
+        rootBounded.sha256 === expectedRootSha256;
+      const rpcRootAbsent = [404, 410].includes(rootResponse.status);
       const gatewayExact =
         gatewayResponse.status === 200 &&
         gatewayBounded.sha256 === expectedRootSha256;
@@ -659,8 +703,9 @@ export class CandidateSourceSnapshotFilebaseCarImportTransport {
       const evidenceSha256 = sha256(canonicalJson(evidence));
       const requestId =
         pinEvidence.providerRequestIdHash ??
+        rootEvidence.providerRequestIdHash ??
         gatewayEvidence.providerRequestIdHash;
-      if (allPinned && gatewayExact) {
+      if (rootPinned && rpcRootExact && gatewayExact) {
         return {
           inspectedRootBlock: new Uint8Array(gatewayBounded.bytes),
           inspectionResult: "present_exact",
@@ -670,11 +715,13 @@ export class CandidateSourceSnapshotFilebaseCarImportTransport {
           providerHttpStatus: gatewayResponse.status,
           providerRequestIdHash: requestId,
           providerResponseBytes:
-            pinBounded.byteCount + gatewayBounded.byteCount,
+            pinBounded.byteCount +
+            rootBounded.byteCount +
+            gatewayBounded.byteCount,
           rootStatus: "present_exact",
         };
       }
-      if (nonePinned && gatewayAbsent) {
+      if (rootUnpinned && rpcRootAbsent && gatewayAbsent) {
         return {
           inspectedRootBlock: null,
           inspectionResult: "conclusively_absent",
@@ -684,7 +731,9 @@ export class CandidateSourceSnapshotFilebaseCarImportTransport {
           providerHttpStatus: gatewayResponse.status,
           providerRequestIdHash: requestId,
           providerResponseBytes:
-            pinBounded.byteCount + gatewayBounded.byteCount,
+            pinBounded.byteCount +
+            rootBounded.byteCount +
+            gatewayBounded.byteCount,
           rootStatus: "absent",
         };
       }
@@ -696,7 +745,10 @@ export class CandidateSourceSnapshotFilebaseCarImportTransport {
         providerEvidenceSha256: evidenceSha256,
         providerHttpStatus: gatewayResponse.status,
         providerRequestIdHash: requestId,
-        providerResponseBytes: pinBounded.byteCount + gatewayBounded.byteCount,
+        providerResponseBytes:
+          pinBounded.byteCount +
+          rootBounded.byteCount +
+          gatewayBounded.byteCount,
         rootStatus: "unavailable",
       };
     } catch {

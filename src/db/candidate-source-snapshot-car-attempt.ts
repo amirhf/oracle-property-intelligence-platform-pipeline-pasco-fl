@@ -466,7 +466,7 @@ export interface CandidateSourceSnapshotCarImportInspection {
   planId: string;
 }
 
-/** Records one immutable root-and-pin inspection for an unknown outcome. */
+/** Records one immutable root-and-pin observation for an unknown outcome. */
 export async function recordCandidateSourceSnapshotCarImportInspection(
   databaseUrl: string,
   inputValue: z.input<typeof inspectionInputSchema>,
@@ -528,8 +528,6 @@ export async function recordCandidateSourceSnapshotCarImportInspection(
         SELECT inspection_payload, inspection_sha256
         FROM oracle_candidate_source_snapshot_car_import_inspections
         WHERE car_import_inspection_id = ${inspectionId}
-           OR car_import_attempt_id = ${binding.car_import_attempt_id}
-           OR car_import_outcome_id = ${input.outcomeId}
         FOR UPDATE
       `;
       if (existing[0]) {

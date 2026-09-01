@@ -918,11 +918,20 @@ export async function recordCandidateSourceSnapshotCarGatewayEvidence(
         JOIN oracle_candidate_source_snapshot_car_artifacts artifact
           ON artifact.car_artifact_id = attempt.car_artifact_id
          AND artifact.plan_id = attempt.plan_id
-        LEFT JOIN oracle_candidate_source_snapshot_car_import_inspections inspection
-          ON inspection.car_import_attempt_id = attempt.car_import_attempt_id
-         AND inspection.car_import_outcome_id = outcome.car_import_outcome_id
-         AND inspection.car_artifact_id = artifact.car_artifact_id
-         AND inspection.plan_id = artifact.plan_id
+        LEFT JOIN LATERAL (
+          SELECT candidate_inspection.*
+          FROM oracle_candidate_source_snapshot_car_import_inspections
+            candidate_inspection
+          WHERE candidate_inspection.car_import_attempt_id =
+                  attempt.car_import_attempt_id
+            AND candidate_inspection.car_import_outcome_id =
+                  outcome.car_import_outcome_id
+            AND candidate_inspection.car_artifact_id = artifact.car_artifact_id
+            AND candidate_inspection.plan_id = artifact.plan_id
+          ORDER BY candidate_inspection.inspected_at DESC,
+                   candidate_inspection.car_import_inspection_id DESC
+          LIMIT 1
+        ) inspection ON true
         WHERE attempt.car_import_attempt_id = ${input.attemptId}
           AND outcome.car_import_outcome_id = ${input.outcomeId}
         FOR SHARE OF attempt, outcome, artifact
