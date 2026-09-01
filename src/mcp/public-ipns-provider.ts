@@ -1663,6 +1663,9 @@ async function initializeCandidateSourceSnapshot(options: {
     new HttpPublicCidRangeTransport(
       options.config.resolverPolicy,
       options.config.limits,
+      fetch,
+      undefined,
+      options.config.candidateArtifactGatewayBaseUrl ?? undefined,
     );
   const reader =
     options.sourceSnapshotQueryTableReader ??

@@ -24,6 +24,7 @@ export interface LocalArtifactProviderConfig {
 }
 
 export interface PublicIpnsProviderConfig {
+  candidateArtifactGatewayBaseUrl?: string | null;
   candidateDemoPlanId: string | null;
   candidateDemoPlanSha256: string | null;
   candidateDemoSourcePlanSha256: string | null;
@@ -126,6 +127,31 @@ function publicProvider(
       "MCP_PUBLIC_RESOLVER_POLICY must be public_two_gateway_v1 or candidate_filebase_delegated_v2",
     );
   }
+  const candidateArtifactGatewayBaseUrl =
+    environment.MCP_PUBLIC_CANDIDATE_ARTIFACT_GATEWAY_BASE_URL?.trim() || null;
+  if (candidateArtifactGatewayBaseUrl !== null) {
+    let parsed: URL;
+    try {
+      parsed = new URL(candidateArtifactGatewayBaseUrl);
+    } catch {
+      throw new Error(
+        "MCP_PUBLIC_CANDIDATE_ARTIFACT_GATEWAY_BASE_URL is invalid",
+      );
+    }
+    if (
+      resolverPolicy !== "candidate_filebase_delegated_v2" ||
+      parsed.origin !== "https://foolish-green-asp.myfilebase.com" ||
+      parsed.pathname !== "/" ||
+      parsed.username !== "" ||
+      parsed.password !== "" ||
+      parsed.search !== "" ||
+      parsed.hash !== ""
+    ) {
+      throw new Error(
+        "MCP_PUBLIC_CANDIDATE_ARTIFACT_GATEWAY_BASE_URL must be the approved candidate HTTPS origin",
+      );
+    }
+  }
   const candidateDemoPlanId =
     environment.MCP_PUBLIC_CANDIDATE_DEMO_PLAN_ID?.trim() || null;
   const candidateDemoPlanSha256 =
@@ -154,6 +180,10 @@ function publicProvider(
     );
   }
   return {
+    candidateArtifactGatewayBaseUrl:
+      candidateArtifactGatewayBaseUrl === null
+        ? null
+        : "https://foolish-green-asp.myfilebase.com",
     candidateDemoPlanId,
     candidateDemoPlanSha256,
     candidateDemoSourcePlanSha256,

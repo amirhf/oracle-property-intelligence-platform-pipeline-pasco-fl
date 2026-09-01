@@ -46,6 +46,37 @@ function rangeResponse(
 }
 
 describe("bounded immutable-CID range reads", () => {
+  it("uses only the approved candidate artifact gateway when configured", async () => {
+    const requests: string[] = [];
+    const transport = new HttpPublicCidRangeTransport(
+      "candidate_filebase_delegated_v2",
+      LIMITS,
+      async (input) => {
+        requests.push(String(input));
+        return rangeResponse(PARQUET_BYTES, 0, 3);
+      },
+      undefined,
+      "https://foolish-green-asp.myfilebase.com",
+    );
+
+    await expect(
+      transport.readCidRange(CID, 0, 4, PARQUET_BYTES.byteLength, 4),
+    ).resolves.toEqual(PARQUET_BYTES.slice(0, 4));
+    expect(requests).toEqual([
+      `https://foolish-green-asp.myfilebase.com/ipfs/${CID}`,
+    ]);
+    expect(
+      () =>
+        new HttpPublicCidRangeTransport(
+          "candidate_filebase_delegated_v2",
+          LIMITS,
+          fetch,
+          undefined,
+          "https://example.invalid",
+        ),
+    ).toThrow("Candidate artifact gateway is not approved");
+  });
+
   it("exposes a hyparquet-compatible bounded buffer and verifies PAR1 with exact ranges", async () => {
     const requests: Array<{
       method: string;

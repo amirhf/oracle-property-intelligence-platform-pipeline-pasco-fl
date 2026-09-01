@@ -7,6 +7,8 @@ import { CIDV0_PATTERN } from "../publication/ipfs-cid.js";
 
 const CIDV1_BASE32_PATTERN = /^b[a-z2-7]{20,120}$/;
 const RETRY_BACKOFF_MS = 50;
+const CANDIDATE_ARTIFACT_GATEWAY_ORIGIN =
+  "https://foolish-green-asp.myfilebase.com";
 
 const GATEWAY_PROFILES = {
   candidate_filebase_delegated_v2: ["https://ipfs.filebase.io"],
@@ -275,8 +277,21 @@ export class HttpPublicCidRangeTransport implements PublicCidRangeTransport {
     >,
     readonly fetchImplementation: typeof fetch = fetch,
     retryDelayImplementation: RetryDelay = defaultRetryDelay,
+    candidateArtifactGatewayBaseUrl?: string,
   ) {
-    this.#origins = GATEWAY_PROFILES[profile];
+    if (
+      candidateArtifactGatewayBaseUrl !== undefined &&
+      (profile !== "candidate_filebase_delegated_v2" ||
+        candidateArtifactGatewayBaseUrl !== CANDIDATE_ARTIFACT_GATEWAY_ORIGIN)
+    ) {
+      throw rangeError(
+        "configuration_invalid",
+        "Candidate artifact gateway is not approved",
+      );
+    }
+    this.#origins = candidateArtifactGatewayBaseUrl
+      ? [candidateArtifactGatewayBaseUrl]
+      : GATEWAY_PROFILES[profile];
     this.#retryDelay = retryDelayImplementation;
     nonNegativeInteger(limits.maxRedirects, "redirect limit");
     nonNegativeInteger(limits.retries, "retry limit");

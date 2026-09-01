@@ -66,14 +66,26 @@ describe("Oracle MCP provider isolation", () => {
     expect(
       loadMcpConfig({
         ...environment,
+        MCP_PUBLIC_CANDIDATE_ARTIFACT_GATEWAY_BASE_URL:
+          "https://foolish-green-asp.myfilebase.com",
         MCP_PUBLIC_RESOLVER_POLICY: "candidate_filebase_delegated_v2",
         MCP_PUBLIC_RETRIES: "1",
         MCP_PUBLIC_TRANSPORT_TIMEOUT_MS: "20000",
       }).provider,
     ).toMatchObject({
+      candidateArtifactGatewayBaseUrl:
+        "https://foolish-green-asp.myfilebase.com",
       limits: { retries: 1, transportTimeoutMs: 20_000 },
       resolverPolicy: "candidate_filebase_delegated_v2",
     });
+    expect(() =>
+      loadMcpConfig({
+        ...environment,
+        MCP_PUBLIC_CANDIDATE_ARTIFACT_GATEWAY_BASE_URL:
+          "https://example.invalid",
+        MCP_PUBLIC_RESOLVER_POLICY: "candidate_filebase_delegated_v2",
+      }),
+    ).toThrow("approved candidate HTTPS origin");
     expect(() =>
       loadMcpConfig({
         ...environment,
